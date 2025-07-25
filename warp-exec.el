@@ -37,7 +37,7 @@
 (require 'warp-errors)
 (require 'warp-security-policy)
 (require 'warp-thread)
-(require 'warp-crypto)
+(require 'warp-crypt)
 (require 'warp-marshal)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
