@@ -43,6 +43,11 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Configuration
 
+(defgroup warp-exec nil
+  "Configuration for secure and controlled code execution in Emacs."
+  :group 'warp
+  :prefix "warp-exec-")
+
 (defcustom warp-exec-max-execution-time 30.0
   "Maximum execution time in seconds for code evaluation.
 This applies to forms executed under `:strict`, `:moderate`, and
