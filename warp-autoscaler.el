@@ -276,7 +276,7 @@ Signals:
     (monitor action target-size reason)
   "Apply a scaling decision to the cluster with error handling and logging.
 This function checks for circuit breaker state and cooldown periods
-before attempting to scale the cluster via `warp:cluster-scale`. It
+before attempting to scale the cluster via `warp:pool-resize`. It
 updates the monitor's last scale times and total scale counts.
 
 Arguments:
@@ -292,7 +292,7 @@ Returns:
   or rejects on failure.
 
 Side Effects:
-- Calls `warp:cluster-scale`.
+- Calls `warp:pool-resize`.
 - Updates `last-scale-up-time` or `last-scale-down-time` in `monitor`.
 - Increments `total-scale-ups` or `total-scale-downs` in `monitor`.
 - Records success/failure with the circuit breaker."
@@ -304,7 +304,9 @@ Side Effects:
          (current-size (length (warp:cluster-managed-workers
                                 cluster)))
          ;; Ensure target-size is within min/max bounds
-         (final-size (max min (min max target-size))))
+         (final-size (max min (min max target-size)))
+         ;; Get the worker pool directly from the cluster state
+         (pool (warp-cluster-state-worker-pool (warp-cluster-state cluster))))
     (cond
      ((and cb (not (warp:circuit-breaker-can-execute-p cb)))
       (let ((msg (format "Scaling for '%s' blocked by open circuit breaker."
@@ -321,12 +323,12 @@ Side Effects:
         (loom:resolved! `(:action :no-action :size ,current-size
                                   :reason ,reason))))
      (t
-      ;; Perform the scaling action
+      ;; Perform the scaling action by calling the pool's resize function
       (warp:log! :info "autoscaler" "Scaling %s for '%s': %d -> %d. %s"
                  (if (> final-size current-size) "up" "down")
                  (warp:cluster-name cluster) current-size final-size
                  (format "Reason: %s" reason))
-      (braid! (warp:cluster-scale cluster final-size)
+      (braid! (warp:pool-resize pool final-size)
         (:then (lambda (result)
                  (warp:log! :info "autoscaler" "Scaled '%s' to %d workers."
                             (warp:cluster-name cluster) final-size)
