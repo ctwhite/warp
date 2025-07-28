@@ -1,572 +1,995 @@
-;;; warp-crypt.el --- Cryptographic Primitives for Warp -*- lexical-binding: t; -*-
+;;; warp-crypt.el --- Cryptographic Utilities and Key Management for Warp -*- lexical-binding: t; -*-
 
 ;;; Commentary:
+;; This module provides essential cryptographic primitives for the Warp
+;; distributed computing framework, such as digital signatures, hashing,
+;; and JSON Web Token (JWT) handling.
 ;;
-;; This module provides a consolidated interface for cryptographic
-;; operations within the Warp framework. It abstracts interactions with
-;; external tools like OpenSSL and GnuPG to provide a clean, unified
-;; Emacs Lisp API.
+;; This module also now incorporates a **Secure Key Management Pattern**
+;; through `warp:key-manager-create`. This centralizes the lifecycle
+;; management of cryptographic keys, from loading and decryption to
+;; secure in-memory storage and eventual cleanup. It abstracts away
+;; complex file operations and integrates various key provisioning
+;; strategies.
 ;;
-;; ## Core Features:
+;; ## Key Features:
 ;;
-;; - **AES Encryption:** Symmetric encryption and decryption using AES
-;;   (AES-256-CBC, AES-128-CBC, AES-256-GCM) via the `openssl` command.
-;;
-;; - **Digital Signing:** Signing and verification of data using GnuPG
-;;   (`gpg`) via the `epg.el` library.
-;;
-;; - **Key Handling:** Includes helpers for key derivation (from TLS
-;;   configs), random IV generation, and hashing.
-;;
-;; - **Error Handling:** Defines specific error conditions for cryptographic
-;;   failures.
-;;
-;; - **Feature Detection:** Provides functions to check if the necessary
-;;   underlying command-line tools (`openssl`, `gpg`, `sha256sum`) are
-;;   available on the system.
-;;
-;; This module is a foundational building block for security features
-;; across the Warp stack. It requires that `openssl`, `sha256sum`, and
-;; `gpg` are available in the system's PATH.
+;; - **Key Manager (`warp-key-manager`)**: Provides a declarative API
+;;   for managing the full lifecycle of private and public keys,
+;;   including loading, decryption, and secure cleanup.
+;; - **Key Provisioning Strategies**: Integrates `warp-key-provisioner`
+;;   implementations for securely obtaining GPG passphrases (e.g., from
+;;   offline files or master enrollment).
+;; - **GPG Signing & Verification**: High-level wrappers for creating
+;;   and verifying detached GPG signatures.
+;; - **Hashing**: Simple interface for common hashing algorithms like
+;;   SHA-256.
+;; - **Base64 Encoding**: Provides both standard and URL-safe Base64
+;;   variants.
+;; - **JWT Handling**: Full support for decoding, verifying, and
+;;   generating JSON Web Tokens.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'loom)
-(require 's)
-(require 'subr-x)
 (require 'epg)
+(require 'json)
+(require 's)
 (require 'base64)
+(require 'url)
+(require 'subr-x)
 
 (require 'warp-log)
-(require 'warp-errors)
+(require 'warp-error)
+(require 'warp-env)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
 
-(define-error 'warp-crypt-error "Generic error for cryptographic operations.")
-
-(define-error 'warp-encryption-error
-  "Warp encryption error." 'warp-crypt-error)
-
-(define-error 'warp-decryption-error
-  "Warp decryption error." 'warp-crypt-error)
-
-(define-error 'warp-crypt-exec-not-found
-  "Required crypto executable not found." 'warp-crypt-error)
+(define-error 'warp-crypt-error
+  "A generic cryptographic error in the Warp framework."
+  'warp-error)
 
 (define-error 'warp-crypt-signing-failed
-  "Digital signing operation failed." 'warp-crypt-error)
+  "A digital signing operation failed."
+  'warp-crypt-error)
 
 (define-error 'warp-crypt-verification-failed
-  "Signature verification failed." 'warp-crypt-error)
+  "A digital signature verification failed."
+  'warp-crypt-error)
 
 (define-error 'warp-crypt-key-error
-  "Error related to cryptographic keys." 'warp-crypt-error)
+  "A cryptographic key management error occurred (e.g., key not found
+  or inaccessible, or decryption failed)."
+  'warp-crypt-error)
+
+(define-error 'warp-crypt-jwt-error
+  "An error occurred during JSON Web Token (JWT) processing."
+  'warp-crypt-error)
+
+(define-error 'warp-crypt-unsupported-algorithm
+  "An unsupported cryptographic algorithm was requested."
+  'warp-crypt-error)
+
+(define-error 'warp-crypt-provisioning-error
+  "An error occurred during the key provisioning process."
+  'warp-crypt-key-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Constants and Customization
+;;; Struct Definitions
 
-(defconst warp--encryption-algorithms '(aes-256-cbc aes-128-cbc aes-256-gcm)
-  "A list of supported symmetric encryption algorithms.")
+(cl-defstruct (warp-key-provisioner (:copier nil))
+  "Base struct for key provisioning strategies. This acts as a marker and
+a parent for concrete provisioner implementations, enabling polymorphism
+via `cl-defmethod`.
 
-(defcustom warp-default-encryption-algorithm 'aes-256-cbc
-  "The default encryption algorithm to use if not specified."
-  :type `(choice ,@(mapcar #'list warp--encryption-algorithms))
-  :group 'warp)
+Fields:
+- `worker-id`: The ID of the worker, for logging context during
+  provisioning."
+  (worker-id nil :type string))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Private: Utility Functions
+(cl-defstruct (warp-offline-key-provisioner
+               (:include warp-key-provisioner)
+               (:constructor make-warp-offline-key-provisioner))
+  "Provisions a GPG passphrase from a local file specified by an
+environment variable (`WARP_WORKER_PASSPHRASE_FILE_PATH`). This strategy
+is suitable for environments where secrets can be securely mounted into
+the worker's filesystem at launch.")
 
-(defun warp--random-bytes (n)
-  "Generate `N` random bytes as a unibyte string.
+(cl-defstruct (warp-master-enrollment-provisioner
+               (:include warp-key-provisioner)
+               (:constructor make-warp-master-enrollment-provisioner))
+  "Provisions a GPG passphrase by contacting the master's secure
+enrollment API. This strategy uses a one-time bootstrap token for
+authentication and is suitable for dynamic environments where manual
+key distribution is impractical.
 
-Arguments:
-- `N` (integer): The number of random bytes to generate.
+Fields:
+- `bootstrap-url`: The URL of the master's enrollment endpoint.
+- `bootstrap-token`: The one-time token for authenticating with the
+  master."
+  (bootstrap-url nil :type string)
+  (bootstrap-token nil :type string))
 
-Returns:
-- (string): A unibyte string of `N` random bytes."
-  (let ((result (make-string n 0)))
-    (dotimes (i n)
-      (aset result i (random 256)))
-    result))
+(cl-defstruct (warp-key-manager (:constructor %%make-key-manager))
+  "Manages the lifecycle of cryptographic keys (load, decrypt, cleanup).
 
-(defun warp--bytes-to-hex (bytes)
-  "Convert a unibyte string of `BYTES` to its hexadecimal representation.
-
-Arguments:
-- `BYTES` (string): The unibyte string to convert.
-
-Returns:
-- (string): The hexadecimal string representation."
-  (mapconcat (lambda (byte) (format "%02x" byte))
-             bytes ""))
-
-(defun warp--hex-to-bytes (hex-string)
-  "Convert a `HEX-STRING` to a unibyte string of bytes.
-
-Arguments:
-- `HEX-STRING` (string): The hexadecimal string (e.g., \"414243\").
-
-Returns:
-- (string): The corresponding unibyte string (e.g., \"ABC\")."
-  (let ((result (make-string (/ (length hex-string) 2) 0))
-        (i 0))
-    (while (< i (length hex-string))
-      (let ((byte-hex (substring hex-string i (+ i 2))))
-        (aset result (/ i 2) (string-to-number byte-hex 16)))
-      (setq i (+ i 2)))
-    result))
-
-(defun warp--sha256 (input)
-  "Compute the SHA-256 hash of `INPUT` string.
-
-Arguments:
-- `INPUT` (string): The string to hash.
-
-Returns:
-- (string): The raw 32-byte SHA-256 hash as a unibyte string."
-  (let ((temp-file (make-temp-file "warp-hash-")))
-    (unwind-protect
-        (progn
-          (with-temp-file temp-file
-            (insert input))
-          (with-temp-buffer
-            ;; Call sha256sum and capture the hex hash output
-            (call-process "sha256sum" nil t nil temp-file)
-            (goto-char (point-min))
-            (if (looking-at "\\([0-9a-fA-F]+\\)")
-                ;; Convert the hex hash to raw bytes
-                (warp--hex-to-bytes (match-string 1))
-              (error "Failed to parse sha256sum output"))))
-      (when (file-exists-p temp-file)
-        (delete-file temp-file)))))
+Fields:
+- `name`: A name for the key manager instance.
+- `strategy`: The key provisioning strategy (e.g., `:offline-provisioning`).
+- `key-paths`: Alist mapping key types to file paths (e.g., `(:private
+  \"/path/to/key\")`).
+- `decrypted-private-key-path`: Path to the temporary decrypted private
+  key file.
+- `public-key-material`: In-memory copy of the public key material.
+- `auto-cleanup`: If `t`, automatically cleans up keys on Emacs exit.
+- `lock`: Mutex for thread-safe operations."
+  (name nil :type string)
+  (strategy nil :type symbol)
+  (key-paths nil :type list)
+  (decrypted-private-key-path nil :type (or null string))
+  (public-key-material nil :type (or null string))
+  (auto-cleanup nil :type boolean)
+  (lock (loom:lock "warp-key-manager-lock") :type t))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Private: Encryption Helpers
+;;; Private Functions
 
-(defun warp--get-iv-size (algorithm)
-  "Get the required Initialization Vector (IV) size for an `ALGORITHM`.
+;;----------------------------------------------------------------------
+;;; Key Management Helpers
+;;----------------------------------------------------------------------
 
-Arguments:
-- `ALGORITHM` (keyword): The encryption algorithm.
-
-Returns:
-- (integer): The required IV size in bytes."
-  (case algorithm
-    ((aes-256-cbc aes-128-cbc) 16) ; AES block size is 128 bits (16 bytes)
-    (aes-256-gcm 12)               ; GCM recommended IV size is 96 bits (12 bytes)
-    (t (error "Unknown IV size for algorithm: %s" algorithm))))
-
-(defun warp--generate-iv (algorithm)
-  "Generate a random Initialization Vector (IV) for the given `ALGORITHM`.
+(defun warp--key-manager-decrypt-private-key (manager passphrase)
+  "Decrypts the manager's private key file using the provided passphrase
+and writes the decrypted content to a secure temporary file.
+This is a critical internal step in the key loading process.
 
 Arguments:
-- `ALGORITHM` (keyword): The encryption algorithm.
+- `manager` (warp-key-manager): The key manager instance.
+- `passphrase` (string or nil): The passphrase for decryption. If `nil`,
+  it's assumed the private key is unencrypted.
 
-Returns:
-- (string): A unibyte string containing the random IV."
-  (warp--random-bytes (warp--get-iv-size algorithm)))
-
-(defun warp--algorithm-to-openssl (algorithm)
-  "Convert an internal `ALGORITHM` keyword to its OpenSSL command-line name.
-
-Arguments:
-- `ALGORITHM` (keyword): The internal algorithm name.
-
-Returns:
-- (string): The corresponding OpenSSL algorithm name."
-  (pcase algorithm
-    ('aes-256-cbc "aes-256-cbc")
-    ('aes-128-cbc "aes-128-cbc")
-    ('aes-256-gcm "aes-256-gcm")
-    (_ (error "Unknown or unsupported OpenSSL algorithm: %s" algorithm))))
-
-(defun warp--derive-key-from-tls-config (tls-config)
-  "Derive a 256-bit (32-byte) encryption key from a `TLS-CONFIG` plist.
-It uses the SHA-256 hash of a seed value derived from the config.
-
-Arguments:
-- `TLS-CONFIG` (plist): A plist potentially containing :cert-file,
-  :key-file, and :password.
-
-Returns:
-- (string): A 32-byte raw key as a unibyte string."
-  (let* ((cert-file (plist-get tls-config :cert-file))
-         (key-file (plist-get tls-config :key-file))
-         (password (plist-get tls-config :password))
-         ;; Create a seed from the available info to ensure some uniqueness.
-         (seed (or password
-                   (and cert-file (file-exists-p cert-file) cert-file)
-                   (and key-file (file-exists-p key-file) key-file)
-                   "default-warp-key-if-nothing-else-is-provided")))
-    ;; Generate a 32-byte key using SHA-256, which is suitable for AES-256.
-    (warp--sha256 seed)))
-
-(defun warp--encrypt-with-algorithm (data algorithm key iv)
-  "Encrypt `DATA` using OpenSSL via a shell command.
-
-Arguments:
-- `DATA` (string): The plaintext data to encrypt.
-- `ALGORITHM` (keyword): The encryption algorithm to use.
-- `KEY` (string): The raw encryption key (unibyte string).
-- `IV` (string): The raw initialization vector (unibyte string).
-
-Returns:
-- (string): The raw encrypted data (ciphertext) as a unibyte string."
-  (let ((temp-file-in (make-temp-file "warp-encrypt-in-"))
-        (temp-file-out (make-temp-file "warp-encrypt-out-")))
-    (unwind-protect
-        (progn
-          (with-temp-file temp-file-in
-            (insert data))
-          (let* ((openssl-alg (warp--algorithm-to-openssl algorithm))
-                 (cmd (format "openssl enc -%s -in %s -out %s -K %s -iv %s"
-                              openssl-alg
-                              (shell-quote-argument temp-file-in)
-                              (shell-quote-argument temp-file-out)
-                              (warp--bytes-to-hex key)
-                              (warp--bytes-to-hex iv)))
-                 (result (shell-command-to-string cmd)))
-            (unless (zerop (nth 2 (process-attributes
-                                   (get-process "shell-command"))))
-              (error "Encryption command failed. Stderr: %s" result)))
-          (with-temp-buffer
-            (set-buffer-multibyte nil)
-            (insert-file-contents-literally temp-file-out)
-            (buffer-string)))
-      (when (file-exists-p temp-file-in) (delete-file temp-file-in))
-      (when (file-exists-p temp-file-out) (delete-file temp-file-out)))))
-
-(defun warp--decrypt-with-algorithm (ciphertext algorithm key iv)
-  "Decrypt `CIPHERTEXT` using OpenSSL via a shell command.
-
-Arguments:
-- `CIPHERTEXT` (string): The raw encrypted data (unibyte string).
-- `ALGORITHM` (keyword): The encryption algorithm to use.
-- `KEY` (string): The raw decryption key (unibyte string).
-- `IV` (string): The raw initialization vector (unibyte string).
-
-Returns:
-- (string): The decrypted plaintext data."
-  (let ((temp-file-in (make-temp-file "warp-decrypt-in-"))
-        (temp-file-out (make-temp-file "warp-decrypt-out-")))
-    (unwind-protect
-        (progn
-          (with-temp-file temp-file-in
-            (set-buffer-multibyte nil)
-            (insert ciphertext))
-          (let* ((openssl-alg (warp--algorithm-to-openssl algorithm))
-                 (cmd (format "openssl enc -%s -d -in %s -out %s -K %s -iv %s"
-                              openssl-alg
-                              (shell-quote-argument temp-file-in)
-                              (shell-quote-argument temp-file-out)
-                              (warp--bytes-to-hex key)
-                              (warp--bytes-to-hex iv)))
-                 (result (shell-command-to-string cmd)))
-            (unless (zerop (nth 2 (process-attributes
-                                   (get-process "shell-command"))))
-              (error "Decryption command failed. Stderr: %s" result)))
-          (with-temp-buffer
-            (insert-file-contents temp-file-out)
-            (buffer-string)))
-      (when (file-exists-p temp-file-in) (delete-file temp-file-in))
-      (when (file-exists-p temp-file-out) (delete-file temp-file-out)))))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Private: GPG/EPG Signing Helpers
-
-(defun warp-crypt--make-epg-context ()
-  "Create and configure an EPG context for cryptographic operations.
-
-Returns:
-- (epg-context): A newly created EPG context."
-  (let ((context (epg-make-context 'OpenPGP)))
-    (setf (epg-context-armor context) nil)    ; We want binary output
-    (setf (epg-context-textmode context) nil) ; Binary mode
-    (setf (epg-context-include-certs context) nil)
-    context))
-
-(defun warp-crypt--handle-epg-error (err operation-name)
-  "Handle EPG errors and convert them to appropriate `warp-crypt` errors.
-
-Arguments:
-- `ERR` (list): The error list returned by `condition-case`.
-- `OPERATION-NAME` (string): A descriptive name for the failed operation.
+Returns: (loom-promise): A promise that resolves to `t` on successful
+  decryption and temporary file creation.
 
 Signals:
-- `warp-crypt-exec-not-found`: If the GPG executable is not found.
-- `warp-crypt-key-error`: If a required key is not available.
-- `warp-crypt-signing-failed`: If a signing operation failed.
-- `warp-crypt-verification-failed`: If a verification operation failed.
-- `warp-crypt-error`: For any other generic EPG error."
-  (let ((error-data (cdr err))
-        (error-symbol (car err)))
-    (warp:log! :error "warp-crypt" "%s failed with EPG error: %S"
-               operation-name err)
-    (cond
-      ((eq error-symbol 'epg-error)
-       (let* ((error-string (if error-data
-                                (format "%S" error-data)
-                              "Unknown EPG error"))
-              (error-msg (format "%s: %s" operation-name error-string)))
-         (cond
-           ((string-match-p "gpg.*not found\\|executable.*not found"
-                            error-string)
-            (signal 'warp-crypt-exec-not-found
-                    (list :message error-msg :cause err)))
-           ((string-match-p "secret key.*not available\\|key.*not found"
-                            error-string)
-            (signal 'warp-crypt-key-error
-                    (list :message error-msg :cause err)))
-           ((string-equal operation-name "GPG signing")
-            (signal 'warp-crypt-signing-failed
-                    (list :message error-msg :cause err)))
-           ((string-equal operation-name "GPG verification")
-            (signal 'warp-crypt-verification-failed
-                    (list :message error-msg :cause err)))
-           (t
-            (signal 'warp-crypt-error
-                    (list :message error-msg :cause err))))))
-      (t
-       (let ((error-msg (format "%s failed: %S" operation-name err)))
-         (signal 'warp-crypt-error
-                 (list :message error-msg :cause err)))))))
+- `warp-crypt-key-error`: If no private key path is defined, the GPG
+  decryption fails (e.g., wrong passphrase, GPG error), or if writing
+  to the temporary file fails."
+  (loom:with-mutex! (warp-key-manager-lock manager)
+    (let* ((encrypted-path
+            (cdr (assoc :private (warp-key-manager-key-paths manager))))
+           (manager-name (warp-key-manager-name manager)))
+      (unless encrypted-path
+        (loom:rejected!
+         (warp:error! :type 'warp-crypt-key-error
+                      :message (format "No private key path defined for %s."
+                                       manager-name))))
+      (condition-case err
+          (let* ((decrypted-content
+                  (if passphrase
+                      ;; Use external GPG process for decryption.
+                      (warp:crypt-decrypt-gpg-file encrypted-path passphrase)
+                    ;; If no passphrase, assume unencrypted and read directly.
+                    (warp:crypto-read-file-contents encrypted-path)))
+                 ;; Create a unique, temporary file for the decrypted key.
+                 (temp-file (make-temp-file
+                             (format "warp-%s-pk-" manager-name)
+                             nil ".dec")))
+            ;; Write decrypted content to the temporary file.
+            (with-temp-file temp-file (insert decrypted-content))
+            ;; Store the path to the temporary file in the manager.
+            (setf (warp-key-manager-decrypted-private-key-path manager)
+                  temp-file)
+            (warp:log! :info manager-name
+                       "Private key decrypted to temporary file: %s."
+                       temp-file)
+            (loom:resolved! t))
+        (error
+         (loom:rejected!
+          (warp:error! :type 'warp-crypt-key-error
+                       :message (format "Failed to decrypt private key for %s: %S"
+                                        manager-name err)
+                       :cause err)))))))
 
-(defun warp-crypt--validate-key-id (key-id)
-  "Validate that `KEY-ID` is a reasonable key identifier.
+;;----------------------------------------------------------------------
+;;; JWT Helpers
+;;----------------------------------------------------------------------
 
-Arguments:
-- `KEY-ID` (string): The key identifier to validate.
-
-Returns:
-- (string): The trimmed `KEY-ID`.
-
-Signals:
-- `warp-crypt-key-error`: If `KEY-ID` is not a non-empty string."
-  (unless (and (stringp key-id) (not (string-empty-p key-id)))
-    (signal 'warp-crypt-key-error
-            (list :message "Key ID must be a non-empty string"
-                  :key-id key-id)))
-  (string-trim key-id))
-
-(defun warp-crypt--import-public-key (context public-key-string)
-  "Import a `PUBLIC-KEY-STRING` into the EPG `CONTEXT`.
+(defun warp--crypto-jwt-decode-part (encoded-part context-name)
+  "Decode and parse a single Base64URL-encoded JSON part of a JWT.
+This is a robust helper that wraps the decoding and JSON parsing in
+error handling to provide clear context upon failure. It is used for
+decoding the JWT header and claims.
 
 Arguments:
-- `CONTEXT` (epg-context): The EPG context to import the key into.
-- `PUBLIC-KEY-STRING` (string): The public key data as a string.
+- `encoded-part` (string): The Base64URL-encoded string representing
+    a JWT part (e.g., header or claims).
+- `context-name` (string): A descriptive name for the part being
+    decoded (e.g., \"header\", \"claims\") for error messages.
 
 Returns:
-- (epg-context): The modified EPG context.
+- (plist): The decoded and parsed JSON object as a plist.
 
 Signals:
-- `warp-crypt-key-error`: If `PUBLIC-KEY-STRING` is not a non-empty string.
-- `warp-crypt-error`: If the public key import fails via EPG."
-  (unless (and (stringp public-key-string)
-               (not (string-empty-p public-key-string)))
-    (signal 'warp-crypt-key-error
-            (list :message "Public key must be a non-empty string"
-                  :key public-key-string)))
+- `warp-crypt-jwt-error`: If Base64URL decoding fails, or if the
+    decoded string is not valid JSON."
   (condition-case err
-      (let ((key-data (encode-coding-string public-key-string 'utf-8)))
-        (epg-import-keys-from-string context key-data)
-        context)
+      (json-read-from-string
+       (warp:crypto-base64url-decode encoded-part))
     (error
-     (warp-crypt--handle-epg-error err "Public key import"))))
+     (signal
+      (warp:error! :type 'warp-crypt-jwt-error
+                   :message (format "Failed to decode JWT %s: %S"
+                                    context-name err)
+                   :cause err)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
-;;;###autoload
-(defun warp:crypto-available-p (&optional feature)
-  "Check if cryptographic dependencies are available.
-
-Arguments:
-- `FEATURE` (keyword, optional): The specific feature to check.
-  - `:encryption`: Checks for `openssl` and `sha256sum`.
-  - `:signing`: Checks for `gpg` (via `epg`).
-  - If nil, checks for all features.
-
-Returns:
-- (boolean): t if dependencies for the feature are met, nil otherwise."
-  (pcase (or feature :all)
-    (:encryption (and (executable-find "openssl")
-                      (executable-find "sha256sum")))
-    (:signing (condition-case nil
-                  (executable-find (epg-context-program
-                                    (epg-make-context 'OpenPGP)))
-                (error nil)))
-    (:all (and (warp:crypto-available-p :encryption)
-               (warp:crypto-available-p :signing)))))
+;;----------------------------------------------------------------------
+;;; Core Cryptographic Primitives
+;;----------------------------------------------------------------------
 
 ;;;###autoload
-(defun warp:encrypt (data tls-config &rest options)
-  "Encrypt `DATA` using a key derived from `TLS-CONFIG`.
-
-The final output is a Base64-encoded string containing the IV prepended
-to the ciphertext, i.e., `Base64(IV + Ciphertext)`.
+(defun warp:crypto-read-file-contents (file-path)
+  "Reads the entire contents of a file into a string.
+This is a utility function used internally and exposed for consistency.
+It ensures the file is readable before attempting to read its contents.
 
 Arguments:
-- `DATA` (any): The Lisp data to encrypt. It will be converted to a string
-  via `prin1-to-string` if it is not already one.
-- `TLS-CONFIG` (plist): A plist used to derive the encryption key.
-  See `warp--derive-key-from-tls-config`.
-- `OPTIONS` (plist): A property list of options:
-  - `:algorithm` (keyword): The algorithm to use. Defaults to
-    `warp-default-encryption-algorithm`.
-  - `:key` (string): A raw encryption key (unibyte string). If provided,
-    this is used instead of deriving one from `tls-config`.
+- `file-path` (string): The absolute or relative path to the file.
 
 Returns:
-- (string): The Base64-encoded encrypted data.
+- (string): The complete content of the file as a single string.
 
 Signals:
-- `user-error`: If an unsupported algorithm is provided.
-- `warp-encryption-error`: If the underlying encryption command fails."
-  (let* ((algorithm (or (plist-get options :algorithm)
-                        warp-default-encryption-algorithm))
-         (key (or (plist-get options :key)
-                  (warp--derive-key-from-tls-config tls-config)))
-         (iv (warp--generate-iv algorithm))
-         (data-string (if (stringp data) data (prin1-to-string data))))
+- `file-error`: If the file does not exist, is not readable, or if
+    any other file system error occurs during reading."
+  (unless (file-readable-p file-path)
+    (signal (warp:error! :type 'file-error
+                         :message (format "File not found or unreadable: %s"
+                                          file-path))))
+  (with-temp-buffer
+    (insert-file-contents file-path)
+    (buffer-string)))
 
-    (unless (memq algorithm warp--encryption-algorithms)
-      (error "Unsupported encryption algorithm: %s" algorithm))
+;;;###autoload
+(defun warp:crypt-decrypt-gpg-file (encrypted-file-path passphrase)
+  "Decrypts a GPG-encrypted file using an external `gpg` process.
+The passphrase is securely piped to the `gpg` process's stdin to prevent
+it from appearing in command-line arguments (which could be visible in
+process lists). This ensures the passphrase is handled with reasonable
+security during decryption.
+
+Arguments:
+- `encrypted-file-path` (string): The path to the GPG encrypted file.
+- `passphrase` (string): The passphrase required to decrypt the file.
+
+Returns:
+- (string): The decrypted file content as a string.
+
+Signals:
+- `warp-crypt-key-error`: If the encrypted file is not found or
+    unreadable, if the GPG decryption process fails (e.g., incorrect
+    passphrase, GPG not installed, corrupted file), or any system error
+    occurs during the process invocation."
+  (let* ((process-name (format "gpg-decrypt-proc-%s" (emacs-pid)))
+         ;; Use `--passphrase-fd 0` to read passphrase from stdin.
+         (gpg-command (format "gpg --batch --passphrase-fd 0 --decrypt %s"
+                              (shell-quote-argument encrypted-file-path)))
+         (proc nil)
+         (exit-status nil)
+         (process-output-buffer (generate-new-buffer " *gpg-decrypt-output*")))
+
+    (unless (file-readable-p encrypted-file-path)
+      (signal (warp:error! :type 'warp-crypt-key-error
+                           :message (format "Encrypted file not found or %s."
+                                            "unreadable: %s"
+                                            encrypted-file-path))))
 
     (condition-case err
-        (let ((encrypted-data (warp--encrypt-with-algorithm
-                               data-string algorithm key iv)))
-          ;; Prepend the IV to the ciphertext before encoding. The recipient
-          ;; will need it for decryption.
-          (base64-encode-string (concat iv encrypted-data)))
-      (error
-       (signal 'warp-encryption-error
-               (list (format "Encryption failed: %s"
-                             (error-message-string err))))))))
-
-;;;###autoload
-(defun warp:decrypt (encrypted-data tls-config &rest options)
-  "Decrypt `ENCRYPTED-DATA` using a key derived from `TLS-CONFIG`.
-
-This function expects the input to be a Base64-encoded string where the
-raw Initialization Vector (IV) is prepended to the ciphertext.
-
-Arguments:
-- `ENCRYPTED-DATA` (string): The Base64-encoded string to decrypt.
-- `TLS-CONFIG` (plist): A plist used to derive the decryption key.
-- `OPTIONS` (plist): A property list of options:
-  - `:algorithm` (keyword): The algorithm to use. Defaults to
-    `warp-default-encryption-algorithm`.
-  - `:key` (string): A raw decryption key (unibyte string). If provided,
-    this is used instead of deriving one from `tls-config`.
-
-Returns:
-- (string): The decrypted plaintext data.
-
-Signals:
-- `warp-decryption-error`: If decryption fails for any reason."
-  (let* ((algorithm (or (plist-get options :algorithm)
-                        warp-default-encryption-algorithm))
-         (key (or (plist-get options :key)
-                  (warp--derive-key-from-tls-config tls-config)))
-         (decoded-data (base64-decode-string encrypted-data))
-         (iv-size (warp--get-iv-size algorithm))
-         (iv (substring decoded-data 0 iv-size))
-         (ciphertext (substring decoded-data iv-size)))
-
-    (condition-case err
-        (warp--decrypt-with-algorithm ciphertext algorithm key iv)
-      (error
-       (signal 'warp-decryption-error
-               (list (format "Decryption failed: %s"
-                             (error-message-string err))))))))
-
-;;;###autoload
-(defun warp:crypto-sign-data (data-string private-key-id)
-  "Signs `DATA-STRING` using GnuPG with the specified `PRIVATE-KEY-ID`.
-
-Arguments:
-- `DATA-STRING` (string): The data to be signed.
-- `PRIVATE-KEY-ID` (string): The identifier of the private key to use for
-  signing.
-
-Returns:
-- (string): The raw binary signature as a unibyte string.
-
-Signals:
-- `warp-crypt-error`: If `DATA-STRING` is not a string.
-- `warp-crypt-key-error`: If the `PRIVATE-KEY-ID` is invalid or no secret
-  key is found.
-- `warp-crypt-signing-failed`: If the GPG signing operation fails."
-  (unless (stringp data-string)
-    (signal 'warp-crypt-error
-            (list :message "Data to sign must be a string"
-                  :data data-string)))
-
-  (let ((key-id (warp-crypt--validate-key-id private-key-id)))
-    (condition-case err
-        (let* ((context (warp-crypt--make-epg-context))
-               (data-bytes (encode-coding-string data-string 'utf-8))
-               (signing-keys (epg-list-keys context key-id t))) ; t = secret keys
-          (unless signing-keys
-            (signal 'warp-crypt-key-error
-                    (list :message (format "No secret key found for: %s" key-id)
-                          :key-id key-id)))
-          (let ((signature (epg-sign-string context data-bytes
-                                            (car signing-keys) 'detach)))
-            (warp:log! :debug "warp-crypt"
-                       "Successfully signed data with key: %s" key-id)
-            signature))
-      (error
-       (warp-crypt--handle-epg-error err "GPG signing")))))
-
-;;;###autoload
-(defun warp:crypto-verify-signature
-    (data-string signature public-key-string)
-  "Verifies a `SIGNATURE` against `DATA-STRING` using a `PUBLIC-KEY-STRING`.
-
-Arguments:
-- `DATA-STRING` (string): The original data that was signed.
-- `SIGNATURE` (string): The raw binary signature to verify.
-- `PUBLIC-KEY-STRING` (string): The public key data as a string, used to
-  verify the signature.
-
-Returns:
-- (boolean): t if the signature is valid, nil otherwise.
-
-Signals:
-- `warp-crypt-error`: If `DATA-STRING` or `SIGNATURE` are not strings.
-- `warp-crypt-key-error`: If `PUBLIC-KEY-STRING` is invalid.
-- `warp-crypt-verification-failed`: If the GPG verification operation fails."
-  (unless (stringp data-string)
-    (signal 'warp-crypt-error
-            (list :message "Data to verify must be a string"
-                  :data data-string)))
-  (unless (stringp signature)
-    (signal 'warp-crypt-error
-            (list :message "Signature must be a string"
-                  :signature signature)))
-
-  (condition-case err
-      (let* ((context (warp-crypt--make-epg-context))
-             (_ (warp-crypt--import-public-key context public-key-string))
-             (data-bytes (encode-coding-string data-string 'utf-8)))
-        (let ((verify-result (epg-verify-string
-                              context signature data-bytes)))
-          (if (and verify-result
-                   (cl-some (lambda (sig)
-                              (eq (epg-signature-status sig) 'good))
-                            verify-result))
-              (progn
-                (warp:log! :debug "warp-crypt" "Signature verification successful")
-                t)
+        (unwind-protect
             (progn
-              (warp:log! :debug "warp-crypt"
-                         "Signature verification failed: %S" verify-result)
-              nil))))
+              ;; Start GPG process and feed passphrase via stdin.
+              (setq proc (start-process process-name process-output-buffer
+                                        shell-file-name shell-command-switch
+                                        gpg-command))
+              (process-send-string proc (concat passphrase "\n"))
+              (process-send-eof proc) ;; Signal end of input
+
+              ;; Wait for the GPG process to complete and get its exit status.
+              (setq exit-status (process-wait proc t))
+
+              (if (zerop (process-exit-status proc))
+                  ;; If GPG exited successfully, return the decrypted content.
+                  (with-current-buffer process-output-buffer
+                    (buffer-string))
+                ;; If GPG exited with an error, capture its stderr/stdout
+                ;; for debugging.
+                (let ((error-output (with-current-buffer process-output-buffer
+                                      (buffer-string))))
+                  (signal (warp:error! :type 'warp-crypt-key-error
+                                       :message (format "GPG decryption %s%s: %s"
+                                                        "failed (exit %d)"
+                                                        (process-exit-status proc)
+                                                        (s-trim error-output)))))))
+          ;; Ensure cleanup of the temporary buffer, regardless of success.
+          (when (buffer-live-p process-output-buffer)
+            (kill-buffer process-output-buffer)))
+      (error
+       ;; Catch any Elisp errors during process invocation or I/O.
+       (signal (warp:error! :type 'warp-crypt-key-error
+                            :message (format "Error during GPG decryption: %S"
+                                             err)
+                            :cause err))))))
+
+;;;###autoload
+(defun warp:crypto-sign-data (data-string private-key-path)
+  "Digitally sign `DATA-STRING` using the GPG private key at
+`private-key-path`. `private-key-path` should point to an **unencrypted**
+GPG private key file.
+
+This function uses Emacs's `epg` library to create a detached GPG
+signature. For secure environments, it implicitly relies on `gpg-agent`
+to manage private key access and passphrases (if the key needs it and
+is in the keyring). Here, it assumes the key at `private-key-path`
+is directly usable by GPG or EPG's temporary import mechanisms.
+
+Arguments:
+- `data-string` (string): The data (e.g., text, binary content) to sign.
+- `private-key-path` (string): The file path to the unencrypted GPG
+  private key. This key will be used to generate the signature.
+
+Returns:
+- (string): The raw binary detached signature.
+
+Signals:
+- `warp-crypt-key-error`: If the specified private key file is not
+    found or is unreadable.
+- `warp-crypt-signing-failed`: If the underlying signing operation fails
+    due to cryptographic issues (e.g., invalid key format, EPG backend
+    error)."
+  (unless (file-readable-p private-key-path)
+    (signal (warp:error! :type 'warp-crypt-key-error
+                         :message (format "Private key file not found or %s"
+                                          "readable: %s"
+                                          private-key-path))))
+  (condition-case err
+      (let ((epg-context (epg-context-create)))
+        (unwind-protect
+            (progn
+              ;; We want a raw binary signature, not ASCII-armored.
+              (epg-context-set-armor epg-context nil)
+              ;; Set the key for signing from the file.
+              ;; EPG will attempt to use this file directly.
+              (epg-context-set-sign-key epg-context private-key-path)
+              (epg-sign-string epg-context data-string))
+          ;; Ensure the EPG context is always freed.
+          (epg-context-free epg-context)))
     (error
-     (warp-crypt--handle-epg-error err "GPG verification"))))
+     (signal (warp:error! :type 'warp-crypt-signing-failed
+                          :message (format "Failed to sign data with key %s."
+                                           private-key-path)
+                          :cause err)))))
+
+;;;###autoload
+(defun warp:crypto-verify-signature (data-string signature-binary
+                                     public-key-material)
+  "Verify a digital signature against `DATA-STRING` using a public key.
+This function uses Emacs's `epg` library to verify a detached GPG
+signature, confirming that the data has not been tampered with and
+was signed by the holder of the corresponding private key.
+
+The `public-key-material` should be the ASCII-armored GPG public key
+block (e.g., PEM format) as a string.
+
+Arguments:
+- `data-string` (string): The original data that was signed.
+- `signature-binary` (string): The raw binary detached signature to
+    verify.
+- `public-key-material` (string): The ASCII-armored GPG public key
+    block that corresponds to the private key used for signing.
+
+Returns:
+- (boolean): `t` if the signature is cryptographically valid for the
+    given data and public key, `nil` otherwise.
+
+Signals:
+- `warp-crypt-verification-failed`: If the verification *process*
+  encounters a cryptographic error that prevents a clear true/false
+  result (e.g., malformed inputs, GPG backend issues). This error
+  is distinct from a signature simply being invalid (which returns `nil`)."
+  (condition-case err
+      (let ((epg-context (epg-context-create)))
+        (unwind-protect
+            (progn
+              ;; Add the public key material to the context for verification.
+              (epg-context-add-armor-key epg-context public-key-material)
+              ;; Perform the verification.
+              (epg-verify-string epg-context data-string signature-binary))
+          ;; Ensure the EPG context is always freed.
+          (epg-context-free epg-context)))
+    (error
+     (warp:log! :warn "warp-crypt" "Signature verification process failed: %S"
+                err)
+     ;; A verification failure due to a bad signature (e.g., data was
+     ;; tampered with, wrong key) is not an exceptional condition;
+     ;; it should simply return `nil`. We only signal an error if the
+     ;; underlying EPG process itself fails or input is malformed,
+     ;; preventing a definitive `t` or `nil` outcome.
+     (signal (warp:error! :type 'warp-crypt-verification-failed
+                          :message "Verification process encountered an error."
+                          :cause err)))))
+
+;;;###autoload
+(defun warp:crypto-hash (data-string &optional (algorithm 'sha256))
+  "Compute a cryptographic hash of `DATA-STRING`.
+This is used for creating checksums and verifying data integrity. It
+leverages Emacs's built-in `secure-hash` function.
+
+Arguments:
+- `data-string` (string): The data (text or binary) to hash.
+- `algorithm` (symbol, optional): The hashing algorithm to use. Defaults
+  to `sha256`. Other supported algorithms can be found via
+  `secure-hash-algorithms`.
+
+Returns:
+- (string): The hash digest as a hexadecimal string.
+
+Signals:
+- `warp-crypt-unsupported-algorithm`: If the requested hashing
+    algorithm is not supported by the underlying Emacs `secure-hash`
+    function."
+  (if (memq algorithm (secure-hash-algorithms))
+      (secure-hash algorithm data-string)
+    (signal (warp:error! :type 'warp-crypt-unsupported-algorithm
+                         :message (format "Unsupported hashing algorithm: %S."
+                                          algorithm)))))
+
+;;;###autoload
+(defun warp:crypto-base64-encode (data-binary)
+  "Encode binary `DATA-BINARY` to a standard Base64 string.
+This produces a string typically used for MIME or simple data transfer.
+
+Arguments:
+- `data-binary` (string): The binary string to encode.
+
+Returns:
+- (string): The Base64 encoded string."
+  (base64-encode-string data-binary))
+
+;;;###autoload
+(defun warp:crypto-base64-decode (base64-string)
+  "Decode a standard Base64 string to binary data.
+
+Arguments:
+- `base64-string` (string): The Base64 string to decode.
+
+Returns:
+- (string): The decoded binary string."
+  (base64-decode-string base64-string))
+
+;;;###autoload
+(defun warp:crypto-base64url-encode (data-binary)
+  "Encode binary `DATA-BINARY` to a URL-safe Base64 string.
+This variant is required by specifications like JWT. It replaces `+` with
+`-`, `/` with `_`, and removes padding `=` characters, making the result
+safe for use in URLs.
+
+Arguments:
+- `data-binary` (string): The binary string to encode.
+
+Returns:
+- (string): The Base64URL encoded string."
+  (let* ((standard-b64 (base64-encode-string data-binary t))
+         ;; Remove padding characters (=) from the end.
+         (no-padding (s-replace-regexp "=*$" "" standard-b64)))
+    ;; Replace `+` with `-` and `/` with `_` for URL safety.
+    (s-replace "_" "/" (s-replace "-" "+" no-padding))))
+
+;;;###autoload
+(defun warp:crypto-base64url-decode (base64url-string)
+  "Decode a URL-safe Base64 string to binary data.
+This function correctly handles the URL-safe alphabet (reverting `-` to
+`+` and `_` to `/`) and re-adds any necessary padding (`=`) before
+performing the standard Base64 decoding.
+
+Arguments:
+- `base64url-string` (string): The Base64URL string to decode.
+
+Returns:
+- (string): The decoded binary string."
+  (let* ((standard-b64 (s-replace "-" "+" (s-replace "_" "/" base64url-string)))
+         ;; Re-add padding. Base64 strings must have length divisible by 4.
+         ;; Padding can be up to 3 '=' characters.
+         (padded (concat standard-b64
+                         (make-string (% (- 4 (% (length standard-b64) 4)) 4)
+                                      ?=))))
+    (base64-decode-string padded)))
+
+;;----------------------------------------------------------------------
+;;; Key Management and Provisioning
+;;----------------------------------------------------------------------
+
+;;;###autoload
+(cl-defgeneric warp:crypt-provision-passphrase (provisioner)
+  "Generic function to provision a GPG passphrase using a specific strategy.
+
+This function dispatches to a concrete implementation based on the type of
+the `PROVISIONER` instance. It returns a promise that resolves with the
+passphrase string, or resolves with `nil` if no passphrase is required
+(e.g., for unencrypted keys). The promise rejects on any provisioning
+failure.
+
+Arguments:
+- `provisioner` (warp-key-provisioner): An instance of a concrete
+  provisioner strategy (e.g., `warp-offline-key-provisioner`).
+
+Returns: (loom-promise): A promise that resolves to the passphrase
+    string (or `nil`) on success.
+
+Signals:
+- `warp-crypt-provisioning-error`: On any failure to obtain the
+    passphrase via the chosen strategy."
+  (:documentation "Provision a GPG passphrase using a specific strategy."))
+
+(cl-defmethod warp:crypt-provision-passphrase ((p warp-offline-key-provisioner))
+  "Implements passphrase provisioning by reading from a local file.
+This method checks the `WARP_WORKER_PASSPHRASE_FILE_PATH` environment
+variable. If set, it reads the content of the file, immediately deletes
+the file for security, and returns the content as the passphrase. If the
+variable is not set, it assumes the key is unencrypted and returns `nil`.
+
+Arguments:
+- `p` (warp-offline-key-provisioner): The provisioner instance.
+
+Returns: (loom-promise): A promise that resolves to the passphrase
+    string (or `nil`) on success.
+
+Side Effects:
+- Reads the file specified by `WARP_WORKER_PASSPHRASE_FILE_PATH`.
+- **Deletes the passphrase file immediately after reading for security.**
+- Logs file access and deletion.
+
+Signals:
+- `warp-crypt-provisioning-error`: If the environment variable is set
+    but the file cannot be read or deleted."
+  (let ((passphrase-file (getenv (warp:env 'worker-passphrase-file-path))))
+    (if passphrase-file
+        (condition-case err
+            (let ((passphrase (s-trim
+                               (warp:crypto-read-file-contents
+                                passphrase-file))))
+              ;; CRITICAL: Securely delete the file immediately after reading.
+              ;; This helps prevent the passphrase from lingering on disk.
+              (delete-file passphrase-file)
+              (warp:log! :info (warp-key-provisioner-worker-id p)
+                         "Passphrase file deleted after read.")
+              (loom:resolved! passphrase))
+          (error
+           (loom:rejected!
+            (warp:error! :type 'warp-crypt-provisioning-error
+                         :message (format "Failed to read/delete %s: %S"
+                                          passphrase-file err)
+                         :cause err))))
+      (progn
+        (warp:log! :warn (warp-key-provisioner-worker-id p)
+                   "WARP_WORKER_PASSPHRASE_FILE_PATH not set. Assuming %s."
+                   "unencrypted private key.")
+        (loom:resolved! nil)))))
+
+(cl-defmethod warp:crypt-provision-passphrase ((p warp-master-enrollment-provisioner))
+  "Implements passphrase provisioning by contacting the master's enrollment
+API. This strategy is suitable for dynamic environments where manual
+key distribution is impractical.
+
+This method uses the bootstrap URL and token provided during its
+construction to make a secure HTTPS request to the master. It expects a
+JSON response containing the passphrase.
+
+Arguments:
+- `p` (warp-master-enrollment-provisioner): The provisioner instance.
+
+Returns: (loom-promise): A promise that resolves to the passphrase
+    string on success.
+
+Side Effects:
+- Makes an HTTPS network request to the master enrollment URL.
+- Logs network activity.
+
+Signals:
+- `warp-crypt-provisioning-error`: If bootstrap URL or token are
+    missing, the HTTP request fails, the master returns a non-200
+    status, or the response is malformed/missing the passphrase."
+  (let ((url (warp-master-enrollment-provisioner-bootstrap-url p))
+        (token (warp-master-enrollment-provisioner-bootstrap-token p))
+        (worker-id (warp-key-provisioner-worker-id p)))
+    (unless url
+      (loom:rejected! (warp:error!
+                       :type 'warp-crypt-provisioning-error
+                       :message (format "Missing master bootstrap URL %s."
+                                        (warp:env 'master-bootstrap-url)))))
+    (unless token
+      (loom:rejected! (warp:error!
+                       :type 'warp-crypt-provisioning-error
+                       :message (format "Missing worker bootstrap token %s."
+                                        (warp:env 'worker-bootstrap-token)))))
+
+    (condition-case err
+        (let* ((headers `(("Authorization" . ,(format "Bearer %s" token))
+                         ("Content-Type" . "application/json")))
+               (body (json-encode `((worker_id . ,worker-id))))
+               ;; `url-retrieve-synchronously` is blocking. For a true async
+               ;; system, this would ideally be an async HTTP client.
+               (request (url-retrieve-synchronously url body headers 'post))
+               (status (url-http-parse-status request))
+               (response-data (cadr (assoc 'data request)))
+               (response-json (when response-data
+                                (json-read-from-string response-data))))
+
+          (unless (= status 200)
+            (loom:rejected!
+             (warp:error! :type 'warp-crypt-provisioning-error
+                          :message (format "Enrollment failed: HTTP status %d. %s"
+                                           status response-data)
+                          :details response-json)))
+
+          (let ((passphrase (cdr (assoc 'passphrase response-json))))
+            (unless passphrase
+              (loom:rejected!
+               (warp:error! :type 'warp-crypt-provisioning-error
+                            :message (format "Invalid enrollment response: %s."
+                                             "Missing passphrase. Response: %S"
+                                             response-json))))
+            (warp:log! :info worker-id
+                       "Successfully obtained GPG passphrase from Master.")
+            (loom:resolved! passphrase)))
+      (error
+       (loom:rejected!
+        (warp:error! :type 'warp-crypt-provisioning-error
+                     :message (format "Master enrollment process failed: %S"
+                                      err)
+                     :cause err))))))
+
+;;;###autoload
+(defun warp:crypt-create-provisioner (strategy &key worker-id)
+  "Factory function to create and configure the appropriate key
+provisioner instance. This function acts as the entry point to the key
+provisioning subsystem. It takes a strategy symbol and returns a fully
+configured instance of the corresponding provisioner struct.
+
+Arguments:
+- `strategy` (symbol): The provisioning strategy, e.g.,
+  `:offline-provisioning` or `:master-enrollment`.
+- `worker-id` (string, optional): The worker's ID, required for strategies
+  that involve communication with the master (e.g., `:master-enrollment`)
+  for logging context.
+
+Returns:
+- (warp-key-provisioner): An instance of the correct concrete provisioner.
+
+Signals:
+- `warp-crypt-unsupported-algorithm`: If the provided `strategy` is not
+    recognized or supported."
+  (pcase strategy
+    (:offline-provisioning
+     (make-warp-offline-key-provisioner :worker-id worker-id))
+    (:master-enrollment
+     (make-warp-master-enrollment-provisioner
+      :worker-id worker-id
+      :bootstrap-url (getenv (warp:env 'master-bootstrap-url))
+      :bootstrap-token (getenv (warp:env 'worker-bootstrap-token))))
+    (_ (signal (warp:error! :type 'warp-crypt-unsupported-algorithm
+                            :message (format "Unsupported strategy: %S"
+                                             strategy))))))
+
+;;;###autoload
+(cl-defun warp:key-manager-create (&key name strategy key-paths auto-cleanup)
+  "Create a new, configured key manager instance.
+This function initializes a `warp-key-manager` struct. It sets up the
+strategy for obtaining passphrases and registers the paths to key files.
+Key loading and decryption are initiated by calling
+`warp:key-manager-load-keys`.
+
+Arguments:
+- `:name` (string, optional): A descriptive name for the manager.
+  Defaults to \"anonymous-key-manager\".
+- `:strategy` (symbol): The provisioning strategy (`:offline-provisioning`
+  or `:master-enrollment`). This determines how passphrases are obtained.
+- `:key-paths` (alist): An alist mapping key types to file paths:
+  `(:private \"/path/to/encrypted_private_key\" :public
+  \"/path/to/public_key\")`. These paths are relative to the worker.
+- `:auto-cleanup` (boolean, optional): If `t`, registers a
+  `kill-emacs-hook` to securely delete the temporary decrypted private
+  key file on Emacs exit. Defaults to `nil`.
+
+Returns: (warp-key-manager): A new, un-loaded key manager instance.
+
+Side Effects:
+- If `auto-cleanup` is `t`, adds a hook to `kill-emacs-hook` to ensure
+  cleanup on Emacs shutdown.
+- Logs manager creation."
+  (let* ((manager (%%make-key-manager
+                   :name (or name "anonymous-key-manager")
+                   :strategy strategy
+                   :key-paths key-paths
+                   :auto-cleanup (or auto-cleanup nil))))
+    (when (warp-key-manager-auto-cleanup manager)
+      ;; Register a cleanup hook on Emacs exit if auto-cleanup is enabled.
+      ;; This is crucial for preventing decrypted keys from lingering.
+      (add-hook 'kill-emacs-hook
+                (lambda () (loom:await (warp:key-manager-cleanup manager t)))))
+    (warp:log! :debug (warp-key-manager-name manager) "Key manager created.")
+    manager))
+
+;;;###autoload
+(cl-defun warp:key-manager-load-keys (manager &key passphrase)
+  "Loads and decrypts cryptographic keys managed by the `MANAGER`.
+This function orchestrates the process of making the private and public
+keys available for use. It first attempts to provision a passphrase
+using the manager's defined strategy (or uses an explicitly provided
+`passphrase`). Then, it uses this passphrase to decrypt the private
+key and loads the public key material into memory.
+
+Arguments:
+- `manager` (warp-key-manager): The key manager instance.
+- `:passphrase` (string, optional): An explicit passphrase to use. If
+  provided, this overrides the configured `strategy` for obtaining the
+  passphrase.
+
+Returns: (loom-promise): A promise that resolves to `t` on successful
+  key loading and decryption.
+
+Signals:
+- `warp-crypt-key-error`: If public or private key paths are missing,
+  public key reading fails, or private key decryption fails.
+- `warp-crypt-provisioning-error`: If passphrase provisioning
+  (via strategy) fails."
+  (loom:with-mutex! (warp-key-manager-lock manager)
+    (let* ((public-path (cdr (assoc :public
+                                    (warp-key-manager-key-paths manager))))
+           (private-path (cdr (assoc :private
+                                     (warp-key-manager-key-paths manager))))
+           (manager-name (warp-key-manager-name manager)))
+
+      ;; 1. Validate that required key paths are provided in `key-paths`.
+      (unless public-path
+        (loom:rejected! (warp:error! :type 'warp-crypt-key-error
+                                     :message (format "Missing public %s."
+                                                      "key path for %s"
+                                                      manager-name))))
+      (unless private-path
+        (loom:rejected! (warp:error! :type 'warp-crypt-key-error
+                                     :message (format "Missing private %s."
+                                                      "key path for %s"
+                                                      manager-name))))
+
+      ;; 2. Load public key material into memory first.
+      (condition-case err
+          (setf (warp-key-manager-public-key-material manager)
+                (warp:crypto-read-file-contents public-path))
+        (error
+         (loom:rejected! (warp:error! :type 'warp-crypt-key-error
+                                      :message (format "Failed to read %s: %S"
+                                                       "public key for %s"
+                                                       manager-name err)
+                                      :cause err))))
+
+      ;; 3. Obtain the passphrase: either use the explicitly provided one,
+      ;;    or trigger the configured provisioning strategy.
+      (braid! (if passphrase
+                  (loom:resolved! passphrase) ; Use explicit passphrase
+                ;; Create a provisioner instance and run its provisioning method.
+                (let ((provisioner (warp:crypt-create-provisioner
+                                    (warp-key-manager-strategy manager)
+                                    :worker-id manager-name)))
+                  (warp:crypt-provision-passphrase provisioner)))
+        ;; 4. Once passphrase is obtained, decrypt the private key.
+        (:then (lambda (actual-passphrase)
+                 (warp--key-manager-decrypt-private-key
+                  manager actual-passphrase)))
+        ;; 5. Final success step.
+        (:then (lambda (_)
+                 (warp:log! :info manager-name "Cryptographic keys loaded.")
+                 t))
+        (:catch (lambda (err)
+                  ;; Catch any errors from passphrase provisioning or decryption.
+                  (loom:rejected!
+                   (warp:error! :type 'warp-crypt-key-error
+                                :message (format "Failed to load keys for %s: %S"
+                                                 manager-name err)
+                                :cause err))))))))
+
+;;;###autoload
+(defun warp:key-manager-cleanup (manager &optional force)
+  "Securely cleans up cryptographic key material managed by `MANAGER`.
+This involves deleting the temporary decrypted private key file from disk
+and clearing sensitive in-memory key material. This function should be
+called during shutdown to prevent sensitive data exposure.
+
+Arguments:
+- `manager` (warp-key-manager): The key manager instance.
+- `:force` (boolean, optional): If `t`, attempts cleanup even if errors
+  occurred previously, and suppresses re-signaling of cleanup errors
+  to ensure the shutdown process completes. Defaults to `nil`.
+
+Returns: (loom-promise): A promise that resolves to `t` on completion.
+
+Signals:
+- `warp-crypt-key-error`: If cleanup fails (e.g., file cannot be deleted),
+    unless `force` is `t`."
+  (loom:with-mutex! (warp-key-manager-lock manager)
+    (let ((decrypted-path
+           (warp-key-manager-decrypted-private-key-path manager))
+          (manager-name (warp-key-manager-name manager)))
+      (braid! t
+        (:then (lambda (_)
+                 ;; Attempt to delete the temporary decrypted private key file.
+                 (when (and decrypted-path (file-exists-p decrypted-path))
+                   (condition-case err
+                       (progn
+                         (delete-file decrypted-path)
+                         (warp:log! :info manager-name
+                                    "Decrypted private key file deleted."))
+                     (error
+                      (warp:log! :error manager-name
+                                 "Failed to delete decrypted %s: %S"
+                                 "private key file %s" decrypted-path err)
+                      ;; If not force-deleting, re-signal the error.
+                      (unless force (loom:rejected! (loom:error-wrap err))))))))
+        (:then (lambda (_)
+                 ;; Clear in-memory sensitive data.
+                 (setf (warp-key-manager-decrypted-private-key-path manager) nil)
+                 (setf (warp-key-manager-public-key-material manager) nil)
+                 (warp:log! :info manager-name "In-memory key material cleared.")
+                 t))
+        (:catch (lambda (err)
+                  (warp:log! :error manager-name
+                             "Key manager cleanup failed: %S" err)
+                  ;; If not forced, propagate the cleanup error.
+                  (unless force (loom:rejected! err))))))))
+
+;;;###autoload
+(defun warp:key-manager-get-private-key-path (manager)
+  "Retrieve the path to the decrypted private key file.
+This path points to a temporary file created during
+`warp:key-manager-load-keys` that holds the unencrypted private key
+material. It should only be used by cryptographic operations that
+require a file path (e.g., `epg`).
+
+Arguments:
+- `manager` (warp-key-manager): The key manager instance.
+
+Returns: (string or nil): The file path to the decrypted private key,
+  or `nil` if keys have not been loaded or have been cleaned up."
+  (warp-key-manager-decrypted-private-key-path manager))
+
+;;;###autoload
+(defun warp:key-manager-get-public-key-material (manager)
+  "Retrieve the in-memory public key material.
+This function provides access to the public key string (e.g., an
+ASCII-armored GPG public key block) loaded by the manager.
+
+Arguments:
+- `manager` (warp-key-manager): The key manager instance.
+
+Returns: (string or nil): The public key material as a string, or `nil`
+  if keys have not been loaded or have been cleared from memory."
+  (warp-key-manager-public-key-material manager))
+
+;;----------------------------------------------------------------------
+;;; JWT
+;;----------------------------------------------------------------------
+
+;;;###autoload
+(defun warp:crypto-decode-jwt (jwt-string)
+  "Decodes a JWT string into its header and claims parts.
+**SECURITY WARNING**: This function only decodes the token; it
+does **NOT** verify the signature. Do not trust the contents of a
+decoded token until its signature has been verified with
+`warp:crypto-verify-jwt-signature`.
+
+Arguments:
+- `jwt-string` (string): The full JWT string, expected in the format
+    `header.claims.signature` (Base64URL encoded parts).
+
+Returns:
+- (plist): A plist like `(:header HEADER-PLIST :claims CLAIMS-PLIST)`
+    where `HEADER-PLIST` and `CLAIMS-PLIST` are the decoded JSON
+    objects.
+
+Signals:
+- `warp-crypt-jwt-error`: If the JWT string is malformed (e.g.,
+    incorrect number of parts) or if any part cannot be Base64URL
+    decoded or parsed as JSON."
+  (let* ((parts (s-split "\\." jwt-string)))
+    (unless (= (length parts) 3)
+      (signal (warp:error! :type 'warp-crypt-jwt-error
+                           :message "Invalid JWT format (expected 3 parts).")))
+    `(:header ,(warp--crypto-jwt-decode-part (nth 0 parts) "header")
+      :claims ,(warp--crypto-jwt-decode-part (nth 1 parts) "claims"))))
+
+;;;###autoload
+(defun warp:crypto-verify-jwt-signature (jwt-string public-key)
+  "Verifies the signature of a JWT using the provided public key.
+This function is the critical security step for validating an
+untrusted JWT. It reconstructs the signed content (the header and
+claims parts, Base64URL encoded) and verifies the signature against
+this content using the provided public key.
+
+Arguments:
+- `jwt-string` (string): The full JWT string (header.claims.signature).
+- `public-key` (string): The GPG public key material (e.g., an
+    ASCII-armored public key block) that corresponds to the private
+    key used to sign the JWT.
+
+Returns:
+- (boolean): `t` if the signature is valid for the data and public key,
+    `nil` otherwise.
+
+Signals:
+- `warp-crypt-jwt-error`: If the JWT string is malformed (e.g.,
+    incorrect number of parts, invalid Base64URL encoding for signature).
+- `warp-crypt-verification-failed`: If the underlying cryptographic
+    verification process encounters an unrecoverable error (e.g., GPG
+    backend issues, malformed signature binary). This is distinct from
+    a signature that is simply invalid, which returns `nil`."
+  (let* ((parts (s-split "\\." jwt-string)))
+    (unless (= (length parts) 3)
+      (signal (warp:error! :type 'warp-crypt-jwt-error
+                           :message "Invalid JWT format (expected 3 parts).")))
+    ;; The content that was signed is "header_encoded.claims_encoded".
+    (let* ((signed-content (format "%s.%s" (nth 0 parts) (nth 1 parts)))
+           ;; The signature part must be Base64URL decoded into raw binary.
+           (signature-binary (warp:crypto-base64url-decode (nth 2 parts))))
+      ;; Use the generic signature verification function.
+      (warp:crypto-verify-signature signed-content signature-binary public-key))))
+
+;;;###autoload
+(defun warp:crypto-generate-jwt (claims-plist private-key-reference
+                                            &optional (header-plist
+                                                       '(:alg "RS256"
+                                                         :typ "JWT")))
+  "Generate a signed JWT string.
+This function creates a JWT with the given header and claims, signs it
+using the specified private-key-reference, and returns the full JWT
+string. The process involves JSON encoding, Base64URL encoding,
+digital signing, and concatenation.
+
+Arguments:
+- `claims-plist` (plist): The JWT payload claims as an Emacs Lisp plist
+    (e.g., `(:iss \"issuer\" :exp 1678886400)`). This will be JSON
+    encoded into the JWT claims section.
+- `private-key-reference` (string): Reference to the GPG private key
+    for signing. This can be a GPG key ID (e.g., \"0xDEADBEEF\") or a
+    file path to an unencrypted GPG private key.
+- `header-plist` (plist, optional): The JWT header as an Emacs Lisp
+    plist. Defaults to `(:alg \"RS256\" :typ \"JWT\")`.
+
+Returns:
+- (string): The full, signed JWT string (header.claims.signature).
+
+Signals:
+- `warp-crypt-signing-failed`: If the underlying digital signing
+    operation fails (e.g., private key not found, inaccessible, or
+    GPG/EPG issues)."
+  (let* ((header-json (json-encode header-plist))
+         (claims-json (json-encode claims-plist))
+         ;; Encode header and claims using Base64URL.
+         (header-encoded (warp:crypto-base64url-encode header-json))
+         (claims-encoded (warp:crypto-base64url-encode claims-json))
+         ;; The content to be signed is the concatenation of encoded
+         ;; header and encoded claims, separated by a dot.
+         (signed-content (format "%s.%s" header-encoded claims-encoded))
+         ;; Generate the raw binary signature.
+         (signature-binary (warp:crypto-sign-data signed-content
+                                                  private-key-reference))
+         ;; Encode the signature using Base64URL.
+         (signature-encoded (warp:crypto-base64url-encode signature-binary)))
+    ;; Concatenate all parts into the final JWT string.
+    (format "%s.%s.%s" header-encoded claims-encoded signature-encoded)))
 
 (provide 'warp-crypt)
 ;;; warp-crypt.el ends here
