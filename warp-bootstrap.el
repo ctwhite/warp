@@ -1,26 +1,47 @@
-;;; warp-bootstrap.el --- High-Level Component System Bootstrapping -*- lexical-binding: t; -*-
+;;; warp-bootstrap.el --- High-Level Bootstrapping for Warp Systems -*-
+;;; lexical-binding: t; -*-
 
 ;;; Commentary:
-;; This module provides a high-level, generic function for bootstrapping
-;; a Warp component system. In this refactored architecture, its role is
-;; greatly simplified. It no longer orchestrates complex, separate
-;; plugin and lifecycle systems.
 ;;
-;; Instead, it provides a single, convenient entry point,
-;; `warp:bootstrap-system`, which encapsulates the creation of a
-;; `warp-component-system` and the declarative registration of all its
-;; components. This reduces boilerplate in higher-level modules like
-;; `warp-worker` and ensures a consistent initialization pattern across
-;; the framework.
+;; This module provides the primary, high-level entry points for the
+;; Warp framework. It serves as the central hub for both assembling
+;; component systems and managing the overall application lifecycle.
+;;
+;; It consolidates two key bootstrapping functions:
+;;
+;; 1.  **Component System Assembly (`warp:bootstrap-system`):** This macro
+;;     provides a declarative way to create a `warp-component-system`
+;;     and register all of its components. It is the standard, low-level
+;;     tool for building the object graph of a `warp-worker` or `warp-cluster`.
+;;
+;; 2.  **Application Lifecycle Management (`warp:init`, `warp:shutdown`):**
+;;     These functions provide simple, top-level entry points for
+;;     initializing and shutting down the underlying Loom library, which
+;;     is a prerequisite for all of Warp's asynchronous operations. It
+;;     also includes high-level conveniences like
+;;     `warp:multiprocessing-pool-default`.
 
 ;;; Code:
 
 (require 'cl-lib)
+(require 'loom)
+(require 'braid)
 
+(require 'warp-log)
+(require 'warp-cluster)
 (require 'warp-component)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Public API
+;; Forward declarations
+(declare-function loom:init "loom")
+(declare-function loom:shutdown "loom")
+(declare-function warp:component-system-create "warp-component")
+(declare-function warp:defcomponent "warp-component")
+(declare-function warp:cluster-create "warp-cluster")
+(declare-function warp:cluster-start "warp-cluster")
+(declare-function warp:cluster-wait-for-ready "warp-cluster")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; 1. Component System Assembly
 
 ;;;###autoload
 (cl-defmacro warp:bootstrap-system (&key name context definitions)
@@ -52,6 +73,31 @@ Side Effects:
      ,@(cl-loop for def in definitions
                 collect `(warp:defcomponent system ,def))
      system))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; 2. Application Lifecycle Management
+
+;;;###autoload
+(cl-defun warp:init ()
+  "Initialize the core libraries (Loom) that Warp depends on.
+This function serves as the single, top-level entry point for any user
+application or script that intends to use the Warp framework.
+
+Returns: `t`."
+  (warp:log! :info "warp" "Initializing Warp framework...")
+  (loom:init)
+  (warp:log! :info "warp" "Warp framework initialized.")
+  t)
+
+;;;###autoload
+(cl-defun warp:shutdown ()
+  "Shut down the core libraries (Loom) that Warp depends on.
+
+Returns: `nil`."
+  (warp:log! :info "warp" "Shutting down framework...")
+  (loom:shutdown)
+  (warp:log! :info "warp" "Warp framework shutdown complete.")
+  nil)
 
 (provide 'warp-bootstrap)
 ;;; warp-bootstrap.el ends here
