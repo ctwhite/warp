@@ -1,25 +1,30 @@
-;;; warp-connection-manager.el --- Resilient Connection Management for Warp -*- lexical-binding: t; -*-
+;;; warp-connection-manager.el --- Resilient Connection Management for Warp
+;;; -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
 ;; This module provides a high-level, resilient connection management
-;; utility for the Warp framework. It is designed to work on top of the
-;; abstract `warp-transport.el` layer. t leverages built-in features of 
-;; the `warp-transport-connection` object, including its automatic reconnection
-;;  and lifecycle management.
+;; utility. It is designed to operate on top of the abstract
+;; `warp-transport.el` layer, adding a crucial layer of intelligence
+;; and fault tolerance for client components (like workers) that need to
+;; maintain a stable connection to a server component (like a master).
 ;;
-;; The primary responsibilities of this manager are now:
+;; While the underlying `warp-transport-connection` handles its own
+;; automatic reconnection to a *single* address, this manager's
+;; primary responsibilities are higher-level:
 ;;
-;; 1.  **Endpoint Management:** It can manage a list of redundant
-;;     endpoints, selecting the healthiest one for connection attempts.
+;; 1.  **Endpoint Management & Selection**: It manages a list of
+;;     redundant server endpoints, tracks their health over time,
+;;     and intelligently selects the best one for connection attempts.
 ;;
-;; 2.  **Circuit Breaking:** It integrates with `warp-circuit-breaker.el`
-;;     to wrap connection attempts, preventing cascading failures when an
-;;     entire service is down.
+;; 2.  **Service-Level Circuit Breaking**: It integrates with
+;;     `warp-circuit-breaker.el` to wrap all connection attempts. If
+;;     all endpoints for a service are failing, the circuit breaker
+;;     will "trip," preventing the client from hammering a dead service
+;;     and causing cascading failures.
 ;;
-;; This results in a much simpler, more focused module that acts as a
-;; resilience layer without duplicating the core logic already present in
-;; the transport layer.
+;; This results in a focused module that provides resilience against
+;; both individual endpoint failures and complete service outages.
 
 ;;; Code:
 
@@ -27,10 +32,11 @@
 (require 'loom)
 (require 'braid)
 
-(require 'warp-errors)
+(require 'warp-error)
 (require 'warp-log)
 (require 'warp-transport)
 (require 'warp-circuit-breaker)
+(require 'warp-event) 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -49,55 +55,49 @@
 (cl-defstruct (warp-cm-endpoint
                (:constructor %%make-cm-endpoint)
                (:copier nil))
-  "Represents a single connection endpoint with its associated health
-tracking metadata.
+  "Represents a single connection endpoint with its health metadata.
 
-Slots:
-- `address` (string): Network address (e.g., \"tcp://host:port\").
+Fields:
+- `address` (string): The network address (e.g., \"tcp://host:port\").
 - `failure-count` (integer): Total failed connection attempts.
 - `last-failure` (float): Timestamp of the most recent failure.
-- `health-score` (float): A score from 0.0 to 1.0 indicating health.
-- `consecutive-failures` (integer): Number of *consecutive* failed attempts."
+- `health-score` (float): A score from 0.0 (unhealthy) to 1.0 (healthy).
+- `consecutive-failures` (integer): Number of *consecutive* failures."
   (address nil :type string)
   (failure-count 0 :type integer)
   (last-failure nil :type (or null float))
   (health-score 1.0 :type float)
   (consecutive-failures 0 :type integer))
 
-(cl-defstruct (warp-connection-manager
-               (:constructor %%make-connection-manager)
+(cl-defstruct (warp-cm-manager
+               (:constructor %%make-cm-manager)
                (:copier nil))
   "The central state object for the connection manager.
-This struct holds the list of endpoints and the configuration for
-managing connections to them.
 
-Slots:
+Fields:
 - `id` (string): A unique identifier for this manager instance.
 - `endpoints` (list): A list of `warp-cm-endpoint` structs.
-- `active-connection` (warp-transport-connection): The currently live
-  transport connection, if any.
-- `circuit-breaker-id` (string): The service ID used for the circuit
-  breaker.
-- `lock` (loom-lock): A mutex to protect access to the manager's state."
+- `active-connection` (warp-transport-connection): The live connection.
+- `circuit-breaker-id` (string): The ID for the circuit breaker.
+- `lock` (loom-lock): A mutex to protect the manager's state."
   (id (format "warp-cm-%08x" (random (expt 2 32))) :type string)
   (endpoints nil :type list)
-  (active-connection nil :type (or null warp-transport-connection))
+  (active-connection nil :type (or null t))
   (circuit-breaker-id nil :type (or null string))
-  (lock (loom:lock "warp-cm-lock") :type loom-lock))
+  (lock (loom:lock "warp-cm-lock") :type t))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Private Functions
 
 (defun warp-cm--update-endpoint-health (endpoint success-p)
   "Update an endpoint's health metrics based on an operation's result.
-This function adjusts the `health-score` and `consecutive-failures` of
-an endpoint. A successful operation increases the health score and
-resets consecutive failures. A failed operation decreases the health score
-and increments failure counts.
+This function implements a simple heuristic to adjust an endpoint's
+health score. Successes slowly increase the score, while failures
+cause a more significant, immediate decrease.
 
 Arguments:
 - `ENDPOINT` (warp-cm-endpoint): The endpoint to update.
-- `SUCCESS-P` (boolean): Whether the connection operation was successful.
+- `SUCCESS-P` (boolean): Whether the connection was successful.
 
 Returns:
 - `nil`.
@@ -106,187 +106,253 @@ Side Effects:
 - Modifies the health score and failure counts of `ENDPOINT`."
   (let ((score (warp-cm-endpoint-health-score endpoint)))
     (if success-p
-        (setf (warp-cm-endpoint-consecutive-failures endpoint) 0
-              (warp-cm-endpoint-health-score endpoint) (min 1.0 (+ score 0.1)))
+        (progn
+          (setf (warp-cm-endpoint-consecutive-failures endpoint) 0)
+          ;; Gently increase health on success.
+          (setf (warp-cm-endpoint-health-score endpoint)
+                (min 1.0 (+ score 0.1))))
       (cl-incf (warp-cm-endpoint-failure-count endpoint))
       (cl-incf (warp-cm-endpoint-consecutive-failures endpoint))
-      (setf (warp-cm-endpoint-last-failure endpoint) (float-time)
-            (warp-cm-endpoint-health-score endpoint) (max 0.0 (- score 0.2))))))
+      (setf (warp-cm-endpoint-last-failure endpoint) (float-time))
+      ;; Penalize health more aggressively on failure.
+      (setf (warp-cm-endpoint-health-score endpoint)
+            (max 0.0 (- score 0.2))))))
 
 (defun warp-cm--select-best-endpoint (cm)
-  "Select the best endpoint to connect to based on its health score.
-This function prioritizes endpoints with a `health-score` above 0.1.
-If multiple healthy endpoints exist, the one with the highest score is
-chosen. If no healthy endpoints are found, the endpoint with the fewest
-`consecutive-failures` is selected as a fallback.
+  "Select the best endpoint to connect to based on its health.
+This function implements a two-tiered selection strategy:
+1. It first considers only 'healthy' endpoints (score > 0.1) and
+   picks the one with the highest score.
+2. If no healthy endpoints exist, it falls back to picking the
+   endpoint with the fewest *consecutive* failures, in an attempt
+   to recover.
 
 Arguments:
-- `CM` (warp-connection-manager): The connection manager instance.
+- `CM` (warp-cm-manager): The connection manager instance.
 
 Returns:
-- (warp-cm-endpoint or nil): The optimal endpoint, or `nil` if none
-  are configured."
-  (let ((endpoints (warp-connection-manager-endpoints cm)))
-    (unless endpoints
-      (warp:log! :warn (warp-connection-manager-id cm)
-                 "No endpoints configured for connection manager.")
-      (cl-return-from warp-cm--select-best-endpoint nil))
+- (warp-cm-endpoint or nil): The optimal endpoint, or `nil`."
+  (let ((endpoints (warp-cm-manager-endpoints cm)))
+    (unless endpoints (cl-return-from warp-cm--select-best-endpoint nil))
 
-    (let ((healthy (cl-remove-if (lambda (e)
-                                   (< (warp-cm-endpoint-health-score e) 0.1))
-                                 endpoints)))
+    (let ((healthy (cl-remove-if-not
+                    (lambda (e) (> (warp-cm-endpoint-health-score e) 0.1))
+                    endpoints)))
       (if healthy
-          (car (cl-sort healthy #'> :key #'warp-cm-endpoint-health-score))
+          (car (sort healthy #'> :key #'warp-cm-endpoint-health-score))
         (progn
-          (warp:log! :warn (warp-connection-manager-id cm)
-                     "No healthy endpoints found. Retrying best unhealthy.")
-          (car (cl-sort (copy-list endpoints) #'<
-                        :key #'warp-cm-endpoint-consecutive-failures)))))))
+          (warp:log! :warn (warp-cm-manager-id cm)
+                     "No healthy endpoints. Retrying best unhealthy.")
+          (car (sort (copy-list endpoints) #'<
+                     :key #'warp-cm-endpoint-consecutive-failures)))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;###autoload
-(cl-defun warp:connection-manager (endpoints
-                                   &key circuit-breaker-id
-                                   circuit-breaker-config)
+(cl-defun warp:connection-manager-create (endpoints 
+                                          &key circuit-breaker-id
+                                               circuit-breaker-config
+                                               event-system) 
   "Create and configure a new connection manager instance.
-This function initializes a `warp-connection-manager` struct, converting
-the provided endpoint addresses into `warp-cm-endpoint` objects. It also
-sets up and registers a `warp-circuit-breaker` for resilience.
 
 Arguments:
-- `ENDPOINTS` (list): A list of endpoint address strings to manage
-  (e.g., `(\"tcp://localhost:8080\" \"tcp://remote.com:8080\")`).
-- `:circuit-breaker-id` (string, optional): A unique service ID for the
-  circuit breaker. If not provided, one is generated based on the manager's ID.
+- `ENDPOINTS` (list): A list of endpoint address strings to manage.
+- `:circuit-breaker-id` (string, optional): A unique ID for the
+  circuit breaker. If not provided, one will be generated.
 - `:circuit-breaker-config` (plist, optional): A plist of options to
-  pass to `warp:circuit-breaker-get` when initializing the circuit breaker
-  (e.g., `:threshold`, `:timeout`, `:reset-timeout`).
+  pass to `warp:circuit-breaker-get` when creating or retrieving the
+  circuit breaker.
+- `:event-system` (warp-event-system, optional): The event system
+  instance to associate with the circuit breaker created by this manager.
+  If the circuit breaker emits events, this is necessary for them to be
+  processed.
 
 Returns:
-- (warp-connection-manager): A new, configured manager instance.
+- (warp-cm-manager): A new, configured manager instance.
 
 Side Effects:
-- Creates and registers a `warp-circuit-breaker` instance globally."
+- Creates and registers a `warp-circuit-breaker` instance globally,
+  optionally associating it with the provided `event-system`."
   (let* ((endpoint-objs (mapcar (lambda (e) (%%make-cm-endpoint :address e))
                                 (ensure-list endpoints)))
          (cm-id (format "warp-cm-%08x" (random (expt 2 32))))
          (cb-id (or circuit-breaker-id (format "cm-cb-%s" cm-id)))
-         (cm (%%make-connection-manager
+         (cm (%%make-cm-manager
               :id cm-id
               :endpoints endpoint-objs
               :circuit-breaker-id cb-id)))
-    (apply #'warp:circuit-breaker-get cb-id circuit-breaker-config)
+    (apply #'warp:circuit-breaker-get cb-id
+           (append circuit-breaker-config (list :event-system event-system)))
     cm))
 
 ;;;###autoload
 (defun warp:connection-manager-connect (cm &rest transport-options)
   "Establish a resilient connection using the manager.
-This function selects the best available endpoint based on health, then
-attempts to connect using `warp:transport-connect`. This connection
-attempt is wrapped by the manager's circuit breaker to prevent hammering
-unhealthy services. The underlying `warp-transport-connection` is
-responsible for its own reconnection logic.
+This function selects the best endpoint, then attempts to connect,
+wrapping the attempt in a circuit breaker.
 
 Arguments:
-- `CM` (warp-connection-manager): The manager instance.
-- `&rest TRANSPORT-OPTIONS` (plist): A plist of options to pass directly
-  to `warp:transport-connect` (e.g., `:pool-config`, `:read-timeout`).
+- `CM` (warp-cm-manager): The manager instance.
+- `&rest TRANSPORT-OPTIONS` (plist): Options to pass to
+  `warp:transport-connect`.
 
 Returns:
-- (loom-promise): A promise that resolves with the manager `CM` itself
-  once an initial connection is established, or rejects if the circuit
-  breaker is open or the initial connection attempt fails.
+- (loom-promise): A promise that resolves with the manager `CM` on
+  a successful connection, or rejects on failure.
 
 Side Effects:
 - May open a network connection via `warp-transport`.
-- Sets the `active-connection` slot on the manager upon successful connection.
-- Updates the health metrics of the chosen endpoint.
+- Updates endpoint health metrics.
+- May affect the state of the associated `warp-circuit-breaker`."
+  (loom:with-mutex! (warp-cm-manager-lock cm)
+    (cl-block warp:connection-manager-connect
+      (let* ((endpoint (warp-cm--select-best-endpoint cm))
+            (cb-id (warp-cm-manager-circuit-breaker-id cm)))
+        (unless endpoint
+          (cl-return-from warp:connection-manager-connect
+            (loom:rejected!
+            (make-instance 'warp-cm-manager-no-endpoints))))
 
-Signals:
-- `warp-connection-manager-no-endpoints`: If no endpoints are configured.
-- `warp-circuit-breaker-open-error`: If the circuit breaker is in the
-  `open` state, preventing connection attempts."
-  (loom:with-mutex! (warp-connection-manager-lock cm)
-    (let* ((endpoint (warp-cm--select-best-endpoint cm))
-           (cb-id (warp-connection-manager-circuit-breaker-id cm)))
-      (unless endpoint
-        (cl-return-from warp:connection-manager-connect
-          (loom:rejected! (make-instance 'warp-connection-manager-no-endpoints))))
-
-      (let ((connect-fn
-             (lambda ()
-               (braid! (apply #'warp:transport-connect
-                              (warp-cm-endpoint-address endpoint)
-                              transport-options)
-                 (:then (lambda (conn)
-                          (warp-cm--update-endpoint-health endpoint t)
-                          (setf (warp-connection-manager-active-connection cm)
-                                conn)
-                          cm)) ; Resolve with the manager itself
-                 (:catch (lambda (err)
-                           (warp-cm--update-endpoint-health endpoint nil)
-                           (loom:rejected! err)))))))
-        (warp:circuit-breaker-execute cb-id connect-fn)))))
+        (let ((connect-fn
+              (lambda ()
+                (braid! (apply #'warp:transport-connect
+                                (warp-cm-endpoint-address endpoint)
+                                transport-options)
+                  (:then (lambda (conn)
+                            (warp-cm--update-endpoint-health endpoint t)
+                            (setf (warp-cm-manager-active-connection cm) conn)
+                            cm))
+                  (:catch (lambda (err)
+                            (warp-cm--update-endpoint-health endpoint nil)
+                            (loom:rejected! err)))))))
+          ;; `warp:circuit-breaker-execute` already handles the promise chaining.
+          (warp:circuit-breaker-execute cb-id connect-fn))))))
 
 ;;;###autoload
 (defun warp:connection-manager-send (cm message)
   "Send a `MESSAGE` over the active connection managed by `CM`.
-This function serializes the message and sends it via the currently
-active `warp-transport-connection`.
 
 Arguments:
-- `CM` (warp-connection-manager): The connection manager instance.
-- `MESSAGE` (any): The Lisp object to send (it will be serialized by
-  the underlying transport).
+- `CM` (warp-cm-manager): The connection manager instance.
+- `MESSAGE` (any): The Lisp object to send.
 
 Returns:
-- (loom-promise): A promise that resolves when the message is successfully
-  sent, or rejects if there is no active connection or the send operation fails.
-
-Signals:
-- `warp-connection-manager-error`: If there is no active connection.
-- `warp-transport-invalid-state`: If the underlying connection is not
-  in the `:connected` state (propagated from `warp:transport-send`)."
-  (if-let (conn (warp-connection-manager-active-connection cm))
+- (loom-promise): A promise that resolves on successful send, or
+  rejects if there is no active connection or the send fails."
+  (if-let (conn (warp-cm-manager-active-connection cm))
       (warp:transport-send conn message)
-    (loom:rejected! (make-instance 'warp-connection-manager-error
+    (loom:rejected! (make-instance 'warp-cm-manager-error
                                    :message "No active connection"))))
 
 ;;;###autoload
 (defun warp:connection-manager-get-connection (cm)
-  "Get the currently active `warp-transport-connection` from the manager.
+  "Get the currently active `warp-transport-connection`.
 
 Arguments:
-- `CM` (warp-connection-manager): The manager instance.
+- `CM` (warp-cm-manager): The manager instance.
 
 Returns:
-- (warp-transport-connection or nil): The active connection, or `nil` if
-  the manager is not currently connected."
-  (warp-connection-manager-active-connection cm))
+- (warp-transport-connection or nil): The active connection, or `nil`."
+  (warp-cm-manager-active-connection cm))
 
 ;;;###autoload
 (defun warp:connection-manager-shutdown (cm)
   "Shut down the connection manager gracefully.
-This function closes the currently active `warp-transport-connection`
-managed by the manager. It resolves once the underlying connection is closed.
+This closes the currently active `warp-transport-connection`.
 
 Arguments:
-- `CM` (warp-connection-manager): The connection manager to shut down.
+- `CM` (warp-cm-manager): The manager to shut down.
 
 Returns:
-- (loom-promise): A promise that resolves to `t` when the underlying
+- (loom-promise): A promise that resolves to `t` when the
   connection is closed.
 
 Side Effects:
-- Closes the active network connection.
-- Sets `active-connection` slot to `nil`."
-  (if-let (conn (warp-connection-manager-active-connection cm))
+- Closes the active network connection."
+  (if-let (conn (warp-cm-manager-active-connection cm))
       (progn
-        (setf (warp-connection-manager-active-connection cm) nil)
+        (setf (warp-cm-manager-active-connection cm) nil)
         (warp:transport-close conn))
     (loom:resolved! t)))
+
+;;;###autoload
+(defun warp:connection-manager-add-endpoint (cm address)
+  "Dynamically add a new endpoint `ADDRESS` to the manager `CM`.
+This allows for runtime modification of the list of servers that
+the connection manager can attempt to connect to.
+
+Arguments:
+- `CM` (warp-cm-manager): The manager instance.
+- `ADDRESS` (string): The new endpoint address string (e.g.,
+  \"tcp://another-host:port\").
+
+Returns:
+- `t` on success.
+
+Side Effects:
+- Modifies the manager's internal list of endpoints by adding a new
+  `warp-cm-endpoint` instance with default health metrics."
+  (loom:with-mutex! (warp-cm-manager-lock cm)
+    (unless (member address (mapcar #'warp-cm-endpoint-address
+                                    (warp-cm-manager-endpoints cm))
+                    :test #'string=)
+      (push (%%make-cm-endpoint :address address)
+            (warp-cm-manager-endpoints cm)))
+    t))
+
+;;;###autoload
+(defun warp:connection-manager-remove-endpoint (cm address)
+  "Dynamically remove an endpoint `ADDRESS` from the manager `CM`.
+This is useful for removing unresponsive or permanently failed servers
+from the connection manager's rotation.
+
+Arguments:
+- `CM` (warp-cm-manager): The manager instance.
+- `ADDRESS` (string): The endpoint address string to remove.
+
+Returns:
+- `t` on success.
+
+Side Effects:
+- Modifies the manager's internal list of endpoints by removing the
+  specified endpoint."
+  (loom:with-mutex! (warp-cm-manager-lock cm)
+    (setf (warp-cm-manager-endpoints cm)
+          (cl-remove-if (lambda (ep)
+                          (string= (warp-cm-endpoint-address ep) address))
+                        (warp-cm-manager-endpoints cm)))
+    t))
+
+;;;###autoload
+(defun warp:connection-manager-mark-endpoint-down (cm address)
+  "Manually mark an endpoint as unhealthy.
+This immediately sets its health score to 0 and increments its
+consecutive failure count, effectively taking it out of the primary
+selection rotation until it recovers naturally via the circuit breaker's
+half-open state, or is manually reset. This can be used by external
+monitoring systems to indicate an endpoint outage.
+
+Arguments:
+- `CM` (warp-cm-manager): The manager instance.
+- `ADDRESS` (string): The endpoint address string to mark down.
+
+Returns:
+- `t` if the endpoint was found, `nil` otherwise.
+
+Side Effects:
+- Modifies the health score and consecutive failures of the specified
+  `warp-cm-endpoint` object within the manager."
+  (loom:with-mutex! (warp-cm-manager-lock cm)
+    (if-let (endpoint (cl-find-if (lambda (ep)
+                                    (string= (warp-cm-endpoint-address ep)
+                                             address))
+                                  (warp-cm-manager-endpoints cm)))
+        (progn
+          (setf (warp-cm-endpoint-health-score endpoint) 0.0)
+          (cl-incf (warp-cm-endpoint-consecutive-failures endpoint))
+          t)
+      nil)))
 
 (provide 'warp-connection-manager)
 ;;; warp-connection-manager.el ends here
