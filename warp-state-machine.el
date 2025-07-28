@@ -1,31 +1,14 @@
-;;; warp-state-machine.el --- Generic State Machine Implementation -*- lexical-binding: t; -*-
+;;; warp-state-machine.el --- Reusable State Machine Pattern -*- lexical-binding: t; -*-
 
 ;;; Commentary:
+;; A generic, reusable state machine implementation that can be used
+;; by any component to manage complex state transitions. This module
+;; provides the fundamental building blocks for defining states,
+;; allowed transitions, and executing actions or hooks upon state changes.
 ;;
-;; This module provides a generic, declarative implementation of the State
-;; Machine design pattern. It allows defining an entity's possible
-;; states, valid transitions, and actions to perform upon entering or
-;; exiting a state.
-;;
-;; This is a high-value abstraction for managing complex, sequential
-;; lifecycles and ensuring robust, predictable behavior in components
-;; like `warp-worker` and `warp-cluster`.
-;;
-;; ## Key Features:
-;;
-;; - **Declarative State Definition**: Define states and their allowed
-;;   transitions explicitly, making the state model clear.
-;; - **Strict Transition Enforcement**: Prevents invalid state changes,
-;;   enhancing system robustness and debugging.
-;; - **Entry/Exit Hooks**: Allows associating functions (`on-entry`,
-;;   `on-exit`) with states for clean setup/teardown logic. Hooks can
-;;   now return `loom-promise`s for asynchronous execution.
-;; - **Contextual Data**: Supports a shared, mutable context that is
-;;   passed to all state transition functions and hooks.
-;; - **Observability**: Logs state transitions and hook invocations.
-;; - **Thread Safety**: All state modifications are protected by a mutex.
-;; - **Asynchronous Transitions**: `warp:state-machine-transition` now
-;;   returns a `loom-promise` to await asynchronous hook completions.
+;; This is a powerful abstraction for formalizing component behavior,
+;; preventing illegal state changes, and ensuring robust, predictable
+;; system flow.
 
 ;;; Code:
 
@@ -33,292 +16,358 @@
 (require 'loom)
 (require 'braid)
 
-(require 'warp-log)
 (require 'warp-error)
-(require 'warp-marshal)
+(require 'warp-log)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
 
 (define-error 'warp-state-machine-error
-  "Generic error for `warp-state-machine` operations."
+  "A generic error occurred during a `warp-state-machine` operation."
   'warp-error)
 
 (define-error 'warp-state-machine-invalid-transition
-  "Attempted an invalid state transition."
+  "Signaled on an attempt to perform an invalid state transition."
   'warp-state-machine-error)
 
 (define-error 'warp-state-machine-state-not-found
-  "Attempted to access an undefined state in the state machine."
+  "Signaled on an attempt to access or transition to an undefined state."
   'warp-state-machine-error)
 
 (define-error 'warp-state-machine-hook-error
-  "An error occurred during a state machine hook execution."
+  "Signaled when an error occurs during the execution of a hook or action."
   'warp-state-machine-error)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Schema Definitions
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Struct Definitions
 
-(warp:defschema warp-state-definition
-    ((:constructor make-warp-state-definition)
-     (:copier nil))
-  "Defines a single state and its behavior within a state machine.
-This struct is the building block for the machine's state graph.
-
-Fields:
-- `name`: Unique symbolic name of the state (e.g., `:running`).
-- `transitions`: List of symbols representing legal transitions *to*
-  from this state.
-- `on-entry-fn`: Optional `(lambda (context old new))` hook called on
-  entry. Can return a `loom-promise`.
-- `on-exit-fn`: Optional `(lambda (context old new))` hook called on
-  exit. Can return a `loom-promise`."
-  (name nil :type symbol)
-  (transitions nil :type list)
-  (on-entry-fn nil :type (or null function))
-  (on-exit-fn nil :type (or null function)))
-
-(cl-defstruct (warp-state-machine (:constructor %%make-state-machine))
-  "Manages the state and transitions of an entity.
-This object encapsulates the entire state graph and the current
-position within it, ensuring all state changes are valid and
-thread-safe.
+(cl-defstruct (warp-state-machine
+               (:constructor make-warp-state-machine)
+               (:copier nil))
+  "A generic state machine for managing component lifecycles and behaviors.
 
 Fields:
-- `name`: Descriptive name (string) for the state machine.
-- `lock`: `loom-lock` mutex for thread-safe state transitions.
-- `current-state`: Current active state (symbol).
-- `states`: Hash table mapping state names to `warp-state-definition`s.
-- `context`: Shared, mutable plist for all hook functions."
-  (name nil :type string)
-  (lock nil :type loom-lock)
-  (current-state nil :type symbol)
-  (states nil :type hash-table)
-  (context nil :type plist))
+- `id` (string): A unique identifier for this state machine instance.
+- `current-state` (keyword): The current active state of the FSM.
+- `states` (hash-table): Maps a state name (keyword) to its
+  `warp-state-definition` object.
+- `transitions` (hash-table): Maps a state name (keyword) to a list of
+  allowed target state names.
+- `hooks` (hash-table): Maps an event type (keyword) to a list of hook
+  functions to be called.
+- `context` (plist): A mutable property list of contextual data shared
+  across all FSM operations and passed to hooks/actions.
+- `error-handler` (function): An optional function `(lambda (context err
+  old new))` to handle errors during transitions or actions.
+- `lock` (loom-lock): A mutex protecting the state machine from concurrent
+  modification, ensuring thread-safe state changes."
+  (id nil :type string)
+  (current-state :initialized :type keyword)
+  (states (make-hash-table :test 'eq) :type hash-table)
+  (transitions (make-hash-table :test 'eq) :type hash-table)
+  (hooks (make-hash-table :test 'eq) :type hash-table)
+  (context nil :type list)
+  (error-handler nil :type (or null function))
+  (lock (loom:lock "state-machine") :type t))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(cl-defstruct (warp-state-definition
+                (:constructor make-warp-state-definition)
+                (:copier nil))
+  "Defines a single state within a state machine.
+
+Fields:
+- `name` (keyword): The unique symbolic name of the state.
+- `entry-actions` (list): A list of functions to call when entering this
+  state. Each function receives `(context old-state new-state event-data)`.
+- `exit-actions` (list): A list of functions to call when leaving this
+  state. Each function receives `(context old-state new-state event-data)`.
+- `timeout` (number): An optional timeout in seconds for executing this
+  state's entry actions.
+- `metadata` (list): An arbitrary property list associated with the state."
+  (name nil :type keyword)
+  (entry-actions nil :type list)
+  (exit-actions nil :type list)
+  (timeout nil :type (or null number))
+  (metadata nil :type list))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Private Functions
 
-(defun warp--state-machine-get-state-def (machine state-name)
-  "Safely retrieve the definition for a given state name.
-This provides robust access to state definitions.
+(defun warp-state-machine--run-hooks (sm event-type &rest args)
+  "Run all hooks for a given event type asynchronously.
+This function ensures that all registered hooks for a specific event
+are executed. It uses `loom:all-settled` so that one failing hook does
+not prevent others from running.
 
 Arguments:
-- `MACHINE` (warp-state-machine): The state machine instance.
-- `STATE-NAME` (symbol): The name of the state to retrieve.
+- `SM` (warp-state-machine): The state machine instance.
+- `EVENT-TYPE` (keyword): The type of hook to run (e.g., `:before-transition`).
+- `ARGS` (list): Arguments to pass to each hook function.
 
 Returns:
-- (warp-state-definition): The state definition object.
+- (loom-promise): A promise that resolves to `t` after all hooks have
+  been attempted."
+  (loom:promise!
+   (lambda (resolve reject)
+     (if-let ((hooks (gethash event-type (warp-state-machine-hooks sm))))
+         (braid! (loom:all-settled
+                  (cl-loop for hook in hooks
+                           collect
+                           (condition-case err
+                               (apply hook (warp-state-machine-context sm)
+                                      args)
+                             (error
+                              (warp:log! :warn (warp-state-machine-id sm)
+                                         "Error in %S hook: %S"
+                                         event-type err)
+                              (loom:resolved!
+                               (warp:error!
+                                :type 'warp-state-machine-hook-error
+                                :message "Hook failed" :cause err))))))
+           (:then
+            (lambda (results)
+              ;; Log any hook failures but resolve the main promise anyway.
+              (dolist (r results)
+                (when (eq (plist-get r :status) :rejected)
+                  (warp:log! :warn (warp-state-machine-id sm)
+                             "A hook failed during %S: %S"
+                             event-type (plist-get r :value))))
+              (funcall resolve t)))
+           (:catch
+            (lambda (err) ; This catch is for braid! itself failing.
+              (funcall reject
+                       (warp:error!
+                        :type 'warp-state-machine-hook-error
+                        :message "Failed to run hooks"
+                        :cause err)))))
+       ;; If no hooks are registered, resolve immediately.
+       (funcall resolve t)))))
 
-Signals:
-- `warp-state-machine-state-not-found`: If state is not defined."
-  (let ((state-def (gethash state-name (warp-state-machine-states machine))))
-    (unless state-def
-      (signal 'warp-state-machine-state-not-found
-              (list (warp:error!
-                     :type 'warp-state-machine-state-not-found
-                     :message (format "State '%S' not found in machine '%s'."
-                                      state-name
-                                      (warp-state-machine-name machine))))))
-    state-def))
-
-(defun warp--state-machine-run-hook
-    (machine hook-fn-type old-state new-state)
-  "Execute an `on-entry` or `on-exit` hook for a state transition.
-Hooks may return a `loom-promise`, which this function will await.
+(defun warp-state-machine--run-actions
+    (sm actions old-state new-state event-data)
+  "Run a list of state entry or exit actions asynchronously.
+This function executes all actions associated with entering or
+exiting a state. Unlike hooks, if any action fails (rejects its
+promise), the entire sequence is considered failed.
 
 Arguments:
-- `MACHINE` (warp-state-machine): The state machine instance.
-- `HOOK-FN-TYPE` (keyword): Either `:on-entry-fn` or `:on-exit-fn`.
-- `OLD-STATE` (symbol): The state being exited.
-- `NEW-STATE` (symbol): The state being entered.
+- `SM` (warp-state-machine): The state machine instance.
+- `ACTIONS` (list): A list of functions to execute.
+- `OLD-STATE` (keyword): The state being exited.
+- `NEW-STATE` (keyword): The state being entered.
+- `EVENT-DATA` (any): Data related to the transition event.
 
 Returns:
-- (loom-promise): A promise that resolves when the hook completes, or
-  rejects if the hook fails."
-  (let* ((state-to-run (if (eq hook-fn-type :on-entry-fn) new-state old-state))
-         (state-def (warp--state-machine-get-state-def machine state-to-run))
-         (hook-fn (if (eq hook-fn-type :on-entry-fn)
-                      (warp-state-definition-on-entry-fn state-def)
-                    (warp-state-definition-on-exit-fn state-def)))
-         (context (warp-state-machine-context machine))
-         (name (warp-state-machine-name machine)))
+- (loom-promise): A promise that resolves when all actions complete
+  successfully, or rejects with the first error encountered."
+  (loom:promise!
+   (lambda (resolve reject)
+     (braid! (loom:all-settled
+              (cl-loop for action in actions
+                       collect
+                       (condition-case err
+                           (funcall action (warp-state-machine-context sm)
+                                    old-state new-state event-data)
+                         (error
+                          (loom:rejected!
+                           (warp:error!
+                            :type 'warp-state-machine-hook-error
+                            :message "Action failed" :cause err))))))
+       (:then
+        (lambda (results)
+          ;; If any action rejected, propagate the first rejection.
+          (dolist (r results)
+            (when (eq (plist-get r :status) :rejected)
+              (funcall reject (plist-get r :value))
+              (cl-return)))
+          (funcall resolve t)))
+       (:catch (lambda (err) (funcall reject err)))))))
 
-    (if hook-fn
-        (braid! (condition-case err ; Wrap hook execution
-                    (funcall hook-fn context old-state new-state)
-                  (error
-                   (warp:log! :warn name "Error in %S hook for %S: %S"
-                              hook-fn-type state-to-run err)
-                   (loom:rejected!
-                    (warp:error!
-                     :type 'warp-state-machine-hook-error
-                     :message (format "Hook for state %S failed."
-                                      state-to-run)
-                     :cause err)))))
-          (:then (lambda (result) result)) ; Pass through result
-          (:catch (lambda (err) (loom:rejected! err))))
-      (loom:resolved! nil)))) ; No hook function, resolve immediately
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;###autoload
-(cl-defun warp:state-machine (&key (name "anonymous-state-machine")
-                                   initial-state
-                                   states-list
-                                   context)
-  "Create and initialize a new, ready-to-use state machine.
-This constructor parses `states-list` to build the state graph,
-sets the initial state, and runs its `on-entry` hook.
+(defun warp:state-machine-create (id &rest args)
+  "Create a new state machine with the given ID and configuration.
+This is the main factory function for creating a state machine instance.
 
 Arguments:
-- `:name` (string, optional): Descriptive name for logging.
-- `:initial-state` (symbol): Starting state of the machine.
-- `:states-list` (list): Defines the state graph. Each element:
-  `(STATE (TRANSITIONS...) [:on-entry FN] [:on-exit FN])`.
-- `:context` (plist, optional): Shared mutable context for all hooks.
+- `ID` (string): A unique identifier for the state machine instance.
+- `ARGS` (plist): A property list of configuration options:
+  - `:initial-state` (keyword, optional): The starting state of the
+    machine. Defaults to `:initialized`.
+  - `:context` (plist, optional): An initial context property list.
+  - `:error-handler` (function, optional): A function `(lambda (context
+    error old-state new-state))` to handle errors.
 
 Returns:
-- (loom-promise): A promise resolving with the initialized machine
-  after its initial `on-entry` hook completes."
-  (let* ((lock (loom:lock (format "state-machine-lock-%s" name)))
-         (states-ht (make-hash-table :test 'eq))
-         (machine (%%make-state-machine
-                   :name name
-                   :lock lock
-                   :states states-ht
-                   :context (or context '()))))
-    ;; Parse the declarative state list into internal structs.
-    (dolist (state-def-plist states-list)
-      (let* ((state-name (car state-def-plist))
-             (transitions (cadr state-def-plist))
-             (options (cddr state-def-plist))
-             (on-entry-fn (plist-get options :on-entry-fn))
-             (on-exit-fn (plist-get options :on-exit-fn))
-             (state-obj (make-warp-state-definition
-                         :name state-name
-                         :transitions transitions
-                         :on-entry-fn on-entry-fn
-                         :on-exit-fn on-exit-fn)))
-        (puthash state-name state-obj states-ht)))
-
-    ;; Validate and set the initial state.
-    (unless (gethash initial-state states-ht)
-      (signal 'warp-state-machine-state-not-found
-              (list (warp:error!
-                     :type 'warp-state-machine-state-not-found
-                     :message (format "Initial state '%S' not defined."
-                                      initial-state)))))
-
-    (setf (warp-state-machine-current-state machine) initial-state)
-
-    ;; Run the entry hook for the initial state.
-    (braid! (warp--state-machine-run-hook machine
-                                           :on-entry-fn
-                                           nil initial-state)
-      (:then (lambda (_hook-result)
-               (warp:log! :info name "Created. Initial state: %S"
-                          initial-state)
-               machine)) ; Resolve with the machine instance
-      (:catch (lambda (err)
-                (warp:log! :error name "Initialization failed on hook: %S" err)
-                (loom:rejected!
-                 (warp:error!
-                  :type 'warp-state-machine-error
-                  :message (format "Failed to initialize: %S"
-                                   (loom:error-message err))
-                  :cause err)))))))
+- (warp-state-machine): A new, configured state machine instance."
+  (let ((sm (make-warp-state-machine
+             :id id
+             :current-state (plist-get args :initial-state :initialized)
+             :context (or (plist-get args :context) '())
+             :error-handler (plist-get args :error-handler))))
+    (warp:log! :debug id "State machine created (initial state: %S)."
+               (warp-state-machine-current-state sm))
+    sm))
 
 ;;;###autoload
-(defun warp:state-machine-transition (machine new-state)
-  "Attempt to transition the state machine to a new state.
-This thread-safe method validates the transition, executes `on-exit`
-and `on-entry` hooks, and updates the state.
+(defun warp:state-machine-define-state (sm state-name &rest definition-plist)
+  "Define a state and its properties within the state machine.
+This function populates the machine with the definitions of its
+possible states and the transitions allowed from them.
 
 Arguments:
-- `MACHINE` (warp-state-machine): The state machine instance.
-- `NEW-STATE` (symbol): The target state to transition to.
+- `SM` (warp-state-machine): The state machine instance.
+- `STATE-NAME` (keyword): The unique symbolic name of the state.
+- `DEFINITION-PLIST` (plist): A property list defining the state:
+  - `:entry-actions` (list): Functions to call upon entering this state.
+  - `:exit-actions` (list): Functions to call upon exiting this state.
+  - `:timeout` (number): Timeout in seconds for entry actions.
+  - `:transitions-to` (list): A list of allowed target state keywords.
+  - `:metadata` (plist): Arbitrary metadata.
 
 Returns:
-- (loom-promise): A promise resolving to `t` on success (after all
-  hooks complete), or rejecting if transition is invalid or a hook fails.
+- (warp-state-definition): The newly created state definition object."
+  (let ((state-def (make-warp-state-definition
+                    :name state-name
+                    :entry-actions (plist-get definition-plist :entry-actions)
+                    :exit-actions (plist-get definition-plist :exit-actions)
+                    :timeout (plist-get definition-plist :timeout)
+                    :metadata (plist-get definition-plist :metadata)))
+        (allowed-transitions (plist-get definition-plist :transitions-to)))
+    (loom:with-lock (warp-state-machine-lock sm)
+      (puthash state-name state-def (warp-state-machine-states sm))
+      (when allowed-transitions
+        (puthash state-name allowed-transitions
+                 (warp-state-machine-transitions sm))))
+    (warp:log! :debug (warp-state-machine-id sm) "Defined state %S."
+               state-name)
+    state-def))
+
+;;;###autoload
+(defun warp:state-machine-add-hook (sm event-type hook-fn)
+  "Add a hook function for a specific event type in the FSM lifecycle.
+
+Arguments:
+- `SM` (warp-state-machine): The state machine instance.
+- `EVENT-TYPE` (keyword): The hook trigger, e.g., `:before-transition`,
+  `:after-transition`, or `:on-error`.
+- `HOOK-FN` (function): A function `(lambda (context &rest args))` to
+  call. The `args` depend on the `EVENT-TYPE`.
+
+Side Effects:
+- Modifies the `hooks` table in the state machine.
+
+Returns: `nil`."
+  (loom:with-lock (warp-state-machine-lock sm)
+    (let ((hooks-list (gethash event-type (warp-state-machine-hooks sm))))
+      (push hook-fn hooks-list)
+      (puthash event-type hooks-list (warp-state-machine-hooks sm))))
+  (warp:log! :debug (warp-state-machine-id sm) "Added %S hook." event-type)
+  nil)
+
+;;;###autoload
+(defun warp:state-machine-transition (sm target-state &optional event-data)
+  "Transition the state machine to a new state.
+This function orchestrates a state transition. It validates the
+transition, runs exit actions for the current state, updates the
+state, and then runs entry actions for the new state. It also
+executes `:before-transition` and `:after-transition` hooks.
+
+Arguments:
+- `SM` (warp-state-machine): The state machine instance.
+- `TARGET-STATE` (keyword): The state to transition to.
+- `EVENT-DATA` (any, optional): Data related to the event that
+  triggered the transition, passed to hooks and actions.
+
+Returns:
+- (loom-promise): A promise that resolves with `TARGET-STATE` on
+  success, or rejects if the transition is invalid or an action/hook
+  fails.
 
 Signals:
-- `warp-state-machine-invalid-transition`: If transition is invalid.
-- `warp-state-machine-state-not-found`: If `NEW-STATE` not defined."
-  (unless (warp-state-machine-p machine)
-    (signal 'warp-state-machine-error
-            (list (warp:error! :type 'warp-state-machine-error
-                               :message "Invalid state machine object"
-                               :details `(:object ,machine)))))
+- `(warp-state-machine-invalid-transition)`: If the transition is not
+  allowed from the current state.
+- `(warp-state-machine-state-not-found)`: If the `TARGET-STATE` has not
+  been defined."
+  (loom:promise!
+   (lambda (resolve reject)
+     (loom:with-lock (warp-state-machine-lock sm)
+       (let* ((current-state-sym (warp-state-machine-current-state sm))
+              (allowed
+               (gethash current-state-sym
+                        (warp-state-machine-transitions sm)))
+              (current-state-def
+               (gethash current-state-sym (warp-state-machine-states sm)))
+              (target-state-def
+               (gethash target-state (warp-state-machine-states sm))))
 
-  (loom:with-mutex! (warp-state-machine-lock machine)
-    (let* ((current-state (warp-state-machine-current-state machine))
-           (current-def (warp--state-machine-get-state-def
-                         machine current-state))
-           (_new-def (warp--state-machine-get-state-def ; ensure exists
-                      machine new-state)))
-      ;; 1. Validate the transition.
-      (unless (member new-state (warp-state-definition-transitions
-                                 current-def))
-        (signal 'warp-state-machine-invalid-transition
-                (list (warp:error!
-                       :type 'warp-state-machine-invalid-transition
-                       :message (format "Invalid transition: %S -> %S"
-                                        current-state new-state)
-                       :details `(:from ,current-state :to ,new-state)))))
+         ;; 1. Validate transition legality.
+         (unless (or (null allowed) (memq target-state allowed))
+           (funcall reject
+                    (warp:error!
+                     :type 'warp-state-machine-invalid-transition
+                     :message (format "Invalid transition from %S to %S"
+                                      current-state-sym target-state))))
 
-      ;; 2. Orchestrate the transition asynchronously.
-      (braid! (warp--state-machine-run-hook machine
-                                             :on-exit-fn
-                                             current-state new-state)
-        (:then (lambda (_)
-                 ;; 3. Atomically update current state.
-                 (setf (warp-state-machine-current-state machine) new-state)
-                 (warp:log! :info (warp-state-machine-name machine)
-                            "State transition: %S -> %S"
-                            current-state new-state)
-                 ;; 4. Run the entry hook for the new state.
-                 (warp--state-machine-run-hook machine
-                                                 :on-entry-fn
-                                                 current-state new-state)))
-        (:then (lambda (_) t)) ; Resolve with t on success
-        (:catch (lambda (err) (loom:rejected! err)))))))
+         (unless target-state-def
+           (funcall reject
+                    (warp:error!
+                     :type 'warp-state-machine-state-not-found
+                     :message (format "Target state '%S' not defined."
+                                      target-state))))
+
+         ;; 2. Asynchronously chain execution of all hooks and actions.
+         (braid! (warp-state-machine--run-hooks
+                  sm :before-transition current-state-sym target-state
+                  event-data)
+           (:then
+            (lambda (_)
+              (when current-state-def
+                (warp-state-machine--run-actions
+                 sm (warp-state-definition-exit-actions current-state-def)
+                 current-state-sym target-state event-data))))
+           (:then
+            (lambda (_)
+              (setf (warp-state-machine-current-state sm) target-state)
+              (warp:log! :debug (warp-state-machine-id sm)
+                         "State changed: %S -> %S (event: %S)"
+                         current-state-sym target-state event-data)))
+           (:then
+            (lambda (_)
+              (when target-state-def
+                (warp-state-machine--run-actions
+                 sm (warp-state-definition-entry-actions target-state-def)
+                 current-state-sym target-state event-data))))
+           (:then
+            (lambda (_)
+              (warp-state-machine--run-hooks
+               sm :after-transition current-state-sym target-state
+               event-data)))
+           (:then (lambda (_) (funcall resolve target-state)))
+           (:catch
+            (lambda (err)
+              ;; Central error handling for any step in the transition.
+              (warp:log! :error (warp-state-machine-id sm)
+                         "Error during transition from %S to %S: %S"
+                         current-state-sym target-state err)
+              (when-let ((handler (warp-state-machine-error-handler sm)))
+                (funcall handler (warp-state-machine-context sm)
+                         err current-state-sym target-state))
+              (funcall reject err)))))))))
 
 ;;;###autoload
-(defun warp:state-machine-current-state (machine)
+(defun warp:state-machine-get-state (sm)
   "Get the current state of the state machine thread-safely.
 
 Arguments:
-- `MACHINE` (warp-state-machine): The state machine instance.
+- `SM` (warp-state-machine): The state machine instance.
 
 Returns:
-- (symbol): The current state."
-  (unless (warp-state-machine-p machine)
-    (signal 'warp-state-machine-error
-            (list (warp:error! :type 'warp-state-machine-error
-                               :message "Invalid state machine object"
-                               :details `(:object ,machine)))))
-  (loom:with-mutex! (warp-state-machine-lock machine)
-    (warp-state-machine-current-state machine)))
-
-;;;###autoload
-(defun warp:state-machine-list-states (machine)
-  "List all defined states in the state machine.
-
-Arguments:
-- `MACHINE` (warp-state-machine): The state machine instance.
-
-Returns:
-- (list): A list of symbols of all defined state names."
-  (unless (warp-state-machine-p machine)
-    (signal 'warp-state-machine-error
-            (list (warp:error! :type 'warp-state-machine-error
-                               :message "Invalid state machine object"
-                               :details `(:object ,machine)))))
-  (loom:with-mutex! (warp-state-machine-lock machine)
-    (hash-table-keys (warp-state-machine-states machine))))
+- (keyword): The current state symbol."
+  (loom:with-lock (warp-state-machine-lock sm)
+    (warp-state-machine-current-state sm)))
 
 (provide 'warp-state-machine)
 ;;; warp-state-machine.el ends here
