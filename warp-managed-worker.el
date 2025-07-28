@@ -2,30 +2,27 @@
 
 ;;; Commentary:
 ;;
-;; This module introduces a dedicated abstraction for a "Managed Worker"
-;; on the master side of the Warp distributed computing framework.
-;; Unlike the `warp-worker` struct (which represents the worker's own
-;; internal state), `warp-managed-worker` is the master's comprehensive
-;; view of a worker, designed to support robust cluster management,
-;; load balancing, and dynamic scaling decisions.
+;; This module defines the `warp-managed-worker` struct, which is the
+;; master's comprehensive, authoritative view of a worker process. It is
+;; distinct from the `warp-worker` struct, which represents a worker's
+;; own internal state.
 ;;
-;; This separation of concerns clarifies which state is authoritative
-;; on the master versus the worker, preventing ambiguity and enabling
-;; more accurate operational insights.
+;; This separation is critical for robust cluster management. The
+;; `warp-managed-worker` holds not only the state *reported by* the
+;; worker (like metrics) but also the state *observed by* the master
+;; (like RPC latency and circuit breaker status).
 ;;
-;; ## Key Features:
+;; ## Architectural Role:
 ;;
-;; - **Master's View of a Worker**: Encapsulates all worker-related
-;;   information that the master needs to track.
-;; - **Dynamic State Tracking**: Reliably stores the last reported
-;;   metrics, health status, and active connections for load balancing.
-;; - **RPC Tracking**: Tracks master-initiated RPCs for load estimation.
-;;   Distinguishes between worker-reported and master-observed RPC metrics.
+;; - **Master's View of a Worker**: Encapsulates all information the
+;;   master needs to track for load balancing, health monitoring, and
+;;   fault tolerance.
+;; - **Decoupled Metrics Ingestion**: This version is updated to consume a
+;;   generic hash table of metrics from the `warp-metrics-pipeline`,
+;;   removing the tight coupling to a specific metrics struct.
 ;; - **Circuit Breaker Integration**: Each managed worker is associated
-;;   with a dedicated circuit breaker to protect against repeated failures
-;;   when communicating with that worker, preventing cascading failures.
-;; - **Clear Separation**: Distinguishes between the worker's internal
-;;   perspective and the master's external management perspective.
+;;   with a dedicated circuit breaker to protect the master from repeated
+;;   failures when communicating with that worker.
 
 ;;; Code:
 
@@ -34,9 +31,8 @@
 
 (require 'warp-log)
 (require 'warp-rpc)
-(require 'warp-metrics)
 (require 'warp-circuit-breaker)
-(require 'warp-marshal)
+(require 'warp-transport)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definitions
@@ -47,129 +43,144 @@
   "Master's comprehensive view of a managed worker process.
 This struct holds all information the master needs to track and manage
 a worker, including its dynamic state, metrics, and associated
-resources.
+resources like its network connection and circuit breaker.
 
 Fields:
-- `worker-id`: The unique string ID of the worker process (read-only).
-- `rank`: The 1-indexed numerical rank (integer) of the worker within
-  its pool (read-only).
-- `connection`: The active `warp-transport-connection` to this worker.
-- `last-heartbeat-time`: The `float-time` timestamp of the last
-  heartbeat message successfully received from this worker.
-- `health-status`: The worker's current health status (symbol, e.g.,
-  `:healthy`, `:unhealthy`), as determined by the master.
-- `last-reported-metrics`: The last full `warp-worker-metrics` report
-  received from this worker. This is the worker's self-reported metrics.
-- `active-rpcs-to-worker`: The current count of master-initiated RPCs
-  that are in-flight (pending a response) to this worker. Used for load
-  estimation. (Master-observed).
-- `observed-avg-rpc-latency`: The master's observed running average RPC
-  latency (float, in seconds) to this worker. (Master-observed).
-- `reported-avg-rpc-latency`: The worker's self-reported average RPC
-  latency (float, in seconds). (Worker-reported).
-- `last-rpc-latency`: The master's observed latency (float, in seconds)
-  of the most recent RPC sent to this worker. (Master-observed).
-- `total-rpcs-sent`: The cumulative count of all RPCs sent by the master
-  to this worker since its registration. (Master-observed).
-- `failed-rpcs-sent`: The cumulative count of failed RPCs sent by the
-  master to this worker. (Master-observed).
-- `circuit-breaker`: The `warp-circuit-breaker` instance guarding
-  communications from the master to this worker.
-- `resource-limits`: Optional plist containing configuration for
-  resource limits applied to this worker by the master.
-- `config-version`: The version string of the configuration currently
-  applied to this worker."
+- `worker-id` (string): The unique string ID of the worker process.
+- `rank` (integer): The numerical rank of the worker, assigned at launch.
+- `connection` (warp-transport-connection or nil): The active
+  `warp-transport-connection` to this worker. This is how the master
+  communicates with the worker via RPC.
+- `last-heartbeat-time` (float): The timestamp (`float-time`) of the
+  last heartbeat received from this worker. Used for liveness tracking.
+- `health-status` (symbol): The worker's current overall health status
+  (e.g., `:healthy`, `:degraded`, `:unhealthy`), as determined by the
+  master based on various observations.
+- `last-reported-metrics` (hash-table or nil): A hash table containing
+  the last full metrics report received from this worker's
+  `warp-metrics-pipeline`. This is the worker's self-reported state.
+- `active-rpcs` (integer): The current count of master-initiated RPCs
+  that are in-flight (sent but awaiting response) to this worker.
+- `observed-avg-rpc-latency` (float): The master's observed running
+  average RPC latency (in seconds) to this worker. This is a key metric
+  for load balancing.
+- `circuit-breaker` (warp-circuit-breaker or nil): The
+  `warp-circuit-breaker` instance guarding all outgoing communications
+  from the master to this worker. This prevents the master from
+  overwhelming a failing worker.
+- `initial-weight` (float): The base capacity weight assigned to this
+  worker. Used in some load balancing calculations, can be adjusted
+  dynamically."
   (worker-id nil :type string :read-only t)
   (rank nil :type integer :read-only t)
-  (connection nil :type warp-transport-connection)
+  (connection nil :type (or null t))
   (last-heartbeat-time 0.0 :type float)
   (health-status :unknown :type symbol)
-  (last-reported-metrics nil :type (or null warp-worker-metrics))
-  (active-rpcs-to-worker 0 :type integer)
-  (observed-avg-rpc-latency 0.0 :type float) ; Master's observed average
-  (reported-avg-rpc-latency 0.0 :type float) ; Worker's reported average
-  (last-rpc-latency 0.0 :type float)
-  (total-rpcs-sent 0 :type integer)
-  (failed-rpcs-sent 0 :type integer)
-  (circuit-breaker nil :type (or null warp-circuit-breaker))
-  (resource-limits nil :type (or null plist))
-  (config-version "0.0.0" :type string))
-
-(warp:defprotobuf-mapping! warp-managed-worker
-  `((worker-id 1 :string)
-    (rank 2 :int32)
-    (last-heartbeat-time 3 :int64) ; float-time converted to milliseconds for PB
-    (health-status 4 :string) ; keyword converted to string for PB
-    (last-reported-metrics 5 :bytes) ; warp-worker-metrics serialized to bytes
-    (active-rpcs-to-worker 6 :int32)
-    (observed-avg-rpc-latency 7 :double) ; float converted to double for PB
-    (reported-avg-rpc-latency 8 :double) ; float converted to double for PB
-    (last-rpc-latency 9 :double) ; float converted to double for PB
-    (total-rpcs-sent 10 :int64)
-    (failed-rpcs-sent 11 :int64)
-    (resource-limits 12 :bytes) ; plist serialized to bytes
-    (config-version 13 :string)))
+  (last-reported-metrics nil :type (or null hash-table))
+  (active-rpcs 0 :type integer)
+  (observed-avg-rpc-latency 0.0 :type float)
+  (circuit-breaker nil :type (or null t))
+  (initial-weight 1.0 :type float))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;###autoload
-(defun warp:managed-worker-update-metrics (managed-worker worker-metrics)
-  "Update the managed worker's state from a worker metrics report.
+(defun warp:managed-worker-update-from-metrics (m-worker metrics-hash)
+  "Update the managed worker's state from a metrics report hash table.
 This function is the primary way the master ingests state information
-*from* a worker and updates its own view.
+*from* a worker's heartbeat and updates its own view. It is decoupled
+from any specific metrics struct, consuming a generic hash table, which
+makes it flexible to changes in the worker's metrics reporting.
 
 Arguments:
-- `managed-worker` (warp-managed-worker): The managed worker instance.
-- `worker-metrics` (warp-worker-metrics): The latest metrics report."
-  ;; Store the latest raw metrics reported by the worker.
-  (setf (warp-managed-worker-last-reported-metrics managed-worker)
-        worker-metrics)
+- `M-WORKER` (warp-managed-worker): The managed worker instance to update.
+- `METRICS-HASH` (hash-table): The latest metrics report from the
+  worker's `warp-metrics-pipeline` (or other source). Expected to be
+  a hash table mapping string keys to values.
 
-  ;; Defensively update health status from the metrics payload, if available.
-  (when-let (health (and (fboundp 'warp-metrics-warp-worker-metrics-health-status)
-                         (warp-metrics-warp-worker-metrics-health-status
-                          worker-metrics)))
-    (setf (warp-managed-worker-health-status managed-worker) health))
+Returns: `nil`.
 
-  ;; Update the worker-reported average RPC latency.
-  (setf (warp-managed-worker-reported-avg-rpc-latency managed-worker)
-        (warp-metrics-warp-worker-metrics-average-request-duration
-         worker-metrics)))
+Side Effects:
+- Modifies `M-WORKER` with the latest self-reported data (`last-reported-metrics`,
+  `health-status`, `last-heartbeat-time`).
 
-;;;###autoload
-(defun warp:managed-worker-rpc-sent (managed-worker command-name
-                                     rpc-latency success-p)
-  "Update master's RPC tracking for a worker after an RPC completes.
-This function updates the master's *own observations* of a worker's
-performance, which is distinct from the worker's self-reported
-metrics. It also interacts with the worker's circuit breaker.
+Signals:
+- `(error)`: If `METRICS-HASH` is not a hash table."
+  (unless (hash-table-p metrics-hash)
+    (error "metrics-hash must be a hash table for worker %s"
+           (warp-managed-worker-worker-id m-worker)))
+
+  ;; Store the latest raw metrics hash reported by the worker.
+  (setf (warp-managed-worker-last-reported-metrics m-worker) metrics-hash)
+
+  ;; Update health status from the worker-reported metrics. The key
+  ;; "health_status" is a standardized key expected from the pipeline.
+  (setf (warp-managed-worker-health-status m-worker)
+        (gethash "health_status" metrics-hash :unknown))
+
+  ;; Update last heartbeat time.
+  (setf (warp-managed-worker-last-heartbeat-time m-worker) (float-time)))
+
+(defun warp:managed-worker-record-rpc (m-worker rpc-latency success-p)
+  "Update the master's RPC tracking for a worker after an RPC completes.
+This function updates the master's *own observations* of a
+worker's performance (RPC latency and success/failure rate). It is
+distinct from the worker's self-reported metrics and is crucial for
+accurate, master-side load balancing and fault tolerance. It also
+informs the associated circuit breaker.
 
 Arguments:
-- `managed-worker` (warp-managed-worker): The managed worker instance.
-- `command-name` (symbol): The RPC command that was sent.
-- `rpc-latency` (float): The observed latency of the RPC.
-- `success-p` (boolean): Whether the RPC was successful."
-  (cl-incf (warp-managed-worker-total-rpcs-sent managed-worker))
-  (unless success-p
-    (cl-incf (warp-managed-worker-failed-rpcs-sent managed-worker)))
+- `M-WORKER` (warp-managed-worker): The managed worker instance.
+- `RPC-LATENCY` (float): The observed latency of the RPC in seconds.
+- `SUCCESS-P` (boolean): Whether the RPC was successful.
 
-  ;; Update the running average RPC latency observed by the master.
-  ;; Using an EMA for smoother average.
-  (let* ((current-avg (warp-managed-worker-observed-avg-rpc-latency managed-worker))
-         (alpha 0.2)) ; Smoothing factor
-    (setf (warp-managed-worker-observed-avg-rpc-latency managed-worker)
+Returns: `nil`.
+
+Side Effects:
+- Updates `M-WORKER`'s `observed-avg-rpc-latency`.
+- Notifies the associated `warp-circuit-breaker` instance of the RPC
+  outcome (`success` or `failure`), which may cause the circuit to
+  trip or recover. This is an asynchronous operation but is awaited
+  to ensure the state update is queued/processed.
+
+Signals: None (errors from circuit breaker are handled internally)."
+  ;; Update the running average RPC latency observed by the master
+  ;; using an Exponential Moving Average (EMA) for a smoother average.
+  (let* ((current-avg (warp-managed-worker-observed-avg-rpc-latency m-worker))
+         (alpha 0.2)) ; Smoothing factor for EMA. Higher alpha, more responsive.
+    (setf (warp-managed-worker-observed-avg-rpc-latency m-worker)
           (if (> current-avg 0.0)
-              (+ (* alpha rpc-latency)
-                 (* (- 1 alpha) current-avg))
-            rpc-latency))) ; Initialize if first RPC
+              ;; If there's a previous average, apply EMA formula.
+              (+ (* alpha rpc-latency) (* (- 1 alpha) current-avg))
+            ;; Otherwise, initialize with the first data point.
+            rpc-latency)))
 
-  (setf (warp-managed-worker-last-rpc-latency managed-worker) rpc-latency)
+  ;; Notify the circuit breaker of the outcome. This allows the breaker
+  ;; to track the worker's reliability and trip if it fails too often,
+  ;; protecting the master from repeated communication attempts to a
+  ;; faulty worker.
+  (when-let ((cb (warp-managed-worker-circuit-breaker m-worker)))
+    (if success-p
+        ;; Call the correct API for circuit breaker success.
+        ;; Await to ensure the state update is initiated without blocking main.
+        (loom:await (warp:circuit-breaker-record-success cb))
+      ;; Call the correct API for circuit breaker failure.
+      ;; Await to ensure the state update is initiated.
+      (loom:await (warp:circuit-breaker-record-failure cb)))))
 
-  ;; Log at trace level as this can be a very frequent operation.
-  (warp:log! :trace (warp-managed-worker-worker-id managed-worker)
-             "RPC %S to worker: latency=%.3fs, success=%s"
-             command-name rpc-latency success-p))
+;;;######autoload
+(defun warp:managed-worker-avg-latency (m-worker)
+  "Retrieves the master-observed average RPC latency for this worker.
+This is a key metric for latency-based load balancing strategies.
+
+Arguments:
+- `M-WORKER` (warp-managed-worker): The managed worker instance.
+
+Returns:
+- (float): The observed average RPC latency in seconds. Returns 0.0 if
+  no latency has been observed yet."
+  (warp-managed-worker-observed-avg-rpc-latency m-worker))
 
 (provide 'warp-managed-worker)
 ;;; warp-managed-worker.el ends here
