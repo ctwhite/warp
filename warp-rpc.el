@@ -1,34 +1,29 @@
-;;; warp-rpc.el --- Core RPC Handling and Generic Messaging Schemas
-;;; -*- lexical-binding: t; -*-
+;;; warp-rpc.el --- Component-based RPC Framework for Warp -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
-;; This module centralizes the core Remote Procedure Call (RPC) mechanics
-;; for the Warp framework. It provides the fundamental primitives for
-;; initiating RPC requests and handling their responses, including
-;; managing correlation IDs and associating them with `loom-promise`
-;; instances.
+;; This module provides a robust, asynchronous, and component-based
+;; Remote Procedure Call (RPC) framework. It encapsulates all logic for
+;; making requests, handling responses, managing timeouts, and routing
+;; incoming commands to registered handlers.
 ;;
-;; Crucially, this module also **defines the generic, core message
-;; schemas** (prefixed with `warp-rpc-`) that form the foundation of all
-;; inter-component communication in Warp.
+;; ## Architectural Role:
 ;;
-;; ## Key Responsibilities:
+;; This refactored version introduces the `warp-rpc-system` component,
+;; which replaces the previous global state model. The `rpc-system` is a
+;; self-contained component that can be integrated into any part of the
+;; Warp framework (like a worker or cluster).
 ;;
-;; -   **Generic Message Schemas**: Defines the universal
-;;     `warp-rpc-message` envelope and the `warp-rpc-command` structure.
-;; -   **`warp:rpc-request`**: Initiates an RPC request, creates a unique
-;;     correlation ID, registers a pending `loom-promise`, and
-;;     dispatches the message via the transport layer.
-;; -   **`warp:rpc-handle-response`**: Processes incoming RPC response
-;;     messages, resolves or rejects the associated `loom-promise`, and
-;;     cleans up the pending request.
-;; -   **Correlation ID Management**: Maintains a thread-safe registry
-;;     of pending requests using their correlation IDs.
-;; -   **Error Handling**: Centralizes the recognition and
-;;     deserialization of RPC-specific error payloads.
+;; Key features include:
+;; - **Component-Based**: All state is encapsulated within the
+;;   `warp-rpc-system` struct, making it a manageable component.
+;; - **Declarative Handler Registration**: The `warp:defrpc-handlers` macro
+;;   now registers handlers with a specific `rpc-system` instance.
+;; - **Decoupled Proxying**: The logic for proxying RPCs to other components
+;;   is now cleanly integrated with the `warp-component` system.
 
 ;;; Code:
+
 (require 'cl-lib)
 (require 's)
 (require 'loom)
@@ -36,389 +31,395 @@
 
 (require 'warp-log)
 (require 'warp-error)
-(require 'warp-marshal)
-(require 'warp-transport) 
-(require 'warp-protobuf)
+(require 'warp-transport)
+(require 'warp-event)
+(require 'warp-protocol)
+(require 'warp-trace)
+(require 'warp-component) 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
 
-(define-error 'warp-rpc-error
-  "A generic error related to RPC operations."
+(define-error 'warp-rpc-error 
+  "A generic error occurred during an RPC operation." 
   'warp-error)
 
-(define-error 'warp-rpc-timeout-error
-  "An RPC request timed out before a response was received."
+(define-error 'warp-rpc-timeout 
+  "An RPC request did not receive a response within the specified timeout." 
   'warp-rpc-error)
 
-(define-error 'warp-rpc-response-error
-  "The RPC response contained an error payload from the remote peer."
+(define-error 'warp-rpc-handler-not-found
+  "The recipient of an RPC request has no registered handler for the command." 
   'warp-rpc-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Core RPC Schema Definitions
+;;; Schema Definitions
 
 (warp:defschema warp-rpc-message
-    ((:constructor warp-rpc-message-create)
-     (:copier nil)
-     (:json-name "WarpRpcMessage"))
-  "The universal envelope for all RPC communication in Warp.
-This struct defines the standard header and metadata for messages
-exchanged between Warp components, whether for requests, responses,
-or notifications.
+    ((:constructor make-warp-rpc-message))
+  "The fundamental RPC message envelope that wraps all communication.
+This struct provides the transport-level metadata needed to route and
+correlate asynchronous messages.
 
-Slots:
-- `id` (string): A unique identifier for this specific message.
-- `sender-id` (string): The identifier of the entity that originated
-  this message.
-- `target-id` (string): The identifier of the intended recipient.
-- `type` (keyword): The message type (`:request`, `:response`,
-  `:notification`).
-- `payload` (any): The actual content or data of the message. This can
-  be any Lisp object that can be marshaled.
-- `correlation-id` (string or nil): For requests/responses, a unique ID
-  linking a response to its original request. `nil` for notifications.
-- `timestamp` (float): The time (float-time) when the message was created.
-- `timeout` (float or nil): An optional timeout for the message's
-  processing or expected response, in seconds.
-- `cancel-token-id` (string or nil): An ID representing a cancellation
-  token, allowing the recipient to signal cancellation back to the sender."
-  (id nil :type string :json-key "id")
-  (sender-id nil :type string :json-key "senderId")
-  (target-id nil :type string :json-key "targetId")
-  (type :request :type keyword :json-key "type")
-  (payload nil :type t :json-key "payload" :serializable-p t)
-  (correlation-id nil :type (or null string) :json-key "correlationId")
-  (timestamp (float-time) :type float :json-key "timestamp")
-  (timeout nil :type (or null float) :json-key "timeout")
-  (cancel-token-id nil :type (or null string) :json-key "cancelTokenId"))
+Fields:
+- `type` (keyword): The message type, either `:request` or `:response`.
+- `correlation-id` (string): A unique ID that links a request to its
+  corresponding response. This is essential for async communication.
+- `sender-id` (string): The unique ID of the node sending the message.
+- `recipient-id` (string): The unique ID of the intended recipient node.
+- `timestamp` (float): The `float-time` when the message was created, used
+  for diagnostics and performance metrics.
+- `payload` (t): The actual content of the message. For requests, this is
+  a `warp-rpc-command`; for responses, it's the result or an error object.
+- `timeout` (number): Optional timeout in seconds for this request, set by
+  the sender.
+- `metadata` (plist): A property list for additional metadata, such as
+  authentication tokens or tracing IDs, enabling cross-cutting concerns."
+  (type nil :type keyword)
+  (correlation-id nil :type string)
+  (sender-id nil :type string)
+  (recipient-id nil :type string)
+  (timestamp (float-time) :type float)
+  (payload nil :type t)
+  (timeout nil :type (or null number))
+  (metadata nil :type (or null list)))
 
 (warp:defprotobuf-mapping warp-rpc-message
-  ((id 1 :string)
-   (sender-id 2 :string)
-   (target-id 3 :string)
-   (type 4 :string)           ; Stored as string, e.g., "request"
-   (payload 5 :bytes)         ; Payload is marshaled to bytes
-   (correlation-id 6 :string)
-   (timestamp 7 :double)
-   (timeout 8 :double)
-   (cancel-token-id 9 :string)))
+  `((type 1 :string)
+    (correlation-id 2 :string)
+    (sender-id 3 :string)
+    (recipient-id 4 :string)
+    (timestamp 5 :double)
+    (payload 6 :bytes)
+    (timeout 7 :double)
+    (metadata 8 :bytes)))
 
 (warp:defschema warp-rpc-command
-    ((:constructor warp-rpc-command-create)
-     (:copier nil)
-     (:json-name "WarpRpcCommand"))
-  "Represents a command to be executed, with a name and arguments.
-This struct is often used as the `payload` within a `warp-rpc-message`
-when sending commands to a remote service.
+    ((:constructor make-warp-rpc-command))
+  "Represents a command to be executed remotely via RPC.
+This is the application-level payload inside a `warp-rpc-message`.
 
-Slots:
-- `name` (keyword): The name of the command to execute (e.g., `:ping`,
-  `:get-status`).
-- `args` (any): The arguments for the command. This can be any Lisp
-  object that can be marshaled (e.g., a plist, a struct instance).
-- `metadata` (plist): Additional metadata related to the command,
-  e.g., context, tracing information."
-  (name nil :type keyword :json-key "name")
-  (args nil :type t :json-key "args" :serializable-p t)
-  (metadata nil :type plist :json-key "metadata" :serializable-p t))
+Fields:
+- `name` (keyword): The symbolic name of the command to be executed
+  (e.g., `:ping`, `:get-status`).
+- `args` (t): The arguments for the command. This can be any serializable
+  Lisp object, often a plist or a dedicated schema object.
+- `metadata` (plist): Additional command-specific metadata, separate from
+  the transport-level metadata."
+  (name nil :type keyword)
+  (args nil :type t)
+  (metadata nil :type (or null list)))
 
-(warp:defprotobuf-mapping! warp-rpc-command
-  ((name 1 :string)            ; Stored as string, e.g., "ping"
-   (args 2 :bytes)             ; Arguments marshaled to bytes
-   (metadata 3 :bytes)))       ; Metadata marshaled to bytes
-
-;; Define a Protobuf schema for the built-in loom-error struct
-(defconst warp-rpc-error-payload--protobuf-schema
-  '((type 1 :string)
-    (message 2 :string)
-    (details 3 :bytes))
-  "Protobuf schema definition for `loom-error` as an RPC payload.
-This allows `loom-error` instances to be marshaled into Protobuf
-for reliable error propagation across the network.")
-
-(defun warp-rpc-error-payload--to-protobuf-plist (instance)
-  "Converts a `loom-error` instance to a Protobuf-compatible plist.
-This is a custom serialization function for `loom-error` to ensure it
-can be packed into the `payload` field of a Protobuf message.
-
-Arguments:
-- `instance` (loom-error): The `loom-error` object to convert.
-
-Returns:
-- (plist): A plist suitable for Protobuf encoding, representing the
-  error's type, message, and details.
-
-Side Effects:
-- Calls `warp:serialize` to marshal error `details` into bytes."
-  `(:1 ,(symbol-name (loom:error-type instance))
-    :2 ,(loom:error-message instance)
-    :3 ,(warp:serialize (loom:error-details instance) :protocol :protobuf)))
-
-(defun warp-rpc-error-payload--from-protobuf-plist (plist)
-  "Converts a Protobuf-compatible plist to a `loom-error` instance.
-This is a custom deserialization function for `loom-error`,
-reconstructing the error object from its Protobuf representation.
-
-Arguments:
-- `plist` (plist): A plist representing the decoded Protobuf error.
-
-Returns:
-- (loom-error): A new `loom-error` instance.
-
-Side Effects:
-- Calls `warp:deserialize` to unmarshal error `details` from bytes."
-  (loom:error-create
-   :type (intern (plist-get plist :1))
-   :message (plist-get plist :2)
-   :details (warp:deserialize (plist-get plist :3)
-                              :protocol :protobuf
-                              :target-type t))) ; Generic deserialize
-
-;; Register the manual converters for loom-error
-(puthash 'loom-error
-         `(:protobuf-schema ,warp-rpc-error-payload--protobuf-schema
-           :to-protobuf-plist ,#'warp-rpc-error-payload--to-protobuf-plist
-           :from-protobuf-plist ,#'warp-rpc-error-payload--from-protobuf-plist)
-         warp--marshal-converter-registry)
+(warp:defprotobuf-mapping warp-rpc-command
+  `((name 1 :string)
+    (args 2 :bytes)
+    (metadata 3 :bytes)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Global State
+;;; Struct Definitions
 
-(defvar warp-rpc--request-registry (make-hash-table :test 'equal)
-  "A hash table mapping RPC `correlation-id`s to the `loom-promise`
-for a pending outgoing RPC request. This registry tracks active RPCs,
-allowing responses to be matched with their originators.")
+(cl-defstruct (warp-rpc-handler
+               (:constructor make-warp-rpc-handler))
+  "Represents a registered RPC handler, including proxy information.
+This struct stores the logic for how a given RPC command should be handled.
 
-(defvar warp-rpc--registry-lock (loom:lock "warp-rpc-registry")
-  "A mutex protecting `warp-rpc--request-registry` for thread-safe access.
-Ensures atomic operations on the registry, especially in concurrent
-environments.")
+Fields:
+- `command-name` (keyword): The RPC command name this handler is for.
+- `handler-fn` (function): The actual Lisp function to execute for a
+  direct handler. This field is `nil` for a proxy.
+- `is-proxy-p` (boolean): If `t`, this handler is a proxy to another component.
+- `proxy-target` (keyword): The name (keyword) of the component to proxy
+  the call to, as registered in the parent `warp-component-system`."
+  (command-name nil :type keyword)
+  (handler-fn nil :type (or null function))
+  (is-proxy-p nil :type boolean)
+  (proxy-target nil :type (or null keyword)))
+
+(cl-defstruct (warp-rpc-system
+               (:constructor %%make-rpc-system))
+  "A self-contained RPC system component.
+This struct encapsulates all state required for a functioning RPC layer,
+making it a portable and manageable component.
+
+Fields:
+- `name` (string): The name of this RPC system instance, for logging.
+- `component-system` (warp-component-system): A required reference to the parent
+  component system. This is used to look up and resolve proxy targets.
+- `pending-requests` (hash-table): Stores promises for pending outgoing
+  requests, keyed by their correlation ID. This is the heart of the
+  client-side RPC logic.
+- `handlers` (hash-table): Stores `warp-rpc-handler` definitions, keyed by
+  command name (a keyword). This is the heart of the server-side RPC logic.
+- `lock` (loom-lock): A mutex protecting the `pending-requests` hash table
+  from concurrent access."
+  (name "default-rpc" :type string)
+  (component-system (cl-assert nil) :type (or null t))
+  (pending-requests (make-hash-table :test 'equal) :type hash-table)
+  (handlers (make-hash-table :test 'eq) :type hash-table)
+  (lock (loom:lock "warp-rpc") :type t))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Internal Helpers
+;;; Private Functions
 
-(defun warp-rpc--generate-correlation-id ()
-  "Generates a unique correlation identifier for RPC requests.
-This ID is used to match responses with their originating requests.
+(defun warp-rpc--generate-id ()
+  "Generate a unique correlation ID for an RPC request.
+This ensures that responses can be matched to their original requests
+in an asynchronous, multi-request environment.
+
+Arguments: None.
 
 Returns:
-- (string): A unique string identifier, e.g., \"rpc-req-0123456789abcdef\"."
-  (format "rpc-req-%016x" (random (expt 2 64))))
+- (string): A unique correlation ID string."
+  (format "%s-%012x" (format-time-string "%s%N") (random (expt 16 12))))
 
-(defun warp-rpc--unregister-request (corr-id)
-  "Removes a pending request from the registry under lock.
-This function is called once an RPC promise is settled (resolved or
-rejected) to clean up the internal state and prevent memory leaks.
+(defun warp-rpc--handle-timeout (rpc-system correlation-id)
+  "Handle a timeout for a pending RPC request.
+This function is called by a timer when a request has not received a
+response within its allotted time. It cleans up the pending state and
+rejects the associated promise.
 
 Arguments:
-- `corr-id` (string): The correlation ID of the request to unregister.
-
-Returns:
-- `nil`.
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system managing the request.
+- `CORRELATION-ID` (string): The ID of the timed-out request.
 
 Side Effects:
-- Removes the entry associated with `corr-id` from
-  `warp-rpc--request-registry`."
-  (loom:with-mutex! warp-rpc--registry-lock
-    (remhash corr-id warp-rpc--request-registry)))
+- Rejects the pending promise associated with the request with a
+  `warp-rpc-timeout` error.
+- Removes the request's entry from the internal `pending-requests` table.
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+Returns:
+- `nil`."
+  (loom:with-mutex! (warp-rpc-system-lock rpc-system)
+    ;; Check if the request is still pending (it might have been resolved already).
+    (when-let ((pending (gethash correlation-id
+                                 (warp-rpc-system-pending-requests
+                                  rpc-system))))
+      (remhash correlation-id (warp-rpc-system-pending-requests rpc-system))
+      (loom:promise-reject
+       (plist-get pending :promise)
+       (warp:error! :type 'warp-rpc-timeout
+                    :message (format "RPC request %s timed out"
+                                     correlation-id))))))
+
+
 ;;; Public API
 
-;;;###autoload
-(cl-defun warp:rpc-request
-    (connection sender-id target-id payload
-     &key correlation-id timeout promise cancel-token)
-  "Sends an RPC request from `SENDER-ID` to `TARGET-ID`.
-This function initiates an RPC by constructing a `warp-rpc-message`,
-creates a unique correlation ID (if not provided), registers a pending
-`loom-promise` to await the response, and dispatches the message via
-the underlying `warp-transport` layer. The `warp-marshal` system will
-automatically serialize the `warp-rpc-message` structure, including
-its `payload`.
+(cl-defun warp:rpc-system-create (&key name component-system)
+  "Create a new, self-contained RPC system component.
+This function is the factory for the RPC system. It should be used
+within a `warp:defcomponent` definition to create an RPC service.
 
 Arguments:
-- `CONNECTION` (warp-transport-connection): The transport connection
-  to use for sending the request.
-- `SENDER-ID` (string): The identifier of the entity initiating the RPC
-  (e.g., the local service's name).
-- `TARGET-ID` (string): The identifier of the intended RPC recipient
-  (e.g., the remote service's name).
-- `PAYLOAD` (any): The actual data or command for the RPC request.
-  This should typically be an instance of a `warp:defschema`-defined
-  struct (like `warp-rpc-command`), which will be automatically
-  marshalled into the `warp-rpc-message`.
-- `:correlation-id` (string, optional): An optional, pre-defined
-  correlation ID. If `nil`, a new unique one is generated internally.
-- `:timeout` (number, optional): RPC timeout in seconds. If the
-  response is not received within this duration, the returned promise
-  will be rejected with a `warp-rpc-timeout-error`.
-- `:promise` (loom-promise, optional): An existing `loom-promise` to
-  settle with the RPC result. If `nil`, a new promise is created and
-  returned.
-- `:cancel-token` (loom-cancel-token, optional): An optional
-  `loom-cancel-token` to link to the RPC promise for cancellation.
-  If this token is triggered, the RPC promise will be rejected.
+- `:name` (string, optional): A descriptive name for this RPC system instance.
+- `:component-system` (warp-component-system): The parent component
+  system, which is required for resolving RPC proxy targets.
 
 Returns:
-- (loom-promise): A promise that resolves with the response payload (the
-  deserialized `payload` from the `warp-rpc-message` response) or
-  rejects on error (e.g., transport failure, timeout, cancellation,
-  or if the remote peer returns an error payload).
+- (warp-rpc-system): A new, initialized RPC system instance."
+  (%%make-rpc-system
+   :name (or name "default-rpc")
+   :component-system component-system))
+
+(cl-defun warp:rpc-request (rpc-system connection sender-id recipient-id command
+                                     &key (timeout 30.0))
+  "Send an RPC request and return a promise for the response.
+This function is the primary way to initiate remote procedure calls. It
+constructs and sends the message, manages the pending request state by
+storing a promise, and schedules a timeout to prevent indefinite waits.
+
+Arguments:
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system instance making the request.
+- `CONNECTION` (t): The `warp-transport` connection object to send the request on.
+- `SENDER-ID` (string): The unique ID of the sender node.
+- `RECIPIENT-ID` (string): The unique ID of the recipient node.
+- `COMMAND` (warp-rpc-command): The command object to execute remotely.
+- `:timeout` (float, optional): Timeout in seconds. Defaults to 30.0.
 
 Side Effects:
-- Registers the `result-promise` in `warp-rpc--request-registry` for
-  tracking outstanding RPCs.
-- Configures timeout and cancellation callbacks for the `result-promise`.
-- Sends a `warp-rpc-message` (marshalled to its binary representation)
-  via `warp:transport-send`."
-  (let* ((corr-id (or correlation-id (warp-rpc--generate-correlation-id)))
-         (result-promise (or promise (loom:promise)))
-         (message (warp-rpc-message-create
-                   :type :request
-                   :id (warp-rpc--generate-correlation-id) ; Message ID
-                   :sender-id sender-id
-                   :target-id target-id
-                   :correlation-id corr-id
-                   :payload payload ; The raw Lisp object payload
-                   :timestamp (float-time)
-                   :timeout timeout
-                   :cancel-token-id (and cancel-token
-                                         (loom:cancel-token-id
-                                          cancel-token)))))
+- Creates and stores a pending request entry in the RPC system's state.
+- Schedules a timer to handle potential timeouts.
+- Sends data over the provided `CONNECTION`.
 
-    (braid! nil
-      ;; Step 1: Register the promise with its correlation ID
-      (:then (lambda (_)
-               (loom:with-mutex! warp-rpc--registry-lock
-                 (puthash corr-id result-promise warp-rpc--request-registry))
-               t))
-      ;; Step 2: Link cancellation and timeout mechanisms to the promise
-      (:then (lambda (_)
-               (when cancel-token
-                 (loom:cancel-token-add-callback
-                  cancel-token (lambda (reason)
-                                 (warp-rpc--unregister-request corr-id)
-                                 (loom:promise-reject result-promise
-                                                      (or reason
-                                                          :loom-cancel-error)))))
-               (when timeout
-                 (loom:promise-add-timeout
-                  result-promise timeout
-                  (lambda ()
-                    (warp-rpc--unregister-request corr-id)
-                    (loom:promise-reject
-                     result-promise
-                     (make-instance 'warp-rpc-timeout-error
-                                    :message (format "RPC timed out (corr: %s)"
-                                                     corr-id))))))
-               t))
-      ;; Step 3: Send the marshalled RPC message via the transport.
-      ;; `warp:transport-send` uses `warp:serialize` internally, which
-      ;; will serialize the `warp-rpc-message` structure and its payload.
-      (:then (lambda (_)
-               (warp:transport-send connection message)))
-      ;; Step 4: Handle any immediate transport send failure
+Returns:
+- (loom-promise): A promise that will resolve with the response payload from
+  the remote peer, or reject on timeout or a transport-level error."
+  (let* ((correlation-id (warp-rpc--generate-id))
+         (message (make-warp-rpc-message
+                   :type :request :correlation-id correlation-id
+                   :sender-id sender-id :recipient-id recipient-id
+                   :payload command :timeout timeout))
+         (response-promise (loom:promise)))
+
+    ;; Atomically add the pending request and its timeout timer to the state.
+    (loom:with-mutex! (warp-rpc-system-lock rpc-system)
+      (puthash correlation-id
+               (list :promise response-promise
+                     :timer (run-at-time timeout nil #'warp-rpc--handle-timeout
+                                         rpc-system correlation-id))
+               (warp-rpc-system-pending-requests rpc-system)))
+
+    (braid! (warp:transport-send connection message)
+      ;; If the initial send fails, we must immediately clean up the
+      ;; pending request state to prevent memory leaks.
       (:catch (lambda (err)
-                (warp-rpc--unregister-request corr-id)
-                (loom:rejected! err))))
+                (loom:with-mutex! (warp-rpc-system-lock rpc-system)
+                  (when-let (pending (gethash
+                                      correlation-id
+                                      (warp-rpc-system-pending-requests
+                                       rpc-system)))
+                    (cancel-timer (plist-get pending :timer))
+                    (remhash correlation-id
+                             (warp-rpc-system-pending-requests
+                              rpc-system))))
+                (loom:promise-reject response-promise err))))
+    response-promise))
 
-    result-promise))
-
-;;;###autoload
-(defun warp:rpc-handle-response (message)
-  "Handles an incoming RPC response message, settling the corresponding
-promise.
-This function is intended to be called by a message consumer (such as
-a channel or transport bridge) when a `warp-rpc-message` of type
-`:response` is received. It uses the `correlation-id` within the
-response message to look up the original request's pending promise in
-`warp-rpc--request-registry` and then resolves or rejects that promise
-based on the `payload` of the response.
-
-Arguments:
-- `MESSAGE` (warp-rpc-message): The incoming `:response` message object.
-  It is assumed that this message has already been deserialized by the
-  transport layer into a `warp-rpc-message` struct.
-
-Returns:
-- `nil`.
-
-Side Effects:
-- Resolves the pending `loom-promise` associated with `MESSAGE`'s
-  `correlation-id` if the `payload` is successful.
-- Rejects the pending `loom-promise` if the `payload` is a `loom-error`
-  instance, wrapping it in a `warp-rpc-response-error`.
-- Removes the pending request from `warp-rpc--request-registry`.
-- Logs a warning if a response is received for an unknown `correlation-id`
-  (which typically means the original request has already timed out,
-  been cancelled, or completed)."
-  (unless (and (fboundp 'warp-rpc-message-p) (warp-rpc-message-p message)
-               (eq (warp-rpc-message-type message) :response))
-    (warp:log! :warn "rpc"
-               "Received non-response message in handle-response: %S"
-               message)
-    (cl-return-from warp:rpc-handle-response nil))
-
-  (let* ((corr-id (warp-rpc-message-correlation-id message))
-         (payload (warp-rpc-message-payload message))
-         (promise nil))
-    ;; Atomically retrieve and remove the promise.
-    (loom:with-mutex! warp-rpc--registry-lock
-      (when-let ((found (gethash corr-id warp-rpc--request-registry)))
-        (setq promise found)
-        (remhash corr-id warp-rpc--request-registry)))
-
-    (if promise
-        (if (loom-error-p payload)
-            ;; If the payload is an error object, reject the promise.
-            (loom:promise-reject promise
-                                 (make-instance 'warp-rpc-response-error
-                                                :message "RPC returned an error"
-                                                :details payload))
-          ;; Otherwise, resolve the promise with the payload.
-          (loom:promise-resolve promise payload))
-      (warp:log! :warn "rpc"
-                 "Received response for unknown corr-id: %s"
-                 corr-id))))
-
-;;----------------------------------------------------------------------
-;;; Shutdown Hook
-;;----------------------------------------------------------------------
-
-(defun warp-rpc--cleanup-on-exit ()
-  "A cleanup function registered with `kill-emacs-hook` to clear any
-pending RPC requests when Emacs exits.
-This function ensures that all outstanding RPC promises are rejected
-gracefully if Emacs is shutting down, preventing promises from
-hanging indefinitely.
+(defun warp:rpc-handle-response (rpc-system message)
+  "Handle an incoming RPC response message.
+This function is called when a response is received. Its purpose is to
+match the response to a pending request using the correlation ID. It
+then resolves the corresponding promise with the response payload.
 
 Arguments:
-- None.
-
-Returns:
-- `nil`.
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system instance.
+- `MESSAGE` (warp-rpc-message): The received response message.
 
 Side Effects:
-- Clears the `warp-rpc--request-registry` hash table.
-- Rejects all `loom-promise` objects currently stored in the registry
-  with a `loom-shutdown` error."
-  (loom:with-mutex! warp-rpc--registry-lock
-    (when (> (hash-table-count warp-rpc--request-registry) 0)
-      (warp:log! :warn "rpc"
-                 "Emacs shutdown: Rejecting %d pending RPC requests."
-                 (hash-table-count warp-rpc--request-registry))
-      (maphash (lambda (_corr-id promise)
-                 (loom:promise-reject promise
-                                      (loom:make-error
-                                       :type :loom-shutdown
-                                       :message "RPC cancelled due to Emacs shutdown")))
-               warp-rpc--request-registry)
-      (clrhash warp-rpc--request-registry)))
-  nil)
+- Resolves or rejects a pending promise based on the response payload.
+- Cancels the associated timeout timer.
+- Removes the request from the internal `pending-requests` table.
 
-(add-hook 'kill-emacs-hook #'warp-rpc--cleanup-on-exit)
+Returns:
+- `nil`."
+  (let ((correlation-id (warp-rpc-message-correlation-id message)))
+    (loom:with-mutex! (warp-rpc-system-lock rpc-system)
+      ;; Find the corresponding pending request.
+      (when-let (pending (gethash correlation-id
+                                  (warp-rpc-system-pending-requests rpc-system)))
+        ;; Cleanup: cancel the timeout timer and remove the pending entry.
+        (cancel-timer (plist-get pending :timer))
+        (remhash correlation-id (warp-rpc-system-pending-requests rpc-system))
+        (let ((promise (plist-get pending :promise))
+              (payload (warp-rpc-message-payload message)))
+          ;; If the payload itself is an error object, reject the promise.
+          ;; Otherwise, resolve it with the successful result.
+          (if (loom-error-p payload)
+              (loom:promise-reject promise payload)
+            (loom:promise-resolve promise payload)))))))
+
+(defun warp:rpc-dispatch (rpc-system command context)
+  "Dispatch an incoming RPC request to its registered handler.
+This function is the main entry point for executing RPCs on the
+'server' side. It looks up the handler for the command, executes it
+(either directly or by proxying to another component), and sends the
+result back to the original caller as a response message.
+
+Arguments:
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system instance.
+- `COMMAND` (warp-rpc-command): The command to dispatch.
+- `CONTEXT` (plist): Contextual data for the handler, typically including
+  the `:connection` object and the original `warp-rpc-message`.
+
+Side Effects:
+- Sends a response message over the connection provided in `CONTEXT`.
+
+Signals:
+- `(warp-rpc-handler-not-found)`: If no handler is registered for the command name.
+- `(error)`: If a proxy target component cannot be found.
+
+Returns:
+- (loom-promise): A promise that resolves with the handler's result. This
+  is useful for chaining or further processing on the server side."
+  (let* ((cmd-name (warp-rpc-command-name command))
+         (handler-def (gethash cmd-name (warp-rpc-system-handlers rpc-system))))
+    (unless handler-def
+      (error (warp:error! :type 'warp-rpc-handler-not-found
+                          :message (format "No handler for command: %S"
+                                           cmd-name))))
+    (braid!
+        ;; Step 1: Execute the handler, which could be direct or a proxy.
+        (if (warp-rpc-handler-is-proxy-p handler-def)
+            ;; Proxy logic: find the target component and call the method.
+            (let* ((target-name (warp-rpc-handler-proxy-target handler-def))
+                   (target-comp (warp:component-system-get
+                                 (warp-rpc-system-component-system rpc-system)
+                                 target-name)))
+              (unless target-comp
+                (error (format "Proxy target component not found: %S"
+                               target-name)))
+              ;; The convention is that proxy methods have the same name as the command.
+              (funcall cmd-name target-comp command context))
+          ;; Direct logic: just call the registered function.
+          (funcall (warp-rpc-handler-handler-fn handler-def) command context))
+
+      ;; Step 2: Send the successful result back to the original caller.
+      (:then (lambda (result)
+               (when-let ((conn (plist-get context :connection)))
+                 (let ((original-msg (plist-get context :message)))
+                   (warp:transport-send
+                    conn
+                    (make-warp-rpc-message
+                     :type :response
+                     :correlation-id (warp-rpc-message-correlation-id original-msg)
+                     :sender-id (warp-rpc-message-recipient-id original-msg)
+                     :recipient-id (warp-rpc-message-sender-id original-msg)
+                     :payload result))))
+               result))
+      ;; Step 3: On error, send an error payload back to the original caller.
+      (:catch (lambda (err)
+                (when-let ((conn (plist-get context :connection)))
+                  (let ((original-msg (plist-get context :message)))
+                    (warp:transport-send
+                     conn
+                     (make-warp-rpc-message
+                      :type :response
+                      :correlation-id (warp-rpc-message-correlation-id original-msg)
+                      :sender-id (warp-rpc-message-recipient-id original-msg)
+                      :recipient-id (warp-rpc-message-sender-id original-msg)
+                      :payload (loom:error-wrap err)))))
+                ;; Propagate the rejection.
+                (loom:rejected! err))))))
+
+(defmacro warp:defrpc-handlers (rpc-system &rest definitions)
+  "A declarative macro to define and register a set of RPC command handlers.
+This macro provides a clean Domain-Specific Language (DSL) for populating a
+specific `rpc-system` instance with handler definitions, supporting both
+direct function handlers and proxies to other components.
+
+Arguments:
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system instance to register handlers with.
+- `DEFINITIONS` (list): A list of handler definitions, where each definition is:
+  - `(COMMAND-NAME . HANDLER-FN)`: For a regular command.
+  - `(COMMAND-NAME . (proxy-to COMPONENT-KEYWORD))`: To proxy a command to a
+    method of the same name on another component.
+
+Side Effects:
+- Populates the `handlers` hash table of the provided `RPC-SYSTEM` instance
+  with `warp-rpc-handler` structs.
+
+Returns:
+- A quoted list of the generated `puthash` forms, which evaluates to `nil`
+  at runtime after executing the side effects."
+  `(progn
+     ,@(cl-loop for def in definitions collect
+                (let* ((cmd-name (car def))
+                       (handler-spec (cdr def)))
+                  (cond
+                   ;; Case 1: The handler is a direct function reference.
+                   ((functionp handler-spec)
+                    `(puthash ',cmd-name (make-warp-rpc-handler
+                                          :command-name ',cmd-name
+                                          :handler-fn ,handler-spec)
+                              (warp-rpc-system-handlers ,rpc-system)))
+                   ;; Case 2: The handler is a proxy definition.
+                   ((and (listp handler-spec) (eq (car handler-spec) 'proxy-to))
+                    `(puthash ',cmd-name (make-warp-rpc-handler
+                                          :command-name ',cmd-name
+                                          :is-proxy-p t
+                                          :proxy-target ',(cadr handler-spec))
+                              (warp-rpc-system-handlers ,rpc-system)))
+                   ;; Case 3: Invalid definition format.
+                   (t (error "Invalid RPC handler definition: %S" ',def)))))))
 
 (provide 'warp-rpc)
 ;;; warp-rpc.el ends here
