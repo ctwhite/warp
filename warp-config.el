@@ -20,23 +20,21 @@
 ;; - **Automatic Default Merging**: Generated constructors automatically
 ;;   merge user-provided options with predefined defaults.
 ;; - **Environment Variable Overrides**: Configuration values can be
-;;   transparently overridden by environment variables, following a
-;;   defined precedence.
+;;   transparently overridden by environment variables, using either an
+;;   automatic naming convention (`:env-prefix`) or an explicit key
+;;   via the `:env-var` option.
 ;; - **Constraint Validation**: Fields can define validation rules,
 ;;   enforcing data integrity upon configuration creation.
 ;; - **Extensible**: Supports all `warp:defschema` options.
-;; - **Self-Documenting**: Encourages clear documentation for
-;;   configuration fields.
-;; - **Reuse**: Applicable to any module requiring structured config.
 
 ;;; Code:
 
-(require 'cl-lib) 
-(require 'subr-x) 
-(require 's)      
+(require 'cl-lib)
+(require 'subr-x)
+(require 's)
 
-(require 'warp-error) 
-(require 'warp-marshal) 
+(require 'warp-error)
+(require 'warp-marshal)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -57,234 +55,212 @@ on the schema's type declaration.
 Arguments:
 - `STRING-VALUE` (string): The value read from the environment.
 - `TARGET-TYPE` (symbol): The expected Lisp type (e.g., `integer`,
-  `float`, `boolean`, `keyword`, `string`, `list`, `hash-table`).
+  `float`, `boolean`, `keyword`, `string`).
 
 Returns:
 - (any): The coerced value in the `TARGET-TYPE`.
 
 Signals:
-- `warp-config-validation-error`: If the `TARGET-TYPE` is not
-  supported for automatic coercion from a string."
+- `warp-config-validation-error`: If `TARGET-TYPE` is not supported
+  for automatic coercion from a string (e.g., `list`)."
   (pcase target-type
     ('string string-value)
     ('integer (string-to-number string-value))
     ('float (float (string-to-number string-value)))
     ('boolean (member (downcase string-value) '("true" "t" "1")))
-    ('keyword (intern (s-trim-left ":" string-value))) ; Handles :foo or foo
-    ;; Add more complex coercions as needed for lists/hash-tables,
-    ;; likely requiring custom parsing logic for common string formats
+    ('keyword (intern (s-trim-left ":" string-value)))
+    ;; Coercing complex types requires custom parsing logic.
     ((or 'list 'hash-table)
-     (signal (warp:error!
-              :type 'warp-config-validation-error
-              :message (format "Complex type '%S' for env var '%S' "
-                               target-type string-value)
-              :details `(:value ,string-value
-                         :type ,target-type
-                         :reason "Automatic coercion not supported.
-                                  Consider custom parser."))))
-    (_ (signal (warp:error!
-                :type 'warp-config-validation-error
-                :message (format "Unsupported type coercion for env var: %S"
-                                 target-type)
-                :details `(:value ,string-value :type ,target-type))))))
+     (signal
+      (warp:error!
+       :type 'warp-config-validation-error
+       :message (format "Complex type '%S' for env var '%S' "
+                        target-type string-value)
+       :details `(:value ,string-value
+                  :type ,target-type
+                  :reason "Automatic coercion not supported."))))
+    (_ (signal
+        (warp:error!
+         :type 'warp-config-validation-error
+         :message (format "Unsupported type coercion for env var: %S"
+                          target-type)
+         :details `(:value ,string-value :type ,target-type))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;###autoload
 (defmacro warp:defconfig (name-or-name-and-options docstring &rest fields)
-  "Defines a configuration struct, its default values, and a constructor.
-This macro mirrors `cl-defstruct`'s argument signature for defining
-the struct itself, and additionally generates a `defconst` for default
-values and a constructor function.
-
-**Important**: This macro internally uses `warp:defschema`, ensuring
-that all configurations defined with it are automatically compatible
-with `warp:defprotobuf-mapping` and other schema-aware utilities.
+  "Defines a configuration struct, its defaults, and a constructor.
+This macro internally uses `warp:defschema`, ensuring all
+configurations are compatible with `warp:defprotobuf-mapping`.
 
 The generated constructor function accepts `&rest args` (a plist)
-which are merged with `defconst` default values and environment
-variable overrides. User-provided `args` (explicit arguments) take
-precedence over environment variables, which in turn override defaults.
+which are merged with default values and environment variable
+overrides. Precedence is: explicit args > env vars > defaults.
 
 Arguments:
-- `NAME-OR-NAME-AND-OPTIONS`: Either a symbol for the struct name (e.g.,
-  `my-config`), or a list `(symbol OPTIONS)` (e.g., `(my-config :copier nil)`).
-  This also supports custom options for `warp:defconfig` itself:
-    - `:suffix-p` (boolean, default t): If `t`, appends `-config` to the
-      struct name and `-default-config-values` to the constant name.
-    - `:no-constructor-p` (boolean, default nil): If `t`, the macro will
-      NOT generate a `make-warp-NAME-config` constructor.
-    - `:env-prefix` (string): A string prefix for environment variables
-      (e.g., `\"MY_APP_\"` for `MY_APP_FIELD_NAME`). Defaults to
-      `\"WARP_\"` followed by an uppercase version of the config `NAME`.
-- `DOCSTRING` (string): The complete docstring for the generated struct.
-  This string is expected to contain the 'Fields:' section with descriptions.
-- `FIELDS` (forms): A series of forms defining the struct fields,
-  identical to `cl-defstruct` field definitions (e.g.,
-  `(field-name default-value :type type-spec :validate (validation-form))`).
-  - `:validate` (form): An optional form to use for validation. Within this
-    form, the special variable `$` will temporarily bind to the field's
-    value for validation. If the form evaluates to `nil`, validation fails.
+- `NAME-OR-NAME-AND-OPTIONS`: A symbol for the struct name (e.g.,
+  `my-config`), or a list `(symbol OPTIONS)`. Options can include
+  standard `cl-defstruct` options and `warp:defconfig` options:
+    - `:suffix-p` (boolean, default t): Appends `-config` to the
+      struct name and `-default-config-values` to the constant.
+    - `:no-constructor-p` (boolean, default nil): If `t`, do not
+      generate a `make-warp-NAME-config` constructor.
+    - `:env-prefix` (string): Prefix for automatic environment
+      variable names (e.g., `\"MY_APP_\"`).
+- `DOCSTRING` (string): The docstring for the generated struct.
+  Should contain a 'Fields:' section with descriptions.
+- `FIELDS` (forms): A list of field definitions, like `cl-defstruct`.
+  Each field can have additional `warp:defconfig` options:
+    - `:validate` (form): An optional validation form where the special
+      variable `$` is bound to the field's value. If the form returns
+      `nil`, validation fails.
+    - `:env-var` (string): The literal string name of an environment
+      variable to use for overrides (e.g., \"MY_APP_TIMEOUT\"). This
+      takes precedence over the automatic `:env-prefix` naming.
 
-Returns: `nil`.
-
-Side Effects:
-- Defines a `warp:defschema`-based struct.
-- Defines a `defconst` for default values.
-- Optionally defines a constructor function (`make-warp-NAME-config`).
-- The generated constructor performs validation and applies environment
-  variable overrides.
-
-Example usage:
-  (warp:defconfig (my-service-options :copier nil :env-prefix \"MY_APP_\")
-    \"Configuration for My Service.
-
-    Fields:
-    - `timeout` (number): Request timeout in seconds.
-    - `retries` (integer): Number of retry attempts.
-    - `endpoint` (string): Service endpoint URL.\"
-    (timeout 30 :type number :validate (and (>= $ 1) (<= $ 300)))
-    (retries 3 :type integer :validate (> $ 0))
-    (endpoint \"localhost:8080\" :type string
-              :validate (string-match-p \"^https?://[^/]+$\" $)))
-
-  ;; To create an instance:
-  (setq my-config (make-warp-my-service-options-config :retries 5))
-
-  ;; To override via environment (e.g., in shell before launching Emacs):
-  ;; export MY_APP_TIMEOUT=120
-  ;; (setq my-config (make-warp-my-service-options-config)) ; Will pick up 120
-"
+Returns:
+- A `progn` form that defines the struct, constant, and constructor."
   (let* ((name nil)
-         (struct-options-from-name nil)
-         (suffix-p t)               ; Default for :suffix-p
-         (no-constructor-p nil)     ; Default for :no-constructor-p
-         (env-prefix-arg nil)       ; User-provided :env-prefix
-         (internal-struct-options nil)
+         (user-options nil)
+         (suffix-p t)
+         (no-constructor-p nil)
+         (env-prefix-arg nil)
+         (schema-options nil)
          (constructor-name nil)
          (default-const-name nil)
          (final-struct-name nil))
 
-    ;; Parse NAME-OR-NAME-AND-OPTIONS
+    ;; 1. Parse NAME-OR-NAME-AND-OPTIONS to separate our options
+    ;;    from the options meant for `warp:defschema`.
     (if (listp name-or-name-and-options)
         (progn
-          (setq name (cl-first name-or-name-and-options))
-          (setq struct-options-from-name (cl-rest name-or-name-and-options))
-          (setq suffix-p (plist-get struct-options-from-name :suffix-p t))
-          (setq no-constructor-p (plist-get struct-options-from-name
-                                             :no-constructor-p nil))
-          (setq env-prefix-arg (plist-get struct-options-from-name
-                                            :env-prefix))
-          ;; Filter out `warp:defconfig`'s own options
-          (setq internal-struct-options
-                (cl-remove-if (lambda (key) (member key '(:suffix-p
-                                                          :no-constructor-p
-                                                          :env-prefix)))
-                              struct-options-from-name :key #'car)))
+          (setq name (car name-or-name-and-options))
+          (setq user-options (cdr name-or-name-and-options))
+          (setq suffix-p (plist-get user-options :suffix-p t))
+          (setq no-constructor-p
+                (plist-get user-options :no-constructor-p nil))
+          (setq env-prefix-arg (plist-get user-options :env-prefix))
+          (let ((opts (copy-list user-options)))
+            (remf opts :suffix-p)
+            (remf opts :no-constructor-p)
+            (remf opts :env-prefix)
+            (setq schema-options opts)))
       (setq name name-or-name-and-options))
 
-    ;; Determine generated names
+    ;; 2. Determine the final names for the struct, constant, and constructor.
     (setq final-struct-name
           (if suffix-p (intern (format "warp-%s-config" name)) name))
     (setq default-const-name
-          (if suffix-p (intern (format "warp-%s-default-config-values" name))
-              (intern (format "%s-default-values" name))))
+          (if suffix-p
+              (intern (format "warp-%s-default-config-values" name))
+            (intern (format "%s-default-values" name))))
     (setq constructor-name
-          (if suffix-p (intern (format "make-warp-%s-config" name))
-              (intern (format "make-%s-config" name))))
+          (if suffix-p
+              (intern (format "make-warp-%s-config" name))
+            (intern (format "make-%s-config" name))))
 
-    ;; Add internal constructor for the generated schema
-    (setq internal-struct-options
-          (append internal-struct-options
-                  (list :constructor
-                        (intern (format "%%make-%s" final-struct-name)))))
+    (setq schema-options
+          (plist-put schema-options :constructor
+                     (intern (format "%%make-%s" final-struct-name))))
 
-    ;; Determine the effective environment variable prefix
+    ;; 3. Expand into the final `progn` form.
     (let ((effective-env-prefix
-           (or env-prefix-arg (format "WARP_%s_" (s-upcase (symbol-name name))))))
+           (or env-prefix-arg
+               (format "WARP_%s_" (s-upcase (symbol-name name))))))
 
       `(progn
-         ;; Define the warp:defschema-based struct
-         (warp:defschema (,final-struct-name ,@internal-struct-options)
+         (warp:defschema (,final-struct-name ,@schema-options)
            ,docstring
            ,@fields)
 
-         ;; Define the default values constant
          (defconst ,default-const-name
            (list
             ,@(cl-loop for field-def in fields collect
-                       (if (cl-second field-def) ; If default value exists
-                           `(,(cl-first field-def) ,(cl-second field-def))
-                         `(,(cl-first field-def) nil)))) ; Default to nil
-           ,(format "Default values for `%S`." ,final-struct-name))
+                       (if (cadr field-def)
+                           `(,(car field-def) ,(cadr field-def))
+                         `(,(car field-def) nil))))
+           ,(format "Default values for `%S`." final-struct-name))
 
-         ;; Define the constructor function, unless :no-constructor-p
          ,(unless no-constructor-p
             `(cl-defun ,constructor-name (&rest args)
-               ,(format "Creates a new `%S` instance, merging `ARGS` and
-               environment variables with defaults.
-
-               Arguments:
-               - `ARGS` (plist): A property list of configuration options.
-                 These override environment variables and `defconst %S` values.
-
-               Returns:
-               - (%S): A new, initialized configuration instance.
-
-               Signals:
-               - `warp-config-validation-error`: If any field's value fails
-                 its defined validation rule."
-                        final-struct-name default-const-name final-struct-name)
+               ,(format (string-join
+                         '("Creates a new `%S` instance."
+                           ""
+                           "Merges `ARGS` and environment variables with"
+                           "defaults. Precedence is: ARGS > Env Vars > Defaults."
+                           ""
+                           "Arguments:"
+                           "- `ARGS` (plist): Configuration options that"
+                           "  override all other sources."
+                           ""
+                           "Returns:"
+                           "- (%S): A new, initialized configuration instance."
+                           ""
+                           "Signals:"
+                           "- `warp-config-validation-error`: If any field's"
+                           "  value fails its validation rule.")
+                         "\n")
+                        final-struct-name final-struct-name)
                (let* ((final-plist (copy-sequence ,default-const-name))
                       (config-instance nil))
 
-                 ;; 1. Apply environment variable overrides (over defaults)
+                 ;; I. Apply environment variable overrides over defaults.
                  ,@(cl-loop for field-def in fields collect
-                            (let ((field-name (cl-first field-def))
-                                  (field-type (plist-get (cl-rest field-def) :type))
-                                  (env-var-name
-                                   (s-replace "-" "_"
-                                              (s-upcase (format "%s%s"
-                                                                effective-env-prefix
-                                                                (symbol-name
-                                                                 (cl-first field-def)))))))
+                            (let* ((field-name (car field-def))
+                                   (field-opts (cdr field-def))
+                                   (field-type (plist-get field-opts :type))
+                                   (env-var-name-form (plist-get field-opts :env-var))
+                                   (env-var-name
+                                    (if env-var-name-form
+                                        env-var-name-form
+                                      (s-replace
+                                       "-" "_"
+                                       (s-upcase
+                                        (format "%s%s" effective-env-prefix
+                                                (symbol-name field-name)))))))
                               `(when-let ((env-val (getenv ,env-var-name)))
                                  (setq final-plist
-                                       (plist-put final-plist ',field-name
-                                                  (warp--config-coerce-env-value
-                                                   env-val ',field-type))))))
+                                       (plist-put
+                                        final-plist ',field-name
+                                        (warp--config-coerce-env-value
+                                         env-val ',field-type))))))
 
-                 ;; 2. Merge explicit args (highest precedence)
+                 ;; II. Merge explicit args (highest precedence).
                  (setq final-plist (append args final-plist))
 
-                 ;; Create instance from merged values
                  (setq config-instance
-                       (apply #',(intern (format "%%make-%s" final-struct-name))
+                       (apply #',(plist-get schema-options :constructor)
                               final-plist))
 
-                 ;; 3. Perform validation on the created instance
-                 (let ((_it-self config-instance)) ; Bind instance to _it-self
+                 ;; III. Perform validation on the final instance.
+                 (let ((_it-self config-instance))
                    ,@(cl-loop for field-def in fields collect
-                              (let ((field-name (cl-first field-def))
-                                    (validate-spec (plist-get (cl-rest field-def)
-                                                              :validate)))
+                              (let* ((field-name (car field-def))
+                                     (field-opts (cdr field-def))
+                                     (validate-spec
+                                      (plist-get field-opts :validate)))
                                 (when validate-spec
                                   `(let (($ (,(intern (format "%s-%s"
-                                                              final-struct-name field-name))
+                                                              final-struct-name
+                                                              field-name))
                                              _it-self)))
                                      (unless ,validate-spec
-                                       (signal (warp:error!
-                                                :type 'warp-config-validation-error
-                                                :message (format "Validation failed for '%s' in %S"
-                                                                 ',field-name ',final-struct-name)
-                                                :details `(:field ,',field-name
-                                                           :value ,$
-                                                           :reason ,(prin1-to-string
-                                                                     ',validate-spec))))))))))
-                 config-instance))))
-
-         nil)))
+                                       (signal
+                                        (warp:error!
+                                         :type 'warp-config-validation-error
+                                         :message
+                                         (format
+                                          "Validation failed for '%s' in %S"
+                                          ',field-name ',final-struct-name)
+                                         :details
+                                         `(:field ,',field-name
+                                           :value ,$
+                                           :reason
+                                           ,(prin1-to-string
+                                             ',validate-spec))))))))))
+                 config-instance))))))
 
 (provide 'warp-config)
 ;;; warp-config.el ends here
