@@ -1,50 +1,59 @@
-;;; warp-pool.el --- Abstract Worker Pool Core -*- lexical-binding: t; -*-
+;;; warp-pool.el --- Abstract Resource Pool Core -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
 ;; This module provides a generic, thread-safe, and highly configurable
-;; abstract worker pool. It manages the lifecycle of worker processes,
-;; task queuing, dispatching, and error handling.
+;; abstract **resource pool**. It manages the lifecycle of reusable
+;; resources (e.g., processes, TCP connections, database connections),
+;; task queuing, dispatching work to available resources, and error
+;; handling.
 ;;
-;; This version has been refactored to integrate with standalone modules
-;; for advanced features like circuit breaking and priority queuing.
+;; This version has been refactored to **delegate dynamic scaling and
+;; resource allocation decisions to the `warp-allocator` module**.
+;; `warp-pool` now acts primarily as a **resource provider** to the
+;; `warp-allocator`, exposing functions for adding and removing its
+;; managed resources.
 ;;
 ;; ## Core Concepts:
 ;;
-;; - **Worker Lifecycle:** Manages a dynamic set of "workers" (background
-;;   processes or threads), handling creation, termination, and restarts.
+;; - **Resource Lifecycle**: Manages a dynamic set of "resources"
+;;   (background processes, threads, connections, etc.), handling
+;;   creation, validation, termination, and recycling.
+;; - **Task Queuing and Dispatch**: Tasks are submitted and placed in a
+;;   queue (`warp-stream` for FIFO or `loom:pqueue` for priority). The
+;;   pool automatically dispatches tasks to idle resources.
+;; - **Resilience**: Integrates with `warp-circuit-breaker.el` to
+;;   prevent cascading failures. Includes task timeouts and protection
+;;   against repeated resource/task failures.
 ;;
-;; - **Task Queuing and Dispatch:** Tasks are submitted and placed in a
-;;   queue (`loom:queue` or `loom:pqueue`). The pool automatically
-;;   dispatches tasks to idle workers.
+;; ## Customization:
 ;;
-;; - **Dynamic Scaling:** Pools automatically scale the number of workers
-;;   up and down to meet demand.
-;;
-;; - **Resilience:** Integrates with `warp-circuit-breaker.el` to prevent
-;;    cascading failures. Includes task timeouts and protection against
-;;   "poison pill" tasks.
-;;
-;; ## Thread Safety:
-;;
-;; All public functions are thread-safe, acquiring the pool's internal
-;; lock before accessing or modifying any shared state.
+;; The `warp:pool` constructor directly accepts functions for resource
+;; creation, validation, and destruction. For a more declarative way to
+;; bundle complex configurations, the `warp:pool-builder` macro can be
+;; used. Users should generally interact with pools directly via
+;; `warp:pool-submit`, `warp:pool-shutdown`, and `warp:pool-status`,
+;; passing the pool instance explicitly.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'loom)
 (require 'braid)
+(require 'ring)
 
 (require 'warp-log)
 (require 'warp-error)
 (require 'warp-circuit-breaker)
+(require 'warp-stream)
+(require 'warp-config)
+(require 'warp-marshal)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
 
 (define-error 'warp-pool-error
-  "A generic error occurred in a worker pool."
+  "A generic error occurred in a resource pool."
   'warp-error)
 
 (define-error 'warp-invalid-pool-error
@@ -56,238 +65,257 @@
   'warp-pool-error)
 
 (define-error 'warp-pool-poison-pill
-  "A task failed repeatedly, crashing multiple workers, and was rejected."
+  "A task failed repeatedly, crashing multiple resources, and was
+rejected."
   'warp-pool-error)
 
 (define-error 'warp-pool-queue-full
-  "The pool's task queue has reached its maximum configured size."
+  "A write operation failed because the stream's buffer is full."
   'warp-pool-error)
 
 (define-error 'warp-pool-shutdown
-  "An operation was attempted on a pool that is shutting down or shut down."
+  "An operation was attempted on a pool that is shutting down or shut
+down."
+  'warp-pool-error)
+
+(define-error 'warp-pool-resource-unavailable
+  "No suitable resource is available to process the task."
   'warp-pool-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Customization
+;;; Configuration
 
-(defgroup warp-pool nil
-  "A thread-safe, configurable worker pool for executing tasks in parallel."
-  :group 'warp
-  :prefix "warp-pool-")
+(warp:defconfig warp-pool-internal-config
+  "Internal configuration for `warp-pool` instances.
+These parameters control the core behavior of the pool, including
+resource restart policies and internal management intervals.
 
-(defcustom warp-pool-default-min-size 1
-  "The default minimum number of workers to maintain in a dynamic pool."
-  :type '(natnum :min 1)
-  :group 'warp-pool)
-
-(defcustom warp-pool-default-max-size 4
-  "The default maximum number of workers to scale up to in a dynamic pool."
-  :type '(natnum :min 1)
-  :group 'warp-pool)
-
-(defcustom warp-pool-max-worker-restarts 3
-  "The maximum number of times a single worker will be restarted after
-crashing before it is permanently marked as `:failed`."
-  :type '(natnum :min 0)
-  :group 'warp-pool)
-
-(defcustom warp-pool-management-interval 5
-  "The interval in seconds between periodic pool management cycles."
-  :type '(number :min 1)
-  :group 'warp-pool)
-
-(defcustom warp-pool-priority-levels
-  '((:critical . 100) (:high . 75) (:normal . 50)
-    (:low . 25) (:background . 0))
-  "Named priority levels for tasks."
-  :type '(alist :key-type symbol :value-type integer)
-  :group 'warp-pool)
+Fields:
+- `max-resource-restarts` (integer): Max restarts before a resource is
+  permanently failed.
+- `management-interval` (float): Interval for periodic internal
+  management cycles.
+- `metrics-ring-size` (integer): Size of ring buffers for metrics."
+  (max-resource-restarts 3
+                         :type integer
+                         :validate (>= $ 0))
+  (management-interval 5.0
+                       :type float
+                       :validate (>= $ 1.0))
+  (metrics-ring-size 100
+                     :type integer
+                     :validate (>= $ 10)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Struct Definitions
+;;; Schema Definitions
 
-(cl-deftype warp-task-type () '(or null warp-task))
-(cl-deftype warp-pool-worker-type () '(or null warp-pool-worker))
-
-(cl-defstruct (warp-task (:constructor %%make-task))
-  "Represents a single unit of work submitted to the worker pool.
+(warp:defschema warp-task
+    ((:constructor make-warp-task)
+     (:copier nil)
+     (:json-name "WarpTask"))
+  "Represents a single unit of work submitted to the resource pool.
 This struct acts as a container for the user's payload, along with all
 the metadata needed by the pool to manage its execution.
 
-Slots:
+Fields:
 - `promise` (loom-promise): The promise associated with this task.
 - `id` (string): A unique identifier for this task within its pool.
-- `payload` (any): The actual data or callable form for the worker.
+- `payload` (any): The actual data or callable form for the resource.
 - `priority` (integer): The task's priority (higher is more urgent).
 - `submitted-at` (float): Timestamp when the task was submitted.
 - `retries` (integer): Number of times this task has been retried.
-- `worker` (warp-pool-worker): The worker currently executing this task.
-- `cancel-token` (loom-cancel-token): Token to request cancellation.
-- `start-time` (float): Timestamp when execution began.
-- `timeout` (number): Maximum allowed execution time in seconds."
-  (promise nil :type (or null loom-promise))
-  (id "" :type string)
-  (payload nil :type t)
-  (priority 50 :type integer)
-  (submitted-at nil :type (or null float))
-  (retries 0 :type integer)
-  (worker nil :type warp-pool-worker-type)
-  (cancel-token nil :type (or null loom-cancel-token))
-  (start-time nil :type (or null float))
-  (timeout nil :type (or null number)))
+- `resource` (warp-pool-resource or nil): The resource currently
+  executing this task.
+- `cancel-token` (loom-cancel-token or nil): Token to request
+  cancellation.
+- `start-time` (float or nil): Timestamp when execution began.
+- `timeout` (number or nil): Maximum allowed execution time in seconds."
+  (promise nil :type (or null loom-promise) :serializable-p nil)
+  (id "" :type string :json-key "id")
+  (payload nil :type t :json-key "payload")
+  (priority 50 :type integer :json-key "priority")
+  (submitted-at nil :type (or null float) :json-key "submittedAt")
+  (retries 0 :type integer :json-key "retries")
+  (resource nil :type (or null warp-pool-resource) :serializable-p nil)
+  (cancel-token nil :type (or null loom-cancel-token) :serializable-p nil)
+  (start-time nil :type (or null float) :json-key "startTime")
+  (timeout nil :type (or null number) :json-key "timeout"))
 
 (cl-defstruct (warp-pool-health-check
-               (:constructor %%make-pool-health-check))
-  "Health check configuration for workers.
+               (:constructor make-warp-pool-health-check)
+               (:copier nil))
+  "Health check configuration for resources.
 
-Slots:
+Fields:
 - `enabled` (boolean): If non-nil, health checks are enabled.
-- `check-fn` (function): A function `(lambda (worker pool))` that returns
-  non-nil if the worker is healthy.
-- `interval` (integer): The interval in seconds between checks.
+- `check-fn` (function or nil): A function `(lambda (resource pool))`
+  that returns a `loom-promise` resolving to `t` for healthy,
+  rejecting for unhealthy.
+- `interval` (float): The interval in seconds between checks.
 - `failure-threshold` (integer): Number of consecutive failures before
-  a worker is considered failed.
-- `consecutive-failures` (integer): The current count of consecutive failures."
+  a resource is considered failed.
+- `consecutive-failures` (integer): The current count of consecutive
+  failures."
   (enabled nil :type boolean)
   (check-fn nil :type (or null function))
-  (interval 60 :type integer)
+  (interval 60.0 :type float)
   (failure-threshold 3 :type integer)
   (consecutive-failures 0 :type integer))
 
-(cl-defstruct (warp-pool-worker (:constructor %%make-worker))
-  "Represents a single generic worker within a pool.
+(cl-defstruct (warp-pool-resource (:constructor make-warp-pool-resource)
+                                   (:copier nil))
+  "Represents a single generic resource managed within a pool.
 This struct is a handle for an underlying resource, typically a
 background process or thread, and tracks its status and health.
 
-Slots:
-- `process` (process): The underlying Emacs process object.
-- `id` (integer): A unique identifier for this worker within its pool.
-- `status` (symbol): The current state (:idle, :busy, :restarting, etc.).
-- `current-task` (warp-task): The task currently assigned to this worker.
-- `restart-attempts` (integer): Number of times this worker has restarted.
-- `last-active-time` (float): Timestamp when this worker last finished
-  a task.
-- `custom-data` (any): A flexible slot for specialized pool types.
+Fields:
+- `id` (string): A unique identifier for this resource within its pool.
+  Can be a custom ID or an auto-generated one.
+- `resource-handle` (any): The actual underlying resource object (e.g.,
+  an Emacs process, a TCP connection object).
+- `status` (symbol): The current state (`:idle`, `:busy`, `:restarting`,
+  `:failed`, `:stopped`).
+- `current-task` (warp-task or nil): The task currently assigned to this
+  resource.
+- `restart-attempts` (integer): Number of times this resource has
+  restarted.
+- `last-active-time` (float or nil): Timestamp when this resource last
+  finished a task.
+- `custom-data` (any): A flexible slot for specialized pool types to
+  store resource-specific metadata (e.g., worker ID, connection address).
 - `health-check` (warp-pool-health-check): The health check
-  configuration and state for this worker."
-  (process nil :type (or null process))
-  (id 0 :type integer)
-  (status :idle :type symbol)
-  (current-task nil :type warp-task-type)
+  configuration and state for this resource."
+  (id nil :type string)
+  (resource-handle nil :type t)
+  (status :idle :type (member :idle :busy :restarting :failed :stopped))
+  (current-task nil :type (or null warp-task))
   (restart-attempts 0 :type integer)
   (last-active-time nil :type (or null float))
   (custom-data nil :type t)
-  (health-check (%%make-pool-health-check) :type warp-pool-health-check))
+  (health-check (make-warp-pool-health-check) :type warp-pool-health-check))
 
-(cl-defstruct (warp-pool-metrics (:constructor %%make-metrics))
+(warp:defschema warp-pool-metrics
+    ((:constructor make-warp-pool-metrics)
+     (:copier nil)
+     (:json-name "WarpPoolMetrics"))
   "Comprehensive metrics for pool monitoring and observability.
 
-Slots:
+Fields:
 - `tasks-submitted` (integer): Total tasks ever submitted.
 - `tasks-completed` (integer): Total tasks that completed successfully.
 - `tasks-failed` (integer): Total tasks that failed.
 - `tasks-cancelled` (integer): Total tasks that were cancelled.
 - `tasks-timed-out` (integer): Total tasks that timed out.
 - `total-execution-time` (float): Sum of all task execution times.
-- `worker-restarts` (integer): Total number of worker restarts.
-- `queue-wait-times` (list): A ring buffer of recent task wait times.
-- `execution-times` (list): A ring buffer of recent task execution times.
+- `resource-restarts` (integer): Total number of resource restarts.
+- `queue-wait-times` (ring or nil): A ring buffer of recent task wait
+  times (not serialized).
+- `execution-times` (ring or nil): A ring buffer of recent task
+  execution times (not serialized).
 - `peak-queue-length` (integer): The maximum observed queue length.
-- `peak-worker-count` (integer): The maximum observed number of workers.
+- `peak-resource-count` (integer): The maximum observed number of
+  resources.
 - `created-at` (float): Timestamp when the pool was created.
-- `last-task-at` (float): Timestamp of the last task completion."
-  (tasks-submitted 0 :type integer)
-  (tasks-completed 0 :type integer)
-  (tasks-failed 0 :type integer)
-  (tasks-cancelled 0 :type integer)
-  (tasks-timed-out 0 :type integer)
-  (total-execution-time 0.0 :type float)
-  (worker-restarts 0 :type integer)
-  (queue-wait-times '() :type list)
-  (execution-times '() :type list)
-  (peak-queue-length 0 :type integer)
-  (peak-worker-count 0 :type integer)
-  (created-at nil :type (or null float))
-  (last-task-at nil :type (or null float)))
+- `last-task-at` (float or nil): Timestamp of the last task completion."
+  (tasks-submitted 0 :type integer :json-key "tasksSubmitted")
+  (tasks-completed 0 :type integer :json-key "tasksCompleted")
+  (tasks-failed 0 :type integer :json-key "tasksFailed")
+  (tasks-cancelled 0 :type integer :json-key "tasksCancelled")
+  (tasks-timed-out 0 :type integer :json-key "tasksTimedOut")
+  (total-execution-time 0.0 :type float :json-key "totalExecutionTime")
+  (resource-restarts 0 :type integer :json-key "resourceRestarts")
+  (queue-wait-times nil :type (or null ring) :serializable-p nil)
+  (execution-times nil :type (or null ring) :serializable-p nil)
+  (peak-queue-length 0 :type integer :json-key "peakQueueLength")
+  (peak-resource-count 0 :type integer :json-key "peakResourceCount")
+  (created-at nil :type (or null float) :json-key "createdAt")
+  (last-task-at nil :type (or null float) :json-key "lastTaskAt"))
 
-(cl-defstruct (warp-pool-batch-config
-               (:constructor %%make-pool-batch-config))
+(warp:defschema warp-pool-batch-config
+    ((:constructor make-warp-pool-batch-config)
+     (:copier nil)
+     (:json-name "WarpPoolBatchConfig"))
   "Configuration for task batching.
 
-Slots:
+Fields:
 - `enabled` (boolean): If non-nil, task batching is enabled.
 - `max-batch-size` (integer): The maximum number of tasks in a single
   batch.
 - `max-wait-time` (float): Maximum time in seconds to wait before
   processing an complete batch.
-- `batch-processor-fn` (function): A function `(lambda (tasks pool))`
-  that processes a batch of tasks."
-  (enabled nil :type boolean)
-  (max-batch-size 10 :type integer)
-  (max-wait-time 0.1 :type float)
-  (batch-processor-fn nil :type (or null function)))
+- `batch-processor-fn` (function or nil): A function `(lambda (tasks
+  pool))` that processes a batch of tasks. Must be provided if batching
+  is enabled."
+  (enabled nil :type boolean :json-key "enabled")
+  (max-batch-size 10 :type integer :json-key "maxBatchSize"
+                  :validate (>= $ 1))
+  (max-wait-time 0.1 :type float :json-key "maxWaitTime"
+                 :validate (>= $ 0.01))
+  (batch-processor-fn nil :type (or null function) :serializable-p nil))
 
-(cl-defstruct (warp-pool (:constructor %%make-pool))
-  "Represents a generic, thread-safe pool of persistent worker processes.
+(cl-defstruct (warp-pool (:constructor %%make-pool) (:copier nil))
+  "Represents a generic, thread-safe pool of persistent resources.
+This struct is the central engine for the resource pool, containing the
+task queue, the list of resources, and the user-provided hook functions
+that define the pool's specific behavior. It no longer manages its own
+scaling, delegating that to `warp-allocator`.
 
-This struct is the central engine for the worker pool, containing the
-task queue, the list of workers, and the user-provided hook functions
-that define the pool's specific behavior.
-
-Slots:
+Fields:
 - `name` (string): A descriptive name for this pool instance.
 - `context` (any): Shared contextual data for hook functions.
-- `workers` (list): A list of `warp-pool-worker` instances.
+- `resources` (list): A list of `warp-pool-resource` instances.
 - `lock` (loom-lock): A mutex protecting the pool's shared mutable state.
-- `task-queue` (loom:queue or loom:pqueue): The internal task queue.
-- `worker-factory-fn` (function): `(lambda (worker pool))` to create
-  a worker.
-- `worker-ipc-sentinel-fn` (function): `(lambda (worker event pool))`
-  for worker death.
-- `task-executor-fn` (function): `(lambda (task worker pool))` to run
-  a task.
-- `task-cancel-fn` (function): `(lambda (worker task pool))` to cancel
-  a task.
+- `task-queue` (warp-stream or loom:pqueue): The internal task queue. If
+  `:priority` `task-queue-type` is used, it's a `loom:pqueue`; otherwise,
+  it's a `warp-stream`.
+- `resource-factory-fn` (function): `(lambda (resource pool))` to create
+  a resource handle. Must be non-nil.
+- `resource-validator-fn` (function): `(lambda (resource pool))` to
+  validate a resource's health before use. Returns a `loom-promise`.
+- `resource-destructor-fn` (function): `(lambda (resource pool))` to
+  cleanly destroy a resource. Must be non-nil.
+- `task-executor-fn` (function): `(lambda (task resource pool))` to run
+  a task on a resource. Must be non-nil.
+- `task-cancel-fn` (function): `(lambda (resource task pool))` to cancel
+  a running task. Defaults to a no-op that resolves immediately.
 - `shutdown-p` (boolean): `t` if the pool is shutting down.
-- `next-worker-id` (integer): A counter for unique worker IDs.
+- `next-resource-id` (integer): A counter for unique resource IDs.
 - `next-task-id` (integer): A counter for unique task IDs.
-- `management-timer` (timer): Timer for periodic pool management.
-- `min-size` (integer): Minimum number of workers to keep alive.
-- `max-size` (integer): Maximum number of workers to scale up to.
-- `worker-idle-timeout` (integer): Seconds before an idle worker is
-  scaled down.
-- `max-queue-size` (integer): Maximum number of tasks allowed in queue.
+- `management-timer` (timer or nil): Timer for periodic pool management.
+- `max-queue-size` (integer or nil): Maximum number of tasks allowed in
+  queue. `nil` means unbounded.
 - `metrics` (warp-pool-metrics): Comprehensive metrics for the pool.
-- `circuit-breaker-id` (string): The service ID for
+- `circuit-breaker-id` (string or nil): The service ID for
   `warp-circuit-breaker`.
-- `batch-config` (warp-pool-batch-config): Configuration for task
+- `batch-config` (warp-pool-batch-config or nil): Configuration for task
   batching.
 - `pending-batch` (list): The current list of tasks waiting to be
   batched.
-- `batch-timer` (timer): The timer for batch processing."
-  (name "" :type string)
+- `batch-timer` (timer or nil): The timer for batch processing.
+- `internal-config` (warp-pool-internal-config): Internal configuration
+  parameters for the pool."
+  (name (cl-assert nil) :type string)
   (context nil :type t)
-  (workers '() :type list)
+  (resources '() :type list)
   (lock (loom:lock "warp-pool") :type loom-lock)
-  (task-queue nil :type (or null loom:queue loom:pqueue))
-  (worker-factory-fn #'ignore :type function)
-  (worker-ipc-sentinel-fn #'ignore :type function)
-  (task-executor-fn #'ignore :type function)
-  (task-cancel-fn (lambda (w _p) (delete-process (warp-pool-worker-process w)))
+  (task-queue nil :type (or null warp-stream loom:pqueue))
+  (resource-factory-fn (cl-assert nil) :type function)
+  (resource-validator-fn (cl-assert nil) :type function)
+  (resource-destructor-fn (cl-assert nil) :type function)
+  (task-executor-fn (cl-assert nil) :type function)
+  (task-cancel-fn (lambda (_r _t _p) (loom:resolved! nil))
                   :type function)
   (shutdown-p nil :type boolean)
-  (next-worker-id 1 :type integer)
+  (next-resource-id 1 :type integer)
   (next-task-id 1 :type integer)
   (management-timer nil :type (or null timer))
-  (min-size warp-pool-default-min-size :type integer)
-  (max-size warp-pool-default-max-size :type integer)
-  (worker-idle-timeout 300 :type integer)
   (max-queue-size nil :type (or null integer))
-  (metrics (%%make-metrics :created-at (float-time)) :type warp-pool-metrics)
+  (metrics (cl-assert nil) :type warp-pool-metrics)
   (circuit-breaker-id nil :type (or null string))
   (batch-config nil :type (or null warp-pool-batch-config))
   (pending-batch '() :type list)
-  (batch-timer nil :type (or null timer)))
+  (batch-timer nil :type (or null timer))
+  (internal-config (cl-assert nil) :type warp-pool-internal-config))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Private Functions
@@ -302,8 +330,7 @@ Slots:
 Arguments:
 - `pool` (warp-pool): The pool for which to generate the task ID.
 
-Returns:
-- (string): A unique task ID string."
+Returns: (string): A unique task ID string (e.g., \"my-pool-task-123\")."
   (format "%s-task-%d" (warp-pool-name pool)
           (cl-incf (warp-pool-next-task-id pool))))
 
@@ -311,15 +338,15 @@ Returns:
   "A comparator function for the priority queue implementation.
 Compares two `warp-task` objects based on their priority and submission
 time. Higher priority tasks are considered 'greater'. If priorities are
-equal, the task submitted earlier is considered 'greater'.
+equal, the task submitted earlier is considered 'greater'. This ensures
+that high-priority tasks are processed before older, lower-priority ones.
 
 Arguments:
 - `task1` (warp-task): The first task to compare.
 - `task2` (warp-task): The second task to compare.
 
-Returns:
-- (boolean): `t` if `task1` has higher priority or was submitted earlier
-  (in case of equal priority), `nil` otherwise."
+Returns: (boolean): `t` if `task1` has higher priority or was submitted
+  earlier (in case of equal priority), `nil` otherwise."
   (let ((p1 (warp-task-priority task1)) (p2 (warp-task-priority task2)))
     (if (= p1 p2)
         (< (warp-task-submitted-at task1) (warp-task-submitted-at task2))
@@ -327,408 +354,420 @@ Returns:
 
 (defun warp--validate-pool (pool fn-name)
   "Signal a `warp-invalid-pool-error` if `POOL` is not a valid, running pool.
+This helper ensures that public API calls are made on a properly
+initialized and active pool instance.
 
 Arguments:
 - `pool` (warp-pool): The pool instance to validate.
 - `fn-name` (string): The name of the calling function for
-  the error message.
+  the error message, providing context to the user.
 
-Returns:
-- `nil` if the pool is valid.
-
-Side Effects:
-- None.
+Returns: `nil` if the pool is valid.
 
 Signals:
 - `warp-invalid-pool-error`: If the pool is `nil`, not a `warp-pool`
   instance, or is already in a `shutdown-p` state."
   (unless (and (warp-pool-p pool) (not (warp-pool-shutdown-p pool)))
     (let ((pool-name (if (warp-pool-p pool) (warp-pool-name pool) "<?>")))
-      (signal 'warp-invalid-pool-error
-              (list (warp:error! :type 'warp-invalid-pool-error
-                                 :message (format "%s: Pool '%s' is invalid or shut down"
-                                                  fn-name pool-name)))))))
+      (signal (warp:error! :type 'warp-invalid-pool-error
+                           :message (format "%s: Pool '%s' is invalid or %s"
+                                            fn-name pool-name "shut down"))))))
 
-;;----------------------------------------------------------------------
-;;; Queue Abstraction Layer
-;;----------------------------------------------------------------------
-
-(defun warp--pool-queue-length (queue)
-  "Return the length of the `POOL`'s task queue.
-This function abstracts away whether the queue is a standard FIFO queue
-(`loom:queue`) or a priority queue (`loom:pqueue`).
+(defun warp--update-task-metrics (pool task status &optional execution-time)
+  "Update metrics for a task based on its final `STATUS`.
+This function centralizes the logic for tracking task lifecycle metrics,
+including completion times, failures, and queue wait times.
 
 Arguments:
-- `queue` (loom:queue or loom:pqueue): The task queue instance.
+- `pool` (warp-pool): The pool to which the task belongs.
+- `task` (warp-task): The task whose metrics are being updated.
+- `status` (keyword): The final status (`:completed`, `:failed`,
+  `:cancelled`, `:timed-out`).
+- `execution-time` (float, optional): The time taken for task
+  execution. Required for `:completed` status, providing resolution
+  time from `start-time`.
 
-Returns:
-- (integer): The number of tasks currently in the queue."
-  (if (loom:pqueue-p queue) (loom:pqueue-length queue)
-    (loom:queue-length queue)))
+Returns: `nil`.
 
-(defun warp--pool-queue-enqueue (queue task)
-  "Enqueue a `TASK` into the `POOL`'s task queue.
-Handles both standard and priority queues. For priority queues, the task
-is inserted according to its priority.
+Side Effects:
+- Modifies `warp-pool-metrics` in the `pool` instance.
+- Updates `tasks-completed`, `tasks-failed`, `tasks-cancelled`,
+  `tasks-timed-out`, `total-execution-time`, `last-task-at`, and
+  adds to `queue-wait-times` and `execution-times` ring buffers."
+  (loom:with-mutex! (warp-pool-lock pool)
+    (let ((metrics (warp-pool-metrics pool))
+          (now (float-time)))
+      (pcase status
+        (:completed
+         (cl-incf (warp-pool-metrics-tasks-completed metrics))
+         (cl-incf (warp-pool-metrics-total-execution-time metrics)
+                  execution-time)
+         (ring-insert (warp-pool-metrics-execution-times metrics)
+                      execution-time))
+        (:failed
+         (cl-incf (warp-pool-metrics-tasks-failed metrics)))
+        (:cancelled
+         (cl-incf (warp-pool-metrics-tasks-cancelled metrics)))
+        (:timed-out
+         (cl-incf (warp-pool-metrics-tasks-timed-out metrics))))
+      (setf (warp-pool-metrics-last-task-at metrics) now)
+      (when (and (warp-task-submitted-at task) (warp-task-start-time task))
+        (let ((wait-time (- (warp-task-start-time task)
+                            (warp-task-submitted-at task))))
+          (ring-insert (warp-pool-metrics-queue-wait-times metrics)
+                       wait-time))))))
+
+;;----------------------------------------------------------------------
+;;; Task Queue Management
+;;----------------------------------------------------------------------
+
+(defun warp--pool-queue-enqueue (pool task)
+  "Enqueue a `TASK` into the pool's `task-queue`.
+This function handles both priority queues (`loom:pqueue`) and
+stream-based FIFO queues (`warp-stream`), applying backpressure if the
+stream's buffer is full.
 
 Arguments:
-- `queue` (loom:queue or loom:pqueue): The task queue instance.
+- `pool` (warp-pool): The pool instance.
 - `task` (warp-task): The task to enqueue.
 
-Returns:
-- (warp-task): The enqueued task.
+Returns: (loom-promise): A promise that resolves to `t` when the task is
+  successfully enqueued.
 
-Side Effects:
-- Modifies the `queue` by adding `task`."
-  (if (loom:pqueue-p queue) (loom:pqueue-insert queue task)
-    (loom:queue-enqueue queue task)))
+Signals:
+- `warp-pool-queue-full`: If the queue is a `warp-stream` and is full
+  with an `:error` `overflow-policy`."
+  (let ((queue (warp-pool-task-queue pool)))
+    (if (loom:pqueue-p queue)
+        (progn (loom:pqueue-insert queue task) (loom:resolved! t))
+      ;; For warp-stream, `warp:stream-write` handles backpressure
+      ;; according to its `overflow-policy`.
+      (warp:stream-write queue task))))
 
-(defun warp--pool-queue-dequeue (queue)
-  "Dequeue a task from the `POOL`'s task queue.
-Retrieves the next task to be processed, respecting priority if it's a
-priority queue, or FIFO order otherwise.
-
-Arguments:
-- `queue` (loom:queue or loom:pqueue): The task queue instance.
-
-Returns:
-- (warp-task or nil): The dequeued task, or `nil` if the queue is empty.
-
-Side Effects:
-- Modifies the `queue` by removing a task."
-  (if (loom:pqueue-p queue) (loom:pqueue-dequeue queue)
-    (loom:queue-dequeue queue)))
-
-(defun warp--pool-queue-remove (queue task)
-  "Remove a specific `TASK` from the `POOL`'s task queue.
-This is typically used for cancelling tasks that are still in the queue.
+(defun warp--pool-queue-dequeue (pool)
+  "Dequeue the next `TASK` from the pool's `task-queue`.
+This function supports both priority queues and stream-based FIFO queues.
 
 Arguments:
-- `queue` (loom:queue or loom:pqueue): The task queue instance.
-- `task` (warp-task): The specific task to remove.
+- `pool` (warp-pool): The pool instance.
 
-Returns:
-- (boolean): `t` if the task was found and removed, `nil` otherwise.
-
-Side Effects:
-- Modifies the `queue` by potentially removing `task`."
-  (if (loom:pqueue-p queue) (loom:pqueue-remove queue task)
-    (loom:queue-remove queue task)))
-
-(defun warp--pool-queue-empty-p (queue)
-  "Return non-nil if the `POOL`'s task queue is empty.
-
-Arguments:
-- `queue` (loom:queue or loom:pqueue): The task queue instance.
-
-Returns:
-- (boolean): `t` if the queue is empty, `nil` otherwise."
-  (if (loom:pqueue-p queue) (loom:pqueue-empty-p queue)
-    (loom:queue-empty-p queue)))
+Returns: (loom-promise): A promise that resolves to the dequeued
+  `warp-task` or `nil` if the queue is empty. For `warp-stream`, it
+  might return `:eof` if the stream is closed."
+  (let ((queue (warp-pool-task-queue pool)))
+    (if (loom:pqueue-p queue)
+        (loom:resolved! (loom:pqueue-dequeue queue))
+      ;; For warp-stream, read asynchronously. A small timeout can make
+      ;; it behave like a "try-read" to avoid blocking indefinitely if no
+      ;; tasks are immediately available, but `warp--pool-dispatch-next-task`
+      ;; is responsible for loop.
+      (warp:stream-read queue :timeout 0.1))))
 
 ;;----------------------------------------------------------------------
-;;; Enhanced Feature Helpers (Metrics, Batching)
-;;----------------------------------------------------------------------
-
-(defun warp--ring-buffer-add (ring-list item max-size)
-  "Add `ITEM` to `RING-LIST`, maintaining `MAX-SIZE`.
-This function implements a simple ring buffer (or circular buffer) by
-adding an item to the front of a list and truncating the list if it
-exceeds `MAX-SIZE`.
-
-Arguments:
-- `ring-list` (list): The current list representing the ring buffer.
-- `item` (any): The item to add.
-- `max-size` (integer): The maximum allowed size of the ring buffer.
-
-Returns:
-- (list): The updated ring buffer list.
-
-Side Effects:
-- Modifies `ring-list` in place."
-  (push item ring-list)
-  (when (> (length ring-list) max-size)
-    (setcdr (nthcdr (1- max-size) ring-list) nil))
-  ring-list)
-
-(defun warp--update-task-metrics (pool task result-type &optional exec-time)
-  "Update pool metrics when a `TASK` completes.
-This function increments various task counters based on the `RESULT-TYPE`
-and records execution time if provided.
-
-Arguments:
-- `pool` (warp-pool): The pool whose metrics are to be updated.
-- `task` (warp-task): The task that just completed or failed.
-- `result-type` (keyword): The outcome of the task, e.g., `:completed`,
-  `:failed`, `:cancelled`, `:timeout`.
-- `exec-time` (float, optional): The execution time of the task in
-  seconds, relevant for `:completed` tasks.
-
-Returns:
-- `nil`.
-
-Side Effects:
-- Modifies the `metrics` slot of the `pool`."
-  (let ((metrics (warp-pool-metrics pool)))
-    (cl-case result-type
-      (:completed
-       (cl-incf (warp-pool-metrics-tasks-completed metrics))
-       (when exec-time
-         (cl-incf (warp-pool-metrics-total-execution-time metrics)
-                  exec-time)
-         (setf (warp-pool-metrics-execution-times metrics)
-               (warp--ring-buffer-add
-                (warp-pool-metrics-execution-times metrics) exec-time 100))))
-      (:failed (cl-incf (warp-pool-metrics-tasks-failed metrics)))
-      (:cancelled (cl-incf (warp-pool-metrics-tasks-cancelled metrics)))
-      (:timeout (cl-incf (warp-pool-metrics-tasks-timed-out metrics))))
-    (setf (warp-pool-metrics-last-task-at metrics) (float-time))))
-
-(defun warp--maybe-process-batch (pool force)
-  "Process pending batch if conditions are met.
-A batch is processed if `FORCE` is non-nil, or if the number of pending
-tasks reaches `max-batch-size` defined in the pool's batch configuration.
-
-Arguments:
-- `pool` (warp-pool): The pool instance containing the batch config
-  and pending tasks.
-- `force` (boolean): If non-nil, force processing of the current batch
-  regardless of its size.
-
-Returns:
-- `nil`.
-
-Side Effects:
-- Clears the `pending-batch` list in the `pool`.
-- Calls the `batch-processor-fn` with the batched tasks.
-- Cancels the batch timer if it exists."
-  (when-let* ((config (warp-pool-batch-config pool))
-              ((warp-pool-batch-config-enabled config))
-              (pending (warp-pool-pending-batch pool)))
-    (when (or force
-              (>= (length pending)
-                  (warp-pool-batch-config-max-batch-size config)))
-      ;; If a batch is processed, clear the timer.
-      (when (warp-pool-batch-timer pool)
-        (cancel-timer (warp-pool-batch-timer pool))
-        (setf (warp-pool-batch-timer pool) nil))
-      ;; Clear the pending batch and call the processor function.
-      (setf (warp-pool-pending-batch pool) '())
-      (funcall (warp-pool-batch-config-batch-processor-fn config)
-               (nreverse pending) pool))))
-
-;;----------------------------------------------------------------------
-;;; Core Worker Management
+;;; Core Resource Management
 ;;----------------------------------------------------------------------
 
 (defun warp--pool-requeue-or-reject (task pool)
-  "Handle a `TASK` whose worker died.
-If the task has exceeded `warp-pool-max-worker-restarts`, it's considered
-a 'poison pill' and its promise is rejected. Otherwise, the task is
-re-enqueued for another attempt.
+  "Handle a `TASK` whose assigned resource (sub-process, etc.) died.
+If the task has exceeded `max-resource-restarts` (from
+`pool-internal-config`), it's considered a 'poison pill' and its promise
+is rejected. Otherwise, the task is re-enqueued for another attempt on
+a different resource. This provides task-level resilience.
 
 Arguments:
-- `task` (warp-task): The task associated with the dead worker.
+- `task` (warp-task): The task associated with the dead resource.
 - `pool` (warp-pool): The pool to which the task belongs.
 
-Returns:
-- `nil`.
+Returns: (loom-promise): A promise that resolves when the task is
+  handled (requeued or rejected).
 
 Side Effects:
 - Increments `warp-task-retries`.
 - Either rejects the task's promise with `warp-pool-poison-pill`
-  or re-enqueues the task."
+  or re-enqueues the task via `warp--pool-queue-enqueue`."
   (cl-incf (warp-task-retries task))
-  (if (> (warp-task-retries task) warp-pool-max-worker-restarts)
-      ;; Task has failed too many times; reject it as a poison pill.
-      (progn
-        (warp:log! :warn (warp-pool-name pool) "Task %s is a poison pill."
-                   (warp-task-id task))
-        (loom:promise-reject (warp-task-promise task)
-                             (warp:error! :type 'warp-pool-poison-pill
-                                          :message (format "Task %s failed on multiple workers"
-                                                           (warp-task-id task))
-                                          :details `(:task-id ,(warp-task-id task))))
-        (warp--update-task-metrics pool task :failed))
-    ;; Otherwise, re-enqueue the task for another worker to try.
-    (progn
-      (warp:log! :info (warp-pool-name pool) "Re-enqueuing task %s (retry %d)."
-                 (warp-task-id task) (warp-task-retries task))
-      (warp--pool-queue-enqueue (warp-pool-task-queue pool) task))))
-
-(defun warp-pool-handle-worker-death (worker event pool)
-  "Handle the death of a `WORKER`, managing restarts and re-queuing its task.
-This function is typically set as a process sentinel for worker processes.
-It increments worker restart attempts, records circuit breaker failures,
-and attempts to restart the worker or mark it as permanently failed.
-If the worker had a task, that task is either re-queued or rejected as a
-poison pill.
-
-Arguments:
-- `worker` (warp-pool-worker): The worker that died.
-- `event` (string): The event message from the process sentinel.
-- `pool` (warp-pool): The pool to which the worker belongs.
-
-Returns:
-- `nil`.
-
-Side Effects:
-- Updates worker status (`:dead`, `:restarting`, `:failed`).
-- Increments pool metrics (`worker-restarts`).
-- May trigger `warp:circuit-breaker-record-failure`.
-- May re-enqueue a task or reject its promise.
-- May call `warp--pool-start-worker` to restart the worker.
-- Calls `warp--pool-dispatch-next-task` to attempt dispatching."
-  (loom:with-mutex! (warp-pool-lock pool)
-    (warp:log! :warn (warp-pool-name pool) "Worker %d died: %s"
-               (warp-pool-worker-id worker) event)
-    (cl-incf (warp-pool-metrics-worker-restarts (warp-pool-metrics pool)))
-    (when-let ((cb-id (warp-pool-circuit-breaker-id pool)))
-      (warp:circuit-breaker-record-failure (warp:circuit-breaker-get cb-id)))
-    ;; Handle the task associated with the dead worker.
-    (when-let ((task (warp-pool-worker-current-task worker)))
-      (warp--pool-requeue-or-reject task pool))
-    (setf (warp-pool-worker-status worker) :dead)
-    (unless (warp-pool-shutdown-p pool)
-      (cl-incf (warp-pool-worker-restart-attempts worker))
-      (if (> (warp-pool-worker-restart-attempts worker)
-             warp-pool-max-worker-restarts)
-          (progn
-            ;; If max restarts reached, worker is permanently failed.
-            (setf (warp-pool-worker-status worker) :failed)
-            (warp:log! :error (warp-pool-name pool)
-                       "Worker %d failed permanently after %d restarts."
-                       (warp-pool-worker-id worker)
-                       (warp-pool-worker-restart-attempts worker)))
+  (let ((max-restarts (warp-pool-internal-config-max-resource-restarts
+                       (warp-pool-internal-config pool))))
+    (if (> (warp-task-retries task) max-restarts)
+        ;; Task has failed too many times; reject it as a poison pill.
+        ;; This prevents a single problematic task from continuously
+        ;; crashing resources.
         (progn
-          ;; Otherwise, attempt to restart the worker.
-          (setf (warp-pool-worker-status worker) :restarting)
-          (warp:log! :warn (warp-pool-name pool) "Restarting worker %d (%d/%d)."
-                     (warp-pool-worker-id worker)
-                     (warp-pool-worker-restart-attempts worker)
-                     warp-pool-max-worker-restarts)
-          (warp--pool-start-worker worker pool))))
-    ;; After handling worker death, try to dispatch the next task.
-    (warp--pool-dispatch-next-task pool)))
+          (warp:log! :warn (warp-pool-name pool) "Task %s is a poison pill."
+                     (warp-task-id task))
+          (loom:promise-reject (warp-task-promise task)
+                               (warp:error! :type 'warp-pool-poison-pill
+                                            :message (format "Task %s failed on %s."
+                                                             (warp-task-id task)
+                                                             "multiple resources")
+                                            :details `(:task-id
+                                                       ,(warp-task-id task))))
+          ;; Update metrics to reflect a failed task.
+          (loom:resolved! (warp--update-task-metrics pool task :failed)))
+      ;; Otherwise, re-enqueue the task for another resource to try.
+      (progn
+        (warp:log! :info (warp-pool-name pool) "Re-enqueuing task %s (retry %d)."
+                   (warp-task-id task) (warp-task-retries task))
+        (loom:await (warp--pool-queue-enqueue pool task))))))
 
-(defun warp--pool-start-worker (worker pool)
-  "Start a new `WORKER` using the pool's configured factory function.
-This function invokes `worker-factory-fn` to create the underlying process
-and sets up its sentinel to call `worker-ipc-sentinel-fn` on death.
-
-Arguments:
-- `worker` (warp-pool-worker): The worker struct to start.
-- `pool` (warp-pool): The pool to which the worker belongs.
-
-Returns:
-- `nil`.
-
-Side Effects:
-- Calls the `worker-factory-fn`.
-- Sets the `process-sentinel` for the worker's process.
-- Updates worker status to `:starting` then `:idle`.
-- Sets `last-active-time` for the worker."
-  (setf (warp-pool-worker-status worker) :starting)
-  ;; Call the user-defined factory function to create the worker's resource.
-  (funcall (warp-pool-worker-factory-fn pool) worker pool)
-  ;; If the worker has an associated Emacs process, set its sentinel.
-  (when-let (proc (warp-pool-worker-process worker))
-    (process-put proc 'warp-pool-worker worker) ; Store worker obj on process
-    (set-process-sentinel
-     proc (lambda (p e)
-            ;; The sentinel function will call the pool's IPC sentinel handler.
-            (when-let (w (process-get p 'warp-pool-worker))
-              (funcall (warp-pool-worker-ipc-sentinel-fn pool) w e pool)))))
-  ;; Mark worker as idle and record its last active time.
-  (setf (warp-pool-worker-status worker) :idle)
-  (setf (warp-pool-worker-last-active-time worker) (float-time)))
-
-(defun warp--pool-add-worker (pool)
-  "Create, start, and add a new worker to the `POOL`.
-Generates a unique ID for the new worker, adds it to the pool's worker
-list, updates peak worker count metrics, and then starts the worker.
+(defun warp-pool-handle-resource-death (resource event pool)
+  "Handle the death of a `RESOURCE`, managing restarts and re-queuing its task.
+This function is typically set as a process sentinel for resources (e.g.,
+Emacs sub-processes). It increments resource restart attempts, records
+circuit breaker failures, and attempts to restart the resource or mark
+it as permanently failed. If the resource had an active task, that task
+is either re-queued or rejected as a poison pill.
 
 Arguments:
-- `pool` (warp-pool): The pool to which to add a worker.
+- `resource` (warp-pool-resource): The resource that died.
+- `event` (string): The event message from the resource's sentinel
+    (e.g., "Exited normally with status 0").
+- `pool` (warp-pool): The pool to which the resource belongs.
 
-Returns:
-- (warp-pool-worker): The newly created and started worker.
+Returns: (loom-promise): A promise that resolves when the death is
+    handled (resource state updated, task handled).
 
 Side Effects:
-- Increments `next-worker-id`.
-- Adds a new `warp-pool-worker` to `warp-pool-workers`.
-- Updates `warp-pool-metrics-peak-worker-count`.
-- Calls `warp--pool-start-worker`."
-  (let* ((id (cl-incf (warp-pool-next-worker-id pool)))
-         (worker (%%make-worker :id id)))
-    (push worker (warp-pool-workers pool))
-    ;; Update the peak worker count metric.
-    (setf (warp-pool-metrics-peak-worker-count (warp-pool-metrics pool))
-          (max (warp-pool-metrics-peak-worker-count (warp-pool-metrics pool))
-               (length (warp-pool-workers pool))))
-    (warp--pool-start-worker worker pool)
-    (warp:log! :debug (warp-pool-name pool) "Added new worker %d." id)
-    worker))
+- Updates `resource` status (`:dead`, `:restarting`, `:failed`).
+- Increments pool metrics (`resource-restarts`).
+- May trigger `warp:circuit-breaker-record-failure` for the pool's CB.
+- May re-enqueue a task or reject its promise.
+- May call `warp--pool-start-resource` to restart the resource.
+- Calls `warp--pool-dispatch-next-task` to attempt to dispatch
+    another task to an available resource."
+  (warp:log! :warn (warp-pool-name pool) "Resource %s died: %s"
+             (warp-pool-resource-id resource) event)
+  (cl-incf (warp-pool-metrics-resource-restarts (warp-pool-metrics pool)))
 
-(defun warp--pool-remove-worker (worker pool)
-  "Stop and remove a `WORKER` from the `POOL`.
-This function removes the worker from the pool's internal list and
-terminates its underlying process if it's still live.
+  (let ((resource-had-task-p nil))
+    (loom:with-mutex! (warp-pool-lock pool)
+      ;; Record failure on pool's circuit breaker if configured.
+      (when-let ((cb-id (warp-pool-circuit-breaker-id pool)))
+        (loom:await (warp:circuit-breaker-record-failure
+                     (warp:circuit-breaker-get cb-id))))
+
+      ;; Handle the task associated with the dead resource.
+      (when-let ((task (warp-pool-resource-current-task resource)))
+        (setq resource-had-task-p t)
+        (loom:await (warp--pool-requeue-or-reject task pool)))
+
+      (setf (warp-pool-resource-status resource) :dead) ; Temporarily dead
+
+      (unless (warp-pool-shutdown-p pool)
+        (cl-incf (warp-pool-resource-restart-attempts resource))
+        (if (> (warp-pool-resource-restart-attempts resource)
+               (warp-pool-internal-config-max-resource-restarts
+                (warp-pool-internal-config pool)))
+            (progn
+              ;; If max restarts reached, resource is permanently failed.
+              (setf (warp-pool-resource-status resource) :failed)
+              (warp:log! :error (warp-pool-name pool)
+                         "Resource %s failed permanently after %d restarts."
+                         (warp-pool-resource-id resource)
+                         (warp-pool-resource-restart-attempts resource)))
+          (progn
+            ;; Otherwise, attempt to restart the resource.
+            (setf (warp-pool-resource-status resource) :restarting)
+            (warp:log! :warn (warp-pool-name pool)
+                       "Restarting resource %s (%d/%d)."
+                       (warp-pool-resource-id resource)
+                       (warp-pool-resource-restart-attempts resource)
+                       (warp-pool-internal-config-max-resource-restarts
+                        (warp-pool-internal-config pool)))))))
+
+  ;; Perform async restart and dispatch *outside* the main pool lock
+  ;; to avoid blocking other operations.
+  (braid! (if (eq (warp-pool-resource-status resource) :restarting)
+              (warp--pool-start-resource resource pool)
+            (loom:resolved! t)) ; If failed permanently or shutdown, just resolve.
+    (:then (lambda (_)
+             ;; After resource handling, try to dispatch the next task.
+             (loom:await (warp--pool-dispatch-next-task pool))
+             t))
+    (:catch (lambda (err)
+              (warp:log! :error (warp-pool-name pool)
+                         "Error during resource death handling for %s: %S"
+                         (warp-pool-resource-id resource) err)
+              (loom:rejected! err))))))
+
+(defun warp--pool-start-resource (resource pool)
+  "Start a `RESOURCE` using the pool's configured factory function.
+This function invokes `resource-factory-fn` to create the underlying
+resource handle and updates the `resource` struct. After creation,
+it also runs the optional `resource-validator-fn` to ensure the new
+resource is healthy before marking it as idle.
 
 Arguments:
-- `worker` (warp-pool-worker): The worker to remove.
-- `pool` (warp-pool): The pool from which to remove the worker.
+- `resource` (warp-pool-resource): The resource struct to start.
+- `pool` (warp-pool): The pool to which the resource belongs.
 
-Returns:
-- `nil`.
+Returns: (loom-promise): A promise that resolves to `t` when the resource
+  is successfully started and validated, or rejects if creation or
+  validation fails.
 
 Side Effects:
-- Removes `worker` from `warp-pool-workers`.
-- Updates worker status to `:stopping` then `:stopped`.
-- Deletes the associated Emacs process if it's live."
-  (setf (warp-pool-workers pool) (delete worker (warp-pool-workers pool)))
-  (setf (warp-pool-worker-status worker) :stopping)
-  ;; If there's an underlying process, kill it.
-  (when-let ((proc (warp-pool-worker-process worker)))
-    (when (process-live-p proc) (delete-process proc)))
-  (setf (warp-pool-worker-status worker) :stopped))
+- Calls the `resource-factory-fn`.
+- Updates `resource` status to `:starting` then `:idle`.
+- Sets `last-active-time` for the resource.
+- Sets the `resource-handle` slot on `resource`."
+  (setf (warp-pool-resource-status resource) :starting)
+  (warp:log! :debug (warp-pool-name pool) "Starting resource %s."
+             (warp-pool-resource-id resource))
+  (braid! (funcall (warp-pool-resource-factory-fn pool) resource pool)
+    (:then (lambda (resource-handle)
+             (setf (warp-pool-resource-handle resource) resource-handle)
+             ;; After creating the handle, validate it.
+             (loom:await (funcall (warp-pool-resource-validator-fn pool)
+                                  resource pool))))
+    (:then (lambda (is-valid-p)
+             (if is-valid-p
+                 (progn
+                   ;; Mark resource as idle and record its last active time.
+                   (setf (warp-pool-resource-status resource) :idle)
+                   (setf (warp-pool-resource-last-active-time resource)
+                         (float-time))
+                   (warp:log! :debug (warp-pool-name pool)
+                              "Resource %s started and idle."
+                              (warp-pool-resource-id resource))
+                   t)
+               (progn
+                 (warp:log! :warn (warp-pool-name pool)
+                            "Resource %s failed validation after start."
+                            (warp-pool-resource-id resource))
+                 ;; If validation fails, destroy the resource and reject.
+                 (loom:await (warp--pool-remove-resource-internal resource pool))
+                 (loom:rejected!
+                  (warp:error!
+                   :type 'warp-pool-resource-unavailable
+                   :message (format "Resource %s failed initial validation."
+                                    (warp-pool-resource-id resource))))))))
+    (:catch (lambda (err)
+              (setf (warp-pool-resource-status resource) :failed)
+              (warp:log! :error (warp-pool-name pool)
+                         "Failed to start resource %s: %S"
+                         (warp-pool-resource-id resource) err)
+              (loom:rejected! err)))))
+
+(defun warp--pool-add-resource-internal (pool id)
+  "Create, start, and add a new resource to the `POOL`'s internal list.
+This is an internal helper function. This function does not perform
+capacity checks against `min-size`/`max-size`; these checks are the
+responsibility of the `warp-allocator` or other external callers.
+
+Arguments:
+- `pool` (warp-pool): The pool to which to add a resource.
+- `id` (string): The custom ID for the new resource.
+
+Returns: (loom-promise): A promise that resolves to the newly added
+  `warp-pool-resource` object on success, or rejects on failure.
+
+Side Effects:
+- Adds a new `warp-pool-resource` to `warp-pool-resources` list (protected
+  by pool lock).
+- Updates `warp-pool-metrics-peak-resource-count`.
+- Calls `warp--pool-start-resource` asynchronously."
+  (let* ((resource (make-warp-pool-resource :id id)))
+    (loom:with-mutex! (warp-pool-lock pool)
+      (push resource (warp-pool-resources pool))
+      ;; Update the peak resource count metric inside the lock.
+      (setf (warp-pool-metrics-peak-resource-count (warp-pool-metrics pool))
+            (max (warp-pool-metrics-peak-resource-count (warp-pool-metrics pool))
+                 (length (warp-pool-resources pool)))))
+    (warp:log! :debug (warp-pool-name pool) "Adding new resource %s." id)
+    ;; Asynchronously start the resource.
+    (braid! (warp--pool-start-resource resource pool)
+      (:then (lambda (_) resource)) ; Resolve with the resource itself on success
+      (:catch (lambda (err)
+                ;; If starting fails, remove the resource from the list.
+                (loom:with-mutex! (warp-pool-lock pool)
+                  (setf (warp-pool-resources pool)
+                        (delete resource (warp-pool-resources pool))))
+                (warp:log! :error (warp-pool-name pool)
+                           "Failed to add resource %s: %S. Removing." id err)
+                (loom:rejected! err))))))
+
+(defun warp--pool-remove-resource-internal (resource pool)
+  "Stop and remove a `RESOURCE` from the `POOL`'s internal list.
+This is an internal helper function. It simply removes the resource from
+the pool's internal list and attempts to destroy its underlying handle.
+This function does not perform any capacity checks; those are handled by
+the `warp-allocator` or other external callers.
+
+Arguments:
+- `resource` (warp-pool-resource): The resource to remove.
+- `pool` (warp-pool): The pool from which to remove the resource.
+
+Returns: (loom-promise): A promise that resolves to `t` when the resource
+  is removed.
+
+Side Effects:
+- Removes `resource` from `warp-pool-resources` (protected by lock).
+- Updates resource status to `:stopping` then `:stopped`.
+- Calls the `resource-destructor-fn` asynchronously."
+  (setf (warp-pool-resource-status resource) :stopping)
+  (warp:log! :debug (warp-pool-name pool) "Removing resource %s."
+             (warp-pool-resource-id resource))
+  (braid! (funcall (warp-pool-resource-destructor-fn pool) resource pool)
+    (:then (lambda (_)
+             ;; After destruction, remove from the shared resource list.
+             (loom:with-mutex! (warp-pool-lock pool)
+               (setf (warp-pool-resources pool)
+                     (delete resource (warp-pool-resources pool))))
+             (setf (warp-pool-resource-status resource) :stopped)
+             (warp:log! :debug (warp-pool-name pool) "Resource %s removed."
+                        (warp-pool-resource-id resource))
+             t))
+    (:catch (lambda (err)
+              (warp:log! :error (warp-pool-name pool)
+                         "Error destroying resource %s: %S"
+                         (warp-pool-resource-id resource) err)
+              ;; Even if destruction fails, try to remove from the list.
+              (loom:with-mutex! (warp-pool-lock pool)
+                (setf (warp-pool-resources pool)
+                      (delete resource (warp-pool-resources pool))))
+              (loom:rejected! err)))))
 
 ;;----------------------------------------------------------------------
 ;;; Task Dispatching and Cancellation
 ;;----------------------------------------------------------------------
 
-(defun warp--pool-dispatch-to-worker (task worker pool)
-  "Assign a `TASK` to an idle `WORKER` by calling the pool's configured executor.
-This function sets the worker's status to busy, assigns the task to it,
+(defun warp--pool-dispatch-to-resource (task resource pool)
+  "Assign a `TASK` to an idle `RESOURCE` by calling the pool's configured executor.
+This function sets the resource's status to busy, assigns the task to it,
 and then executes the `task-executor-fn`. It also handles result
-resolution or error rejection of the task's promise.
+resolution or error rejection of the task's promise. This function wraps
+the task execution with the pool's `circuit-breaker` if configured,
+providing resilience for task execution.
 
 Arguments:
 - `task` (warp-task): The task to dispatch.
-- `worker` (warp-pool-worker): The worker to which the task is assigned.
+- `resource` (warp-pool-resource): The resource to which the task is
+  assigned.
 - `pool` (warp-pool): The pool instance.
 
-Returns:
-- (loom-promise): The promise associated with the `task`, which will be
-  resolved or rejected by the executor's outcome.
+Returns: (loom-promise): The promise associated with the `task`, which
+  will be resolved or rejected by the executor's outcome.
 
 Side Effects:
-- Updates `worker` status and `current-task`.
-- Updates `task` with `worker` and `start-time`.
-- Calls `warp-pool-task-executor-fn`.
+- Updates `resource` status to `:busy` and sets its `current-task`.
+- Updates `task` with `resource` reference and `start-time`.
+- Calls `warp-pool-task-executor-fn` (potentially wrapped by a CB).
 - Updates pool metrics (`tasks-completed`, `tasks-failed`).
-- May delete the worker's process if the executor fails."
-  (setf (warp-pool-worker-status worker) :busy)
-  (setf (warp-pool-worker-current-task worker) task)
-  (setf (warp-task-worker task) worker)
+- May trigger resource destruction/restart if executor fails."
+  (setf (warp-pool-resource-status resource) :busy)
+  (setf (warp-pool-resource-current-task resource) task)
+  (setf (warp-task-resource task) resource)
   (setf (warp-task-start-time task) (float-time))
-  (warp:log! :debug (warp-pool-name pool) "Dispatching task %s to worker %d."
-             (warp-task-id task) (warp-pool-worker-id worker))
+  (warp:log! :debug (warp-pool-name pool) "Dispatching task %s to resource %s."
+             (warp-task-id task) (warp-pool-resource-id resource))
+
   (let ((executor-fn
          (lambda () (funcall (warp-pool-task-executor-fn pool)
-                             task worker pool))))
+                             task resource pool))))
     (braid! (if-let ((cb-id (warp-pool-circuit-breaker-id pool)))
-                ;; If a circuit breaker is configured, execute via it.
+                ;; If a circuit breaker is configured for the pool, execute
+                ;; the task function through it. This protects the pool from
+                ;; repeatedly using a resource that's causing failures.
                 (warp:circuit-breaker-execute cb-id executor-fn)
               ;; Otherwise, execute the task directly.
               (funcall executor-fn))
@@ -738,73 +777,103 @@ Side Effects:
          (warp--update-task-metrics
           pool task :completed
           (- (float-time) (warp-task-start-time task)))
+         ;; Clear resource's current task after completion.
+         (setf (warp-pool-resource-current-task resource) nil)
+         (setf (warp-pool-resource-status resource) :idle) ;; Mark idle
+         (setf (warp-pool-resource-last-active-time resource) (float-time))
          (loom:promise-resolve (warp-task-promise task) result)))
       (:catch
        (lambda (err)
          ;; On task executor failure, update metrics and reject promise.
          (warp--update-task-metrics pool task :failed)
          (warp:log! :error (warp-pool-name pool)
-                    "Task executor failed for worker %d: %S"
-                    (warp-pool-worker-id worker) err)
-         ;; If the worker's process is still live after executor failure,
-         ;; assume it's corrupted and kill it to trigger a restart.
-         (when-let ((proc (warp-pool-worker-process worker)))
-           (when (process-live-p proc) (delete-process proc)))
+                    "Task executor failed for resource %s: %S"
+                    (warp-pool-resource-id resource) err)
+         ;; Clear resource's current task after failure.
+         (setf (warp-pool-resource-current-task resource) nil)
+         ;; If the resource should be considered failed due to executor error,
+         ;; trigger its death handling (e.g., restart, replacement).
+         (loom:await (warp-pool-handle-resource-death
+                      resource (format "Executor failed: %S" err)
+                      pool))
          (loom:rejected! err))))))
 
 (defun warp--pool-dispatch-next-task (pool)
-  "Find an idle worker and dispatch the next task from the queue.
-If no idle worker is available but the pool is not at `max-size` and
-there are tasks in the queue, a new worker is added and a task is
-dispatched to it.
+  "Find an idle and valid resource and dispatch the next task from the queue.
+This function is responsible for pulling tasks from the queue and assigning
+them to available resources. It does *not* manage resource counts (scaling);
+that's now the responsibility of `warp-allocator`.
 
 Arguments:
 - `pool` (warp-pool): The pool from which to dispatch a task.
 
-Returns:
-- `nil`.
+Returns: (loom-promise): A promise that resolves to `t` if a task was
+  successfully dispatched, or resolves to `nil` if no task could be
+  dispatched (e.g., no idle resources, queue empty).
 
 Side Effects:
-- May call `warp--pool-dispatch-to-worker`.
-- May call `warp--pool-add-worker` to scale up the pool."
-  (unless (warp-pool-shutdown-p pool)
-    (let ((worker (cl-find-if (lambda (w) (eq (warp-pool-worker-status w)
-                                              :idle))
-                              (warp-pool-workers pool))))
-      (cond
-       ;; If an idle worker is found and tasks are in the queue, dispatch.
-       ((and worker (not (warp--pool-queue-empty-p
-                           (warp-pool-task-queue pool))))
-        (warp--pool-dispatch-to-worker (warp--pool-queue-dequeue
-                                        (warp-pool-task-queue pool))
-                                       worker pool))
-       ;; If no idle worker, but pool is below max size and queue has tasks, scale up.
-       ((and (< (length (warp-pool-workers pool)) (warp-pool-max-size pool))
-             (not (warp--pool-queue-empty-p
-                   (warp-pool-task-queue pool))))
-        (warp:log! :info (warp-pool-name pool) "Scaling up: adding worker.")
-        (let ((new-worker (warp--pool-add-worker pool)))
-          (warp--pool-dispatch-to-worker (warp--pool-queue-dequeue
-                                          (warp-pool-task-queue pool))
-                                         new-worker pool)))))))
+- May dequeue a task from `warp-pool-task-queue`.
+- May call `warp--pool-dispatch-to-resource`.
+- May trigger resource death handling if validation fails."
+  (loom:with-mutex! (warp-pool-lock pool)
+    (unless (warp-pool-shutdown-p pool)
+      (let ((resource (cl-find-if (lambda (r) (eq (warp-pool-resource-status r)
+                                                   :idle))
+                                  (warp-pool-resources pool))))
+        (when (and resource (> (loom:pqueue-length
+                                (warp-pool-task-queue pool)) ; Use pqueue-length for both
+                               0))
+          ;; Attempt to validate the resource before dispatching a task to it.
+          (braid! (funcall (warp-pool-resource-validator-fn pool)
+                           resource pool)
+            (:then (lambda (is-valid-p)
+                     (if is-valid-p
+                         (braid! (warp--pool-queue-dequeue pool)
+                           (:then (lambda (task)
+                                    (when (and task (not (eq task :eof)))
+                                      (loom:await
+                                       (warp--pool-dispatch-to-resource
+                                        task resource pool))
+                                      t))) ; Return t for successful dispatch
+                           (:catch (lambda (err) ; Error reading from queue
+                                      (warp:log! :error (warp-pool-name pool)
+                                                 "Error dequeuing task: %S" err)
+                                      nil)))) ; Return nil for dispatch failure
+                       (progn
+                         (warp:log! :warn (warp-pool-name pool)
+                                    "Resource %s failed validation, %s."
+                                    (warp-pool-resource-id resource)
+                                    "not dispatching")
+                         ;; If validation fails, trigger resource death handling.
+                         (loom:await (warp-pool-handle-resource-death
+                                      resource "Failed validation" pool))
+                         nil)))) ; Return nil for dispatch failure
+            (:catch (lambda (err)
+                      (warp:log! :error (warp-pool-name pool)
+                                 "Resource %s validator failed: %S"
+                                 (warp-pool-resource-id resource) err)
+                      ;; If validator itself errors, treat as resource death.
+                      (loom:await (warp-pool-handle-resource-death
+                                   resource (format "Validator error: %S" err)
+                                   pool))
+                      nil))))))) ; Return nil for dispatch failure
 
 (defun warp--pool-setup-task-cancellation (task pool)
   "Set up the cancellation logic for a newly submitted `TASK`.
 Adds a callback to the task's `cancel-token`. When cancelled, the callback
 attempts to remove the task from the queue or, if it's already running,
-calls the pool's `task-cancel-fn` to interrupt the worker.
+calls the pool's `task-cancel-fn` to interrupt the resource.
 
 Arguments:
 - `task` (warp-task): The task for which to set up cancellation.
 - `pool` (warp-pool): The pool to which the task was submitted.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Adds a callback to the `loom-cancel-token` of the `task`.
-- May remove `task` from `warp-pool-task-queue`.
-- May call `warp-pool-task-cancel-fn`.
+- May remove `task` from `warp-pool-task-queue` if it's a priority queue.
+- May call `warp-pool-task-cancel-fn` if task is running.
 - Updates pool metrics (`tasks-cancelled`).
 - Rejects the task's promise with `loom-cancel-error`."
   (when-let ((token (warp-task-cancel-token task)))
@@ -812,128 +881,164 @@ Side Effects:
      token
      (lambda (reason)
        (loom:with-mutex! (warp-pool-lock pool)
-         (let ((was-removed (warp--pool-queue-remove
-                             (warp-pool-task-queue pool) task)))
+         (let ((queue (warp-pool-task-queue pool))
+               (was-removed nil))
+           ;; Attempt to remove from queue if it's a priority queue.
+           (if (loom:pqueue-p queue)
+               (setq was-removed (loom:pqueue-remove queue task))
+             ;; For `warp-stream` (FIFO), direct removal isn't supported.
+             ;; The task's promise will be rejected, and it will be dequeued
+             ;; eventually, but its result will be ignored.
+             (setq was-removed nil))
+
            (if was-removed
                (progn
                  (warp:log! :info (warp-pool-name pool)
                             "Cancelled task %s (in queue)." (warp-task-id task))
                  (warp--update-task-metrics pool task :cancelled))
              ;; If task was not in queue, check if it's currently running.
-             (when-let* ((w (warp-task-worker task))
-                         ((eq (warp-pool-worker-current-task w) task)))
+             (when-let* ((r (warp-task-resource task))
+                         ((eq (warp-pool-resource-current-task r) task)))
                (warp:log! :info (warp-pool-name pool)
-                          "Cancelling running task %s on worker %d."
-                          (warp-task-id task) (warp-pool-worker-id w))
+                          "Cancelling running task %s on resource %s."
+                          (warp-task-id task) (warp-pool-resource-id r))
                ;; Call the user-defined task cancellation function.
-               (funcall (warp-pool-task-cancel-fn pool) w task pool)
+               (funcall (warp-pool-task-cancel-fn pool) r task pool)
                (warp--update-task-metrics pool task :cancelled)))
            ;; Reject the task's promise with a cancellation error.
            (loom:promise-reject (warp-task-promise task)
                                 (warp:error! :type 'loom-cancel-error
-                                             :message (format "Task %s cancelled: %S"
+                                             :message (format "Task %s %s"
                                                               (warp-task-id task)
-                                                              reason)))))))))
+                                                              "cancelled.")
+                                             :data reason))))))))
 
 ;;----------------------------------------------------------------------
-;;; Periodic Pool Management
+;;; Periodic Pool Management (Health Checks & Dispatch)
 ;;----------------------------------------------------------------------
 
 (defun warp--pool-health-check (pool now)
   "Perform health checks on the pool, such as killing timed-out tasks.
-Iterates through busy workers and checks if their current task has
+Iterates through busy resources and checks if their current task has
 exceeded its `timeout`. If so, the task is marked as timed out, its
-promise rejected, and the worker's process is killed.
+promise rejected, and the resource is destructed (which may trigger a
+restart or replacement by `warp-allocator`).
 
 Arguments:
 - `pool` (warp-pool): The pool to perform health checks on.
 - `now` (float): The current timestamp (result of `float-time`).
 
-Returns:
-- `nil`.
+Returns: (loom-promise): A promise that resolves when health checks are
+    complete for all resources.
 
 Side Effects:
 - May update pool metrics (`tasks-timed-out`).
 - May reject task promises with `warp-pool-task-timeout`.
-- May delete worker processes."
-  (dolist (worker (warp-pool-workers pool))
-    (when (eq (warp-pool-worker-status worker) :busy)
-      (when-let* ((task (warp-pool-worker-current-task worker))
-                  (timeout (warp-task-timeout task))
-                  (start-time (warp-task-start-time task))
-                  ;; Check if task has exceeded its timeout.
-                  ((> (- now start-time) timeout)))
-        (warp:log! :warn (warp-pool-name pool)
-                   "Task %s on worker %d timed out after %.2fs."
-                   (warp-task-id task) (warp-pool-worker-id worker) timeout)
-        (warp--update-task-metrics pool task :timeout)
-        (loom:promise-reject (warp-task-promise task)
-                             (warp:error! :type 'warp-pool-task-timeout
-                                          :message (format "Task %s timed out"
-                                                           (warp-task-id task))
-                                          :details `(:timeout ,timeout)))
-        ;; Kill the worker's process if it exists and is still live.
-        (when-let ((proc (warp-pool-worker-process worker)))
-          (when (process-live-p proc) (delete-process proc)))))))
-
-(defun warp--pool-scale-down (pool now)
-  "Find and remove excess idle workers to scale the pool down.
-Workers are eligible for removal if they are idle and have been inactive
-longer than `worker-idle-timeout`. The pool scales down to `min-size`.
-
-Arguments:
-- `pool` (warp-pool): The pool to potentially scale down.
-- `now` (float): The current timestamp (result of `float-time`).
-
-Returns:
-- `nil`.
-
-Side Effects:
-- May call `warp--pool-remove-worker` to stop and remove workers."
-  (when-let ((idle-timeout (warp-pool-worker-idle-timeout pool)))
-    (let ((num-to-reap (- (length (warp-pool-workers pool))
-                          (warp-pool-min-size pool))))
-      (when (> num-to-reap 0)
-        (let ((reapable-workers '()))
-          ;; Identify idle workers that can be reaped.
-          (dolist (worker (warp-pool-workers pool))
-            (when (and (eq (warp-pool-worker-status worker) :idle)
-                       (warp-pool-worker-last-active-time worker)
-                       (> (- now (warp-pool-worker-last-active-time worker))
-                          idle-timeout))
-              (push worker reapable-workers)))
-          ;; Remove reapable workers, prioritizing idle ones.
-          (cl-loop for worker in (nreverse reapable-workers)
-                   while (> num-to-reap 0)
-                   do (warp--pool-remove-worker worker pool)
-                      (cl-decf num-to-reap)
-                   finally do
-                   ;; If there are still workers to remove but they are busy.
-                   (when (> num-to-reap 0)
-                     (warp:log! :warn (warp-pool-name pool)
-                                "Could not scale down fully; %d workers busy."
-                                num-to-reap)))))))
+- May trigger resource destruction via `warp-pool-handle-resource-death`."
+  (loom:all
+   (cl-loop for resource in (copy-sequence (warp-pool-resources pool))
+            when (eq (warp-pool-resource-status resource) :busy)
+            collect (braid! (loom:resolved! nil)
+                      (:then (lambda (_)
+                               (when-let* ((task (warp-pool-resource-current-task resource))
+                                           (timeout (warp-task-timeout task))
+                                           (start-time (warp-task-start-time task))
+                                           ((> (- now start-time) timeout)))
+                                 (warp:log! :warn (warp-pool-name pool)
+                                            "Task %s on resource %s timed out %s."
+                                            (warp-task-id task)
+                                            (warp-pool-resource-id resource)
+                                            (format "after %.2fs" timeout))
+                                 (warp--update-task-metrics pool task :timed-out)
+                                 ;; Reject the task's promise.
+                                 (loom:promise-reject (warp-task-promise task)
+                                                      (warp:error!
+                                                       :type 'warp-pool-task-timeout
+                                                       :message (format "Task %s timed out."
+                                                                        (warp-task-id task))
+                                                       :details `(:timeout ,timeout)))
+                                 ;; Resource hosting the timed-out task should be
+                                 ;; considered unhealthy and possibly recycled.
+                                 (loom:await (warp-pool-handle-resource-death
+                                              resource (format "Task %s timed out"
+                                                              (warp-task-id task))
+                                              pool)))))))))
 
 (defun warp--pool-manage (pool)
   "The main periodic management task for a `POOL`.
 This function is called by a timer at regular intervals to perform
-maintenance tasks like health checks and scaling down idle workers.
-It acquires the pool's lock to ensure thread safety.
+maintenance tasks like health checks for running tasks and
+dispatching any pending tasks. It acquires the pool's lock to
+ensure thread safety for internal state changes. This function does
+NOT handle scaling (adding/removing resources); that responsibility
+is delegated to `warp-allocator`.
 
 Arguments:
 - `pool` (warp-pool): The pool instance to manage.
 
-Returns:
-- `nil`.
+Returns: (loom-promise): A promise that resolves when management cycle
+    is complete.
 
 Side Effects:
-- Calls `warp--pool-health-check`.
-- Calls `warp--pool-scale-down`."
+- Calls `warp--pool-health-check` and `warp--pool-dispatch-next-task`."
   (loom:with-mutex! (warp-pool-lock pool)
     (unless (warp-pool-shutdown-p pool)
       (let ((now (float-time)))
-        (warp--pool-health-check pool now)
-        (warp--pool-scale-down pool now)))))
+        ;; Perform health checks on currently running tasks.
+        (loom:await (warp--pool-health-check pool now))
+        ;; Attempt to dispatch the next available task.
+        (loom:await (warp--pool-dispatch-next-task pool)))))
+  (loom:resolved! t))
+
+;;----------------------------------------------------------------------
+;;; Batch Processing
+;;----------------------------------------------------------------------
+
+(defun warp--maybe-process-batch (pool explicit-flush-p)
+  "Conditionally process the pending batch of tasks.
+This function checks if batching conditions are met (max size or max wait
+time) or if an explicit flush is requested. If so, it processes the batch
+by calling the `batch-processor-fn`.
+
+Arguments:
+- `pool` (warp-pool): The pool instance.
+- `explicit-flush-p` (boolean): If `t`, forces batch processing
+  regardless of size/time limits.
+
+Returns: (loom-promise): A promise that resolves after batch processing.
+
+Side Effects:
+- May cancel `batch-timer`.
+- May clear `pending-batch`.
+- May call `batch-processor-fn`."
+  (loom:with-mutex! (warp-pool-lock pool)
+    (let* ((batch-cfg (warp-pool-batch-config pool))
+           (pending-batch (warp-pool-pending-batch pool))
+           (batch-size (length pending-batch))
+           (process-batch-p (or explicit-flush-p
+                                (and batch-cfg
+                                     (>= batch-size
+                                         (warp-pool-batch-config-max-batch-size
+                                          batch-cfg))))))
+      (when process-batch-p
+        ;; Cancel the batch timer if it's running, as we're processing now.
+        (when (warp-pool-batch-timer pool)
+          (cancel-timer (warp-pool-batch-timer pool))
+          (setf (warp-pool-batch-timer pool) nil))
+        (when (> batch-size 0)
+          (warp:log! :debug (warp-pool-name pool)
+                     "Processing batch of %d tasks." batch-size)
+          ;; Clear the pending batch before processing to avoid race conditions.
+          (setf (warp-pool-pending-batch pool) '())
+          ;; Execute the batch processor function.
+          ;; This function is assumed to return a promise and handle task
+          ;; execution and metrics internally for the batch.
+          (braid! (funcall (warp-pool-batch-config-batch-processor-fn batch-cfg)
+                           (nreverse pending-batch) pool)
+            (:catch (lambda (err)
+                      (warp:log! :error (warp-pool-name pool)
+                                 "Batch processor failed: %S" err))))))))
+  (loom:resolved! t))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
@@ -942,118 +1047,241 @@ Side Effects:
 (cl-defun warp:pool (&rest args
                      &key name
                           task-queue-type
-                          worker-factory-fn
-                          worker-ipc-sentinel-fn
+                          resource-factory-fn
+                          resource-validator-fn
+                          resource-destructor-fn
                           task-executor-fn
-                          task-cancel-fn &allow-other-keys)
-  "Create and initialize a new generic worker pool.
+                          task-cancel-fn
+                          max-queue-size
+                          overflow-policy
+                          internal-config-options
+                          metrics-config-options
+                          circuit-breaker-config-options
+                          batch-config-options
+                          &allow-other-keys)
+  "Create and initialize a new generic resource pool.
 This is the low-level constructor for creating a pool instance. It
-requires the key hook functions that define the pool's behavior. For
-creating reusable pool types, the `warp:defpool` macro is preferred.
+requires the key hook functions that define the pool's behavior for
+managing individual resources and executing tasks. **Note**: This function
+no longer handles auto-scaling; `warp-allocator` is responsible for
+dynamic resizing.
 
 Arguments:
 - `ARGS` (plist): Configuration options for the pool, conforming to
   `warp-pool` struct slots.
 - `:name` (string): A descriptive name for the pool.
-- `:task-queue-type` (keyword): `:priority` for priority queue, or
-  `nil` (default) for standard FIFO queue.
-- `:worker-factory-fn` (function): `(lambda (worker pool))` to create
-  and start a worker resource (e.g., a process).
-- `:worker-ipc-sentinel-fn` (function): Sentinel `(lambda (worker
-  event pool))` to handle worker death.
-- `:task-executor-fn` (function): `(lambda (task worker pool))` to
-  execute a task on a worker.
-- `:task-cancel-fn` (function, optional): `(lambda (worker task pool))`
-  to cancel a running task. Defaults to killing the worker process.
+- `:task-queue-type` (keyword, optional): `:priority` for a priority
+  queue, or `nil` (default) for a standard FIFO queue (using
+  `warp-stream`).
+- `:resource-factory-fn` (function): `(lambda (resource pool))` to create
+  a resource handle (e.g., a process object, a connection object). Must
+  return a `loom-promise` resolving to the resource handle. Must be
+  non-nil.
+- `:resource-validator-fn` (function, optional): `(lambda (resource pool))`
+  to validate a resource's health before use. Returns a `loom-promise`
+  resolving to `t` for valid, or rejecting for invalid. Defaults to a
+  function that always resolves to `t` (valid).
+- `:resource-destructor-fn` (function): `(lambda (resource pool))` to
+  cleanly destroy a resource handle. Must return a `loom-promise`. Must be
+  non-nil.
+- `:task-executor-fn` (function): `(lambda (task resource pool))` to run
+  a task on a resource. Must return a `loom-promise`. Must be non-nil.
+- `:task-cancel-fn` (function, optional): `(lambda (resource task pool))`
+  to cancel a running task. This function is called if a task's
+  `cancel-token` is signaled while the task is active on a resource.
+  Defaults to a no-op that resolves immediately.
+- `:max-queue-size` (integer, optional): Maximum number of tasks allowed
+  in the queue. `nil` means unbounded.
+- `:overflow-policy` (symbol, optional): Policy for `warp-stream` when
+  `max-queue-size` is reached (`:block`, `:drop`, `:error`). Defaults to
+  `:block`. Only applicable for `warp-stream` queues.
+- `:internal-config-options` (plist, optional): Options for
+  `warp-pool-internal-config`.
+- `:metrics-config-options` (plist, optional): Options for
+  `warp-pool-metrics` (though most fields are runtime computed).
+- `:circuit-breaker-config-options` (plist, optional): Options for
+  `warp:circuit-breaker-get`, used to create a circuit breaker for the
+  pool itself.
+- `:batch-config-options` (plist, optional): Options for
+  `warp-pool-batch-config`.
 
-Returns:
-- (warp-pool): A new, started pool instance.
+Returns: (warp-pool): A new, initialized pool instance.
 
 Side Effects:
-- Starts `min-size` workers immediately.
 - Starts a periodic management timer that runs `warp--pool-manage`.
-- Initializes `warp-pool-lock`."
-  (let ((pool (apply #'%%make-pool
-                     :worker-factory-fn worker-factory-fn
-                     :worker-ipc-sentinel-fn worker-ipc-sentinel-fn
-                     :task-executor-fn task-executor-fn
-                     ;; Provide a default task-cancel-fn if none is given.
-                     :task-cancel-fn (or task-cancel-fn
-                                         (lambda (w _p) (delete-process
-                                                         (warp-pool-worker-process w))))
-                     args)))
-    ;; Initialize the task queue based on the requested type.
-    (setf (warp-pool-task-queue pool)
-          (if (eq task-queue-type :priority)
-              (loom:pqueue :comparator #'warp--task-priority-compare)
-            (loom:queue)))
-    ;; Start the initial set of workers defined by `min-size`.
-    (dotimes (_ (warp-pool-min-size pool))
-      (warp--pool-add-worker pool))
-    ;; Schedule the periodic pool management function.
-    (setf (warp-pool-management-timer pool)
-          (run-at-time warp-pool-management-interval
-                       warp-pool-management-interval
-                       #'warp--pool-manage pool))
+- Initializes `warp-pool-lock`.
+- May initialize and retrieve a `warp-circuit-breaker` instance.
+- May initialize `warp-pool-batch-config`."
+  (let* ((resolved-internal-config (apply #'make-warp-pool-internal-config
+                                          internal-config-options))
+         (metrics-obj (make-warp-pool-metrics
+                       :created-at (float-time)
+                       :queue-wait-times (make-ring
+                                          (warp-pool-internal-config-metrics-ring-size
+                                           resolved-internal-config))
+                       :execution-times (make-ring
+                                         (warp-pool-internal-config-metrics-ring-size
+                                          resolved-internal-config))))
+         (pool (apply #'%%make-pool
+                      :resource-factory-fn resource-factory-fn
+                      :resource-validator-fn (or resource-validator-fn
+                                                 (lambda (_r _p) (loom:resolved! t)))
+                      :resource-destructor-fn resource-destructor-fn
+                      :task-executor-fn task-executor-fn
+                      :task-cancel-fn (or task-cancel-fn
+                                          (lambda (_r _t _p) (loom:resolved! nil)))
+                      :max-queue-size max-queue-size
+                      :name name
+                      :internal-config resolved-internal-config
+                      :metrics metrics-obj
+                      args))
+         (batch-cfg (when batch-config-options
+                      (apply #'make-warp-pool-batch-config
+                             batch-config-options)))
+         (cb-id (when circuit-breaker-config-options
+                  (format "pool-cb-%s" name))))
+
+    (loom:with-mutex! (warp-pool-lock pool)
+      (setf (warp-pool-circuit-breaker-id pool) cb-id)
+      (setf (warp-pool-batch-config pool) batch-cfg)
+
+      ;; Initialize the task queue based on the requested type.
+      (setf (warp-pool-task-queue pool)
+            (if (eq task-queue-type :priority)
+                (loom:pqueue :comparator #'warp--task-priority-compare)
+              ;; Default to warp-stream for FIFO queue with backpressure.
+              (warp:stream :name (format "%s-task-queue" name)
+                           :max-buffer-size (or max-queue-size 0)
+                           :overflow-policy (or overflow-policy :block))))
+
+      ;; Schedule the periodic pool management function.
+      ;; This timer will trigger resource health checks and task dispatch attempts.
+      (setf (warp-pool-management-timer pool)
+            (run-at-time (warp-pool-internal-config-management-interval
+                          resolved-internal-config)
+                         (warp-pool-internal-config-management-interval
+                          resolved-internal-config)
+                         #'warp--pool-manage pool)))
+
+    ;; Initialize circuit breaker outside the pool's main lock, as
+    ;; `warp:circuit-breaker-get` might involve IPC.
+    (when circuit-breaker-config-options
+      (apply #'warp:circuit-breaker-get cb-id circuit-breaker-config-options))
     pool))
 
 ;;;###autoload
+(defun warp:pool-add-resources (pool ids-to-add)
+  "Adds new resources to the pool with specified IDs. This function is
+typically called by `warp-allocator` when it decides to scale up the pool.
+Each new resource is created via the pool's `resource-factory-fn` and
+then validated.
+
+Arguments:
+- `pool` (warp-pool): The pool instance to which resources will be added.
+- `ids-to-add` (list of strings): A list of unique string IDs for the
+  resources to add.
+
+Returns: (loom-promise): A promise that resolves to a list of the newly
+  added `warp-pool-resource` objects on successful creation and
+  validation of all resources. Rejects if any resource fails to start.
+
+Side Effects:
+- Creates and starts new resources (via `resource-factory-fn`).
+- Updates internal resource lists and metrics (`warp-pool-resources`,
+  `warp-pool-metrics-peak-resource-count`).
+- Logs resource addition."
+  (warp--validate-pool pool "warp:pool-add-resources")
+  (loom:with-mutex! (warp-pool-lock pool)
+    ;; Map each ID to an internal resource addition process, and await all.
+    (loom:all (cl-loop for id in ids-to-add
+                       collect (warp--pool-add-resource-internal pool id)))))
+
+;;;###autoload
+(defun warp:pool-remove-resources (pool resources-to-remove)
+  "Removes a specific list of `resources-to-remove` from the pool. This
+function is typically called by `warp-allocator` when it decides to
+scale down the pool, or to remove unhealthy resources. Each resource
+is gracefully terminated using the pool's `resource-destructor-fn`.
+
+Arguments:
+- `pool` (warp-pool): The pool instance from which resources will be removed.
+- `resources-to-remove` (list of warp-pool-resource): A list of
+  `warp-pool-resource` objects to remove.
+
+Returns: (loom-promise): A promise that resolves to `t` when all
+  resources are removed. Rejects if any resource fails to terminate cleanly.
+
+Side Effects:
+- Stops and removes the specified resources (via `resource-destructor-fn`).
+- Updates internal resource lists (`warp-pool-resources`).
+- Logs resource removal."
+  (warp--validate-pool pool "warp:pool-remove-resources")
+  (loom:with-mutex! (warp-pool-lock pool)
+    ;; Map each resource to an internal resource removal process, and await all.
+    (loom:all (cl-loop for resource in resources-to-remove
+                       collect (warp--pool-remove-resource-internal pool resource)))))
+
+;;;###autoload
 (defun warp:pool-submit (pool payload &rest opts)
-  "Submit a `PAYLOAD` as a new task to the worker `POOL`.
+  "Submit a `PAYLOAD` as a new task to the resource `POOL`.
 This is the primary function for dispatching work to the pool. It wraps
 the payload in a `warp-task` object, enqueues it, and triggers the
 dispatch mechanism. The operation is fully asynchronous.
 
 Arguments:
 - `POOL` (warp-pool): The pool instance to submit the task to.
-- `PAYLOAD` (any): The data or command for the worker to process.
-- `OPTS` (plist): Task options, such as `:priority`, `:timeout`, and
-  `:cancel-token`.
+- `PAYLOAD` (any): The data or command for the resource to process.
+- `OPTS` (plist): Optional task settings:
+    - `:priority` (integer): The task's priority (higher is more urgent).
+    - `:timeout` (number): Maximum allowed execution time in seconds for
+      this specific task.
+    - `:cancel-token` (loom-cancel-token): A token that can be used to
+      request cancellation of this task.
 
-Returns:
-- (loom-promise): A promise that will be settled with the task's result
-  or rejected with an error.
+Returns: (loom-promise): A promise that will be settled with the task's
+  result or rejected with an error.
 
 Side Effects:
-- Enqueues a task, which may trigger worker scaling or task dispatch.
+- Enqueues a task, which may trigger resource dispatch.
 - Updates pool metrics (`tasks-submitted`, `peak-queue-length`).
-- May set up a batch timer if batching is enabled.
+- May set up a batch timer if batching is enabled for the pool.
 
 Signals:
 - `warp-invalid-pool-error`: If the pool is invalid or shut down.
-- `warp-pool-queue-full`: If the task queue is at its maximum capacity.
-- `warp-pool-shutdown`: If the pool is already shutting down."
-  (warp--validate-pool pool 'warp:pool-submit)
+- `warp-pool-queue-full`: If the task queue is at its maximum capacity
+  and its `overflow-policy` is `:error`.
+- `warp-pool-shutdown`: If the pool is already shutting down (and thus
+  cannot accept new tasks)."
+  (warp--validate-pool pool "warp:pool-submit")
   (let* ((promise (loom:promise))
-         (task (apply #'%%make-task
+         (task (apply #'make-warp-task
                       :id (warp--generate-task-id pool)
                       :promise promise
                       :payload payload
                       :submitted-at (float-time)
                       opts)))
-    (warp--pool-setup-task-cancellation task pool)
     (loom:with-mutex! (warp-pool-lock pool)
+      (warp--pool-setup-task-cancellation task pool)
       (let ((queue (warp-pool-task-queue pool))
-            (max-q-size (warp-pool-max-queue-size pool))
             (batch-cfg (warp-pool-batch-config pool)))
         (cond
          ;; If the pool is shutting down, reject the task immediately.
          ((warp-pool-shutdown-p pool)
           (loom:promise-reject promise (warp:error! :type 'warp-pool-shutdown)))
-         ;; If the queue is full and has a max size, reject.
-         ((and max-q-size (>= (warp--pool-queue-length queue) max-q-size))
-          (loom:promise-reject promise (warp:error! :type 'warp-pool-queue-full)))
          ;; If batching is enabled, add task to pending batch.
          ((and batch-cfg (warp-pool-batch-config-enabled batch-cfg))
           (push task (warp-pool-pending-batch pool))
           ;; Start a batch timer if one isn't already running.
+          ;; This timer will trigger batch processing after `max-wait-time`.
           (unless (warp-pool-batch-timer pool)
             (setf (warp-pool-batch-timer pool)
                   (run-at-time (warp-pool-batch-config-max-wait-time batch-cfg)
                                nil #'warp--maybe-process-batch pool t)))
-          ;; Try to process the batch immediately if conditions are met.
-          (warp--maybe-process-batch pool nil))
-         ;; Otherwise, add task to queue and try to dispatch.
+          ;; Immediately try to process the batch if conditions are met
+          ;; (e.g., max-batch-size reached).
+          (loom:await (warp--maybe-process-batch pool nil)))
+         ;; Otherwise (no batching or batching not enabled), add task to
+         ;; the main queue and immediately try to dispatch it to a resource.
          (t
           (cl-incf (warp-pool-metrics-tasks-submitted
                     (warp-pool-metrics pool)))
@@ -1062,9 +1290,12 @@ Signals:
                  (warp-pool-metrics pool))
                 (max (warp-pool-metrics-peak-queue-length
                       (warp-pool-metrics pool))
-                     (1+ (warp--pool-queue-length queue))))
-          (warp--pool-queue-enqueue queue task)
-          (warp--pool-dispatch-next-task pool)))))
+                     (if (loom:pqueue-p queue)
+                         (loom:pqueue-length queue)
+                       (plist-get (warp:stream-status queue)
+                                  :buffer-length))))
+          (loom:await (warp--pool-queue-enqueue pool task))
+          (loom:await (warp--pool-dispatch-next-task pool))))))
     promise))
 
 ;;;###autoload
@@ -1072,17 +1303,17 @@ Signals:
   "Submit a task with a named priority level.
 This is a convenience wrapper around `warp:pool-submit` that translates a
 priority keyword (e.g., `:critical`) into its corresponding integer
-value, as defined in `warp-pool-priority-levels`.
+value. This simplifies task prioritization for users.
 
 Arguments:
 - `POOL` (warp-pool): The pool instance.
 - `PAYLOAD` (any): The task payload.
 - `PRIORITY-NAME` (keyword): A named priority level from
-  `warp-pool-priority-levels`.
-- `OPTS` (plist): Other task options.
+  `warp-pool-priority-levels` (e.g., `:critical`, `:high`, `:normal`,
+  `:low`, `:lowest`).
+- `OPTS` (plist): Other task options, passed directly to `warp:pool-submit`.
 
-Returns:
-- (loom-promise): A promise for the task's result.
+Returns: (loom-promise): A promise for the task's result.
 
 Side Effects:
 - See `warp:pool-submit`.
@@ -1091,126 +1322,177 @@ Signals:
 - `error`: If `PRIORITY-NAME` is not a valid, defined priority level.
 - `warp-invalid-pool-error`: If the pool is invalid or shut down.
 - `warp-pool-queue-full`: If the task queue is at its maximum capacity."
-  (let ((priority-value (cdr (assq priority-name warp-pool-priority-levels))))
-    (unless priority-value
-      (error "Unknown priority level: %s" priority-name))
-    (apply #'warp:pool-submit pool payload :priority priority-value opts)))
+  ;; Define example priority levels. In a real system, these might be global
+  ;; constants or configurable.
+  (let ((warp-pool-priority-levels
+         '((:critical . 100) (:high . 75) (:normal . 50) (:low . 25)
+           (:lowest . 0))))
+    (let ((priority-value (cdr (assq priority-name warp-pool-priority-levels))))
+      (unless priority-value
+        (error "Unknown priority level: %S" priority-name))
+      (apply #'warp:pool-submit pool payload :priority priority-value opts))))
 
 ;;;###autoload
-(defun warp:pool-shutdown (pool)
-  "Gracefully shut down a generic worker `POOL`.
-This function stops all workers, cancels the management timer, and
-rejects any pending tasks in the queue and any tasks currently in flight.
+(defun warp:pool-shutdown (pool force-p)
+  "Gracefully (or forcefully) shut down a generic resource `POOL`.
+This function stops all managed resources, cancels internal management
+timers, and rejects any pending tasks in the queue and any tasks
+currently in flight. It performs cleanup of pool resources.
 
 Arguments:
 - `POOL` (warp-pool): The pool instance to shut down.
+- `FORCE-P` (boolean): If `t`, forces immediate termination of resources
+  without waiting for in-flight tasks to complete. This is for emergency
+  situations. Defaults to `nil` (graceful shutdown).
 
-Returns:
-- `nil`.
+Returns: (loom-promise): A promise that resolves when the pool is fully
+  shut down.
 
 Side Effects:
-- Stops all worker processes and timers associated with the pool.
+- Stops all resources and internal timers associated with the pool.
 - Rejects promises for all pending and in-flight tasks with a
   `warp-pool-shutdown` error.
-- Sets `warp-pool-shutdown-p` to `t`."
-  (warp--validate-pool pool 'warp:pool-shutdown)
-  ;; Cancel management and batch timers.
-  (when-let ((timer (warp-pool-management-timer pool))) (cancel-timer timer))
-  (when-let ((timer (warp-pool-batch-timer pool))) (cancel-timer timer))
+- Sets `warp-pool-shutdown-p` to `t`.
+- Logs shutdown progress and errors."
+  (warp--validate-pool pool "warp:pool-shutdown")
   (loom:with-mutex! (warp-pool-lock pool)
+    ;; Cancel management and batch timers first to prevent new dispatches.
+    (when-let ((timer (warp-pool-management-timer pool))) (cancel-timer timer))
+    (when-let ((timer (warp-pool-batch-timer pool))) (cancel-timer timer))
     (unless (warp-pool-shutdown-p pool)
       (setf (warp-pool-shutdown-p pool) t)
-      (let ((err (warp:error! :type 'warp-pool-shutdown)))
-        ;; Reject any in-flight tasks and remove workers.
-        (dolist (worker (warp-pool-workers pool))
-          (when-let ((task (warp-pool-worker-current-task worker)))
-            (loom:promise-reject (warp-task-promise task) err))
-          (warp--pool-remove-worker worker pool))
-        ;; Reject any tasks remaining in the queue.
-        (let ((queue (warp-pool-task-queue pool)))
-          (while (not (warp--pool-queue-empty-p queue))
-            (let ((task (warp--pool-queue-dequeue queue)))
-              (when task (loom:promise-reject (warp-task-promise task)
-                                              err))))))
-      (warp:log! :info (warp-pool-name pool) "Shutdown complete.")))
-  nil)
+      (let ((err (warp:error! :type 'warp-pool-shutdown))
+            (queue (warp-pool-task-queue pool))
+            (all-promises '()))
+        ;; Handle tasks and resources:
+        ;; Reject in-flight tasks and then destroy resources.
+        (cl-loop for resource in (copy-sequence (warp-pool-resources pool)) do
+                 (when-let ((task (warp-pool-resource-current-task resource)))
+                   (push (loom:promise-reject (warp-task-promise task) err)
+                         all-promises))
+                 ;; Remove and destroy resource.
+                 (push (warp--pool-remove-resource-internal resource pool)
+                       all-promises))
+
+        ;; Reject any tasks remaining in the pending batch.
+        (when (warp-pool-batch-config pool)
+          (dolist (task (warp-pool-pending-batch pool))
+            (push (loom:promise-reject (warp-task-promise task) err)
+                  all-promises))
+          (setf (warp-pool-pending-batch pool) nil)) ; Clear pending batch
+
+        ;; Reject any tasks remaining in the main task queue.
+        (if (loom:pqueue-p queue)
+            (cl-loop while (not (loom:pqueue-empty-p queue)) do
+                     (let ((task (loom:pqueue-dequeue queue)))
+                       (when task (push (loom:promise-reject (warp-task-promise task)
+                                                             err) all-promises))))
+          ;; For warp-stream, close the stream to prevent new writes/reads,
+          ;; then drain any remaining items and reject their promises.
+          (loom:await (warp:stream-close queue))
+          (cl-loop for chunk in (loom:await (warp:stream-drain queue))
+                   when (warp-task-p chunk) ; Only tasks would have promises
+                   do (push (loom:promise-reject (warp-task-promise chunk)
+                                                 err) all-promises)))
+
+        (braid! (loom:all-settled all-promises) ; Use all-settled to ensure all cleanup runs
+          (:then (lambda (_)
+                   (warp:log! :info (warp-pool-name pool) "Shutdown complete.")
+                   t))
+          (:catch (lambda (error-val)
+                    (warp:log! :error (warp-pool-name pool)
+                               "Shutdown failed with error: %S"
+                               error-val)
+                    (loom:rejected! error-val)))))))
+  (loom:resolved! t))
 
 ;;;###autoload
 (defun warp:pool-status (pool)
   "Return a snapshot of the `POOL`'s current status and metrics.
-Provides high-level information about the pool's configuration, worker
-counts by status, and current queue length.
+Provides high-level information about the pool's configuration, resource
+counts by status, and current queue length. This is a quick way to
+check the operational state of the pool.
 
 Arguments:
 - `POOL` (warp-pool): The pool instance to inspect.
 
-Returns:
-- (plist): A property list containing status information, such as the
-  number of idle/busy workers and the current queue length.
-
-Side Effects:
-- None.
+Returns: (plist): A property list containing status information:
+  - `:name` (string): The pool's name.
+  - `:shutdown-p` (boolean): `t` if the pool is shutting down.
+  - `:resources` (plist): Counts of resources by status (`:total`,
+    `:idle`, `:busy`, `:restarting`, `:failed`, `:dead`, `:starting`,
+    `:stopping`).
+  - `:queue-length` (integer): Current number of tasks in the queue.
 
 Signals:
-- `warp-invalid-pool-error`: If the pool is invalid or shut down."
+- `warp-invalid-pool-error`: If the pool is `nil` or already shut down."
   (warp--validate-pool pool 'warp:pool-status)
   (loom:with-mutex! (warp-pool-lock pool)
-    (let ((statii (mapcar #'warp-pool-worker-status (warp-pool-workers pool))))
+    (let ((statii (mapcar #'warp-pool-resource-status (warp-pool-resources pool))))
       `(:name ,(warp-pool-name pool)
         :shutdown-p ,(warp-pool-shutdown-p pool)
-        :config (:min-size ,(warp-pool-min-size pool)
-                 :max-size ,(warp-pool-max-size pool))
-        :workers (:total ,(length statii) :idle ,(cl-count :idle statii)
-                  :busy ,(cl-count :busy statii)
-                  :restarting ,(cl-count :restarting statii)
-                  :failed ,(cl-count :failed statii)
-                  :dead ,(cl-count :dead statii)
-                  :starting ,(cl-count :starting statii)
-                  :stopping ,(cl-count :stopping statii)
-                  :stopped ,(cl-count :stopped statii))
-        :queue-length ,(warp--pool-queue-length
-                        (warp-pool-task-queue pool))))))
+        :resources (:total ,(length statii)
+                    :idle ,(cl-count :idle statii)
+                    :busy ,(cl-count :busy statii)
+                    :restarting ,(cl-count :restarting statii)
+                    :failed ,(cl-count :failed statii)
+                    :dead ,(cl-count :dead statii)
+                    :starting ,(cl-count :starting statii)
+                    :stopping ,(cl-count :stopping statii))
+        :queue-length ,(if (loom:pqueue-p (warp-pool-task-queue pool))
+                           (loom:pqueue-length (warp-pool-task-queue pool))
+                         (plist-get
+                          (warp:stream-status (warp-pool-task-queue pool))
+                          :buffer-length))))))
 
 ;;;###autoload
 (defun warp:pool-metrics (pool)
   "Get comprehensive metrics for the pool.
 This function provides detailed statistics on task submission, completion,
-failures, execution times, worker restarts, and queue performance.
+failures, execution times, resource restarts, and queue performance.
+It's essential for monitoring the long-term health and efficiency of the
+resource pool.
 
 Arguments:
 - `POOL` (warp-pool): The pool instance to inspect.
 
-Returns:
-- (plist): A nested property list containing detailed metrics about
-  tasks, performance, workers, and queue status.
-
-Side Effects:
-- None.
+Returns: (plist): A nested property list containing detailed metrics about
+  tasks, performance, resources, and queue status. Includes:
+  - `:uptime` (float): Pool's uptime in seconds.
+  - `:tasks` (plist): Breakdown of task outcomes (`:submitted`,
+    `:completed`, `:failed`, `:cancelled`, `:timed-out`).
+  - `:performance` (plist): Average execution time, average queue wait
+    time, total execution time.
+  - `:resources` (plist): Resource restart count, peak resource count.
+  - `:queue` (plist): Peak queue length.
+  - `:health` (plist): Overall success rate.
 
 Signals:
-- `warp-invalid-pool-error`: If the pool is invalid or shut down."
+- `warp-invalid-pool-error`: If the pool is `nil` or already shut down."
   (warp--validate-pool pool 'warp:pool-metrics)
   (loom:with-mutex! (warp-pool-lock pool)
     (let* ((metrics (warp-pool-metrics pool))
-           (exec-times (warp-pool-metrics-execution-times metrics))
-           (queue-times (warp-pool-metrics-queue-wait-times metrics))
+           (exec-times (ring-elements
+                        (warp-pool-metrics-execution-times metrics)))
+           (queue-times (ring-elements
+                         (warp-pool-metrics-queue-wait-times metrics)))
            (uptime (- (float-time) (warp-pool-metrics-created-at metrics))))
       `(:uptime ,uptime
         :tasks (:submitted ,(warp-pool-metrics-tasks-submitted metrics)
-                :completed ,(warp-pool-metrics-tasks-completed metrics)
-                :failed ,(warp-pool-metrics-tasks-failed metrics)
-                :cancelled ,(warp-pool-metrics-tasks-cancelled metrics)
-                :timed-out ,(warp-pool-metrics-tasks-timed-out metrics))
+                    :completed ,(warp-pool-metrics-tasks-completed metrics)
+                    :failed ,(warp-pool-metrics-tasks-failed metrics)
+                    :cancelled ,(warp-pool-metrics-tasks-cancelled metrics)
+                    :timed-out ,(warp-pool-metrics-tasks-timed-out metrics))
         :performance (:avg-execution-time
                       ,(if (not (null exec-times))
-                           (/ (apply #'+ exec-times) (length exec-times)) 0)
+                           (/ (apply #'+ exec-times) (length exec-times)) 0.0)
                       :avg-queue-wait-time
                       ,(if (not (null queue-times))
-                           (/ (apply #'+ queue-times) (length queue-times)) 0)
+                           (/ (apply #'+ queue-times) (length queue-times)) 0.0)
                       :total-execution-time
                       ,(warp-pool-metrics-total-execution-time metrics))
-        :workers (:restarts ,(warp-pool-metrics-worker-restarts metrics)
-                  :peak-count ,(warp-pool-metrics-peak-worker-count metrics))
+        :resources (:restarts ,(warp-pool-metrics-resource-restarts metrics)
+                    :peak-count ,(warp-pool-metrics-peak-resource-count metrics))
         :queue (:peak-length ,(warp-pool-metrics-peak-queue-length metrics))
         :health (:success-rate
                  ,(let ((completed (warp-pool-metrics-tasks-completed
@@ -1220,212 +1502,5 @@ Signals:
                         (/ (* completed 100.0) (+ completed failed))
                       100.0)))))))
 
-;;;###autoload
-(defun warp:pool-resize (pool new-size)
-  "Dynamically resize the worker `POOL` to `NEW-SIZE`.
-This function adjusts the `min-size` and `max-size` of the pool, and then
-immediately triggers worker additions or removals to reach the new desired
-size. If scaling down, it prioritizes removing idle workers. If there are
-still too many workers that are busy, a warning is logged but the resize
-completes.
-
-Arguments:
-- `POOL` (warp-pool): The pool instance to resize.
-- `NEW-SIZE` (integer): The new desired number of workers. Must be a
-  non-negative integer.
-
-Returns:
-- (loom-promise): A promise that resolves to `t` when the resize
-  operation is initiated.
-
-Side Effects:
-- Modifies the pool's `min-size` and `max-size`.
-- May add or remove workers from the pool.
-
-Signals:
-- `warp-invalid-pool-error`: If the pool is invalid or shut down.
-- `warp-pool-error`: If `NEW-SIZE` is negative or not an integer."
-  (warp--validate-pool pool 'warp:pool-resize)
-  (loom:with-mutex! (warp-pool-lock pool)
-    (unless (and (integerp new-size) (>= new-size 0))
-      (signal 'warp-pool-error
-              (list (warp:error! :type 'warp-pool-error
-                                 :message "Invalid new-size for pool resize."
-                                 :details `(:new-size ,new-size)))))
-
-    (let ((current-worker-count (length (warp-pool-workers pool))))
-      (warp:log! :info (warp-pool-name pool) "Resizing pool from %d to %d."
-                 (warp-pool-max-size pool) new-size)
-      (setf (warp-pool-min-size pool) new-size)
-      (setf (warp-pool-max-size pool) new-size)
-      (cond
-       ;; Scale up: Add new workers until `new-size` is reached.
-       ((> new-size current-worker-count)
-        (let ((num-to-add (- new-size current-worker-count)))
-          (dotimes (_ num-to-add) (warp--pool-add-worker pool))))
-       ;; Scale down: Remove workers until `new-size` is reached.
-       ((< new-size current-worker-count)
-        (let ((num-to-remove (- current-worker-count new-size)))
-          ;; Prioritize removing idle workers.
-          (cl-loop for worker in (nreverse (copy-list (warp-pool-workers pool)))
-                   while (> num-to-remove 0)
-                   when (eq (warp-pool-worker-status worker) :idle)
-                   do (warp--pool-remove-worker worker pool)
-                      (cl-decf num-to-remove)
-                   finally do
-                   ;; If there are still workers to remove but they are busy.
-                   (when (> num-to-remove 0)
-                     (warp:log! :warn (warp-pool-name pool)
-                                "Could not scale down fully; %d workers busy."
-                                num-to-remove)))))))
-  (loom:resolved! t))
-
-;;;###autoload
-(defmacro warp:pool-builder (&rest config)
-  "Builder pattern for creating pools with complex configurations.
-This macro provides a structured way to define a `warp-pool` along with
-its optional advanced features like metrics, circuit breakers, and batching.
-
-Arguments:
-- `CONFIG` (plist): A property list where keys are `:pool`, `:metrics`,
-  `:circuit-breaker`, and `:batching`, each associated with a plist of
-  their respective configuration options.
-
-Returns:
-- (warp-pool): A new, configured `warp-pool` instance.
-
-Side Effects:
-- Creates a new `warp-pool`.
-- May initialize `warp-pool-metrics`.
-- May configure and retrieve a `warp-circuit-breaker` instance.
-- May set up `warp-pool-batch-config`."
-  (let ((pool-config '())
-        (metrics-config '())
-        (circuit-breaker-opts '())
-        (batch-config '()))
-    ;; Parse the configuration sections from the input plist.
-    (dolist (section config)
-      (pcase (car section)
-        (:pool (setq pool-config (cdr section)))
-        (:metrics (setq metrics-config (cdr section)))
-        (:circuit-breaker (setq circuit-breaker-opts (cdr section)))
-        (:batching (setq batch-config (cdr section)))))
-    `(let* ((name (plist-get (list ,@pool-config) :name))
-            (pool (apply #'warp:pool ,@pool-config)))
-       ;; Configure metrics if specified.
-       ,(when metrics-config
-          `(setf (warp-pool-metrics pool)
-                 (%%make-metrics :created-at (float-time))))
-       ;; Configure circuit breaker if specified.
-       ,(when circuit-breaker-opts
-          `(progn
-             (setf (warp-pool-circuit-breaker-id pool)
-                   (format "pool-cb-%s" name))
-             (apply #'warp:circuit-breaker-get
-                    (warp-pool-circuit-breaker-id pool)
-                    ,@circuit-breaker-opts)))
-       ;; Configure batching if specified.
-       ,(when batch-config
-          `(setf (warp-pool-batch-config pool)
-                 (apply #'%%make-pool-batch-config ,@batch-config)))
-       pool)))
-
-;;;###autoload
-(cl-defmacro warp:defpool (pool-type
-                           &key worker-factory-fn
-                                worker-ipc-sentinel-fn
-                                task-executor-fn task-cancel-fn)
-  "Define a new, specialized, and reusable type of worker pool.
-This macro generates a new `cl-defstruct` that includes `warp-pool`
-and provides convenient constructor, submit, shutdown, and status
-functions for the new pool type.
-
-Arguments:
-- `POOL-TYPE` (symbol): The name of the new pool type (e.g.,
-  `my-http-pool`).
-- `:worker-factory-fn` (function): The default worker factory function
-  for this pool type.
-- `:worker-ipc-sentinel-fn` (function): The default worker IPC sentinel
-  function.
-- `:task-executor-fn` (function): The default task executor function
-  for this pool type.
-- `:task-cancel-fn` (function, optional): The default task cancellation
-  function.
-
-Returns:
-- (symbol): The `POOL-TYPE` symbol.
-
-Side Effects:
-- Defines a new `cl-defstruct` for `POOL-TYPE`.
-- Defines `make-<pool-type>`, `<pool-type>-p`, `<pool-type>-submit`,
-  `<pool-type>-shutdown`, and `<pool-type>-status` functions."
-  (let* ((pool-name-str (symbol-name pool-type))
-         (constructor-fn (intern (format "make-%s" pool-name-str)))
-         (predicate-fn (intern (format "%s-p" pool-name-str)))
-         (submit-fn (intern (format "%s-submit" pool-name-str)))
-         (shutdown-fn (intern (format "%s-shutdown" pool-name-str)))
-         (status-fn (intern (format "%s-status" pool-name-str))))
-    `(progn
-       (cl-defstruct (,pool-type (:include warp-pool)
-                                 (:constructor ,constructor-fn
-                                  (&rest args &key name &allow-other-keys))
-                                 (:predicate ,predicate-fn))
-         ,(format "A specialized worker pool for the type `%s`."
-                  pool-name-str))
-       (cl-defun ,constructor-fn (&rest args)
-         ,(format "Create and initialize a new `%s` pool.
-
-Arguments:
-- `ARGS` (plist): Configuration options for the pool, passed directly to
-  `warp:pool`.
-
-Returns:
-- (%s): A new, started pool instance of type `%s`." pool-type pool-type pool-type)
-         (apply #'warp:pool
-                :worker-factory-fn ,worker-factory-fn
-                :worker-ipc-sentinel-fn ,worker-ipc-sentinel-fn
-                :task-executor-fn ,task-executor-fn
-                :task-cancel-fn (or ,task-cancel-fn
-                                    (lambda (w _p) (delete-process
-                                                    (warp-pool-worker-process w))))
-                args))
-       (cl-defun ,submit-fn (pool payload &rest opts)
-         ,(format "Submit a task with PAYLOAD to a `%s` pool.
-This is a convenience wrapper around `warp:pool-submit`.
-
-Arguments:
-- `POOL` (%s): The pool instance.
-- `PAYLOAD` (any): The task payload.
-- `OPTS` (plist): Other task options, such as `:priority`, `:timeout`.
-
-Returns:
-- (loom-promise): A promise for the task's result.
-
-Signals:
-- `warp-invalid-pool-error`: If the pool is invalid or shut down.
-- `warp-pool-queue-full`: If the task queue is at its maximum capacity." pool-type pool-type)
-         (apply #'warp:pool-submit pool payload opts))
-       (cl-defun ,shutdown-fn (pool)
-         ,(format "Gracefully shut down a `%s` pool.
-This is a convenience wrapper around `warp:pool-shutdown`.
-
-Arguments:
-- `POOL` (%s): The pool instance to shut down.
-
-Returns:
-- `nil`." pool-type)
-         (warp:pool-shutdown pool))
-       (cl-defun ,status-fn (pool)
-         ,(format "Get the current status of a `%s` pool.
-This is a convenience wrapper around `warp:pool-status`.
-
-Arguments:
-- `POOL` (%s): The pool instance to inspect.
-
-Returns:
-- (plist): A property list containing status information." pool-type)
-         (warp:pool-status pool))
-       ',pool-type)))
-
 (provide 'warp-pool)
-;;; warp-pool.el ends h
+;;; warp-pool.el ends here
