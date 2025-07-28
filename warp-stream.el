@@ -5,7 +5,8 @@
 ;; This file provides an asynchronous data stream primitive, `warp-stream`.
 ;; It acts as a non-blocking, promise-based, thread-safe queue designed to
 ;; facilitate communication between different asynchronous operations
-;; (producers and consumers).
+;; (producers and consumers). It is a fundamental building block for
+;; managing data flow in a concurrent system.
 ;;
 ;; ## Core Concepts
 ;;
@@ -13,34 +14,32 @@
 ;;   stream without knowing anything about the consumer(s), and vice-versa.
 ;;
 ;; - **Backpressure:** A stream can be configured with a maximum buffer
-;;   size and an `overflow-policy`. If a producer tries to write to a full
-;;   stream, the `warp:stream-write` operation will behave according to
-;;   the policy (`:block`, `:drop`, or `:error`). This prevents a fast
-;;   producer from overwhelming a slow consumer and exhausting memory.
+;;   size. If a producer writes to a full stream, the operation will behave
+;;   according to the configured `:overflow-policy` (`:block`, `:drop`, or
+;;   `:error`), preventing a fast producer from overwhelming a slow consumer.
 ;;
-;; - **Asynchronous, Cancellable Reads:** Consumers use `warp:stream-read`
-;;   to get the next item. If the stream is empty, this returns a pending
-;;   promise that resolves when data becomes available. These pending read
-;;   operations can be cancelled.
+;; - **Asynchronous Reads:** Consumers use `warp:stream-read` to get the
+;;   next item. If the stream is empty, this returns a pending promise that
+;;   resolves only when data becomes available.
 ;;
-;; - **Lifecycle:** A stream can be active, closed (signaling a clean
-;;   end-of-file), or errored. All pending and future operations will
-;;   respect the stream's state.
+;; - **Lifecycle:** A stream has a well-defined lifecycle (`:active`,
+;;   `:closed`, `:errored`). All operations respect the stream's state,
+;;   ensuring predictable behavior and preventing resource leaks.
 ;;
 ;; - **Thread-Safety:** All internal state is protected by a `loom-lock`,
-;;   making streams safe to use for communication between threads.
+;;   making streams safe for inter-thread communication.
 ;;
 ;; - **Combinators:** A suite of functions like `warp:stream-map` and
-;;   `warp:stream-filter` allow for the creation of declarative,
-;;   memory-efficient data processing pipelines.
+;;   `warp:stream-filter` allow for creating declarative, memory-efficient
+;;   data processing pipelines.
 
 ;;; Code:
 
-(require 'cl-lib)           
-(require 'loom)             
+(require 'cl-lib)
+(require 'loom)
 
-(require 'warp-log)         
-(require 'warp-error)      
+(require 'warp-log)
+(require 'warp-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Errors Definitions
@@ -70,56 +69,47 @@
 
 (cl-defstruct (warp-stream (:constructor %%make-stream) (:copier nil))
   "Represents an asynchronous, buffered, thread-safe data stream.
-This struct encapsulates all the state required to manage the flow of
-data between one or more producers and consumers.
 
 Fields:
-- `name`: Unique or descriptive name (string) for debugging/logging.
-- `buffer`: Internal `loom:queue` (FIFO) for buffered data chunks.
-- `max-buffer-size`: Max data chunks (`buffer` can hold). Backpressure
-  applies if limit reached.
-- `state`: Current lifecycle state (`:active`, `:closed`, `:errored`).
-- `overflow-policy`: Policy for full buffer writes (`'block`, `'drop`,
-  or `'error`).
-- `read-waiters`: `loom:queue` of pending `loom-promise`s for readers.
-- `write-waiters`: `loom:queue` of `(chunk . promise)` for blocked
-  writers.
-- `space-waiters`: `loom:queue` of `loom-promise`s for producers
-  awaiting buffer capacity.
-- `lock`: `loom-lock` protecting all internal state for thread-safety.
-- `error-obj`: Error object if stream is in `:errored` state."
+- `name`: A descriptive name for debugging and logging.
+- `buffer`: The internal `loom:queue` (FIFO) for buffered data.
+- `max-buffer-size`: The maximum number of items the `buffer` can hold.
+- `state`: The current lifecycle state: `:active`, `:closed`, or `:errored`.
+- `overflow-policy`: The policy for full buffer writes (`:block`, `:drop`,
+  or `:error`).
+- `read-waiters`: A queue of pending `loom-promise`s for waiting readers.
+- `write-waiters`: A queue of `(chunk . promise)` for blocked writers.
+- `space-waiters`: A queue of `loom-promise`s for producers waiting for
+  buffer capacity.
+- `lock`: A `loom-lock` protecting all internal state for thread-safety.
+- `error-obj`: The error object if the stream is in the `:errored` state."
   (name nil :type string)
-  (buffer (loom:queue) :type loom-queue)
+  (buffer (loom:queue) :type t)
   (max-buffer-size 0 :type integer)
   (state :active :type keyword)
   (overflow-policy 'block :type symbol)
-  (read-waiters (loom:queue) :type loom-queue)
-  (write-waiters (loom:queue) :type loom-queue)
-  (space-waiters (loom:queue) :type loom-queue)
-  (lock (loom:lock "warp-stream") :type loom-lock)
+  (read-waiters (loom:queue) :type t)
+  (write-waiters (loom:queue) :type t)
+  (space-waiters (loom:queue) :type t)
+  (lock (loom:lock "warp-stream") :type t)
   (error-obj nil :type (or null error)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Internal Helpers
-;;
-;; Utility functions for stream validation and internal state management.
 
 (defun warp--validate-stream (stream function-name)
   "Signal an error if `STREAM` is not a `warp-stream` object.
-This is a guard function used at the entry point of all public API
-functions.
+This is a guard function used at the entry point of all public API functions.
 
 Arguments:
 - `STREAM` (any): The object to validate.
-- `FUNCTION-NAME` (symbol): The name of the calling function for
-  the error message.
+- `FUNCTION-NAME` (symbol): The calling function's name for the error message.
 
 Returns:
 - `nil` if `STREAM` is a valid `warp-stream`.
 
 Signals:
-- `warp-invalid-stream-error`: If `STREAM` is not a `warp-stream`
-  object."
+- `warp-invalid-stream-error`: If `STREAM` is not a `warp-stream` object."
   (unless (warp-stream-p stream)
     (signal 'warp-invalid-stream-error
             (list (format "%s: Invalid stream object" function-name)
@@ -127,9 +117,8 @@ Signals:
 
 (defun warp--stream-notify-space-waiters (stream)
   "Notify all promises waiting for space in the stream's buffer.
-This helper is called when an item is read from a previously full
-buffer, unblocking any producers waiting via
-`warp:stream-wait-for-space`.
+This is called when an item is read from a previously full buffer,
+unblocking any producers waiting via `warp:stream-wait-for-space`.
 
 Arguments:
 - `STREAM` (warp-stream): The stream instance.
@@ -138,28 +127,28 @@ Returns:
 - `nil`.
 
 Side Effects:
-- Drains the `space-waiters` queue and resolves all promises within
-  it."
-  (let ((waiters-to-resolve (loom:queue-drain
-                              (warp-stream-space-waiters stream))))
-    (dolist (p waiters-to-resolve) (loom:promise-resolve p t))))
+- Drains the `space-waiters` queue and resolves all promises within it."
+  (let ((waiters (loom:queue-drain (warp-stream-space-waiters stream))))
+    (dolist (p waiters) (loom:promise-resolve p t))))
 
 (defun warp--stream-try-unblock-writer (stream)
-  "Attempt to unblock one waiting writer and move its chunk to the buffer.
-This is called after a successful read frees up space.
+  "Attempt to unblock one waiting writer.
+This is called after a read frees up buffer space. It takes the next
+blocked writer (if any), moves its data chunk into the buffer, and
+resolves its pending write promise.
 
 Arguments:
 - `STREAM` (warp-stream): The stream instance.
 
-Returns: `nil`.
+Returns:
+- `nil`.
 
 Side Effects:
-- Moves a chunk from `write-waiters` to `buffer` and resolves the
-  writer's promise."
+- May move a chunk from `write-waiters` to `buffer` and resolve a promise."
   (let* ((writer-entry (loom:queue-dequeue (warp-stream-write-waiters stream)))
          (chunk (car-safe writer-entry))
          (promise (cdr-safe writer-entry)))
-    (when (and chunk promise) ; Ensure valid entry
+    (when (and chunk promise)
       (warp:log! :trace (warp-stream-name stream)
                  "Relieving backpressure for one writer.")
       (loom:queue-enqueue (warp-stream-buffer stream) chunk)
@@ -167,8 +156,6 @@ Side Effects:
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API: Construction & Core Operations
-;;
-;; Functions for creating, writing to, and reading from streams.
 
 ;;;###autoload
 (cl-defun warp:stream
@@ -178,23 +165,20 @@ Side Effects:
   "Create and return a new, empty `warp-stream`.
 
 Arguments:
-- `:NAME` (string, optional): Descriptive name for debugging/logging.
-- `:MAX-BUFFER-SIZE` (integer, optional): Max items stream buffer can
-  hold. 0 for unbounded.
-- `:OVERFLOW-POLICY` (symbol, optional): Policy for full queue writes:
-  `'block` (producer blocks), `'drop` (task discarded), or `'error`
-  (error signaled). Defaults to `'block` if `max-buffer-size` > 0.
+- `:NAME` (string, optional): A descriptive name for debugging and logging.
+- `:MAX-BUFFER-SIZE` (integer, optional): The maximum number of items the
+  stream buffer can hold. A value of 0 means the buffer is unbounded.
+- `:OVERFLOW-POLICY` (symbol, optional): The policy for handling writes to
+  a full buffer. Must be one of `'block` (the write waits for space),
+  `'drop` (the item is discarded), or `'error` (an error is signaled).
 
 Returns:
 - (warp-stream): A new stream object in the `:active` state."
   (unless (>= max-buffer-size 0)
     (error "MAX-BUFFER-SIZE must be non-negative: %S" max-buffer-size))
-  (unless (member overflow-policy '(block drop error))
-    (error "Invalid overflow-policy: %S. Must be one of 'block, 'drop, 'error."
-           overflow-policy))
+  (unless (memq overflow-policy '(block drop error))
+    (error "Invalid overflow-policy: %S" overflow-policy))
 
-  (warp:log! :debug name "Stream created. Max buffer size: %d, %s."
-             max-buffer-size (format "Overflow policy: %S" overflow-policy))
   (%%make-stream :name name
                  :max-buffer-size max-buffer-size
                  :overflow-policy overflow-policy))
@@ -202,159 +186,116 @@ Returns:
 ;;;###autoload
 (cl-defun warp:stream-write (stream chunk &key cancel-token)
   "Write a `CHUNK` of data to the `STREAM`.
-This is the primary function for producers. If the stream's buffer is
-full, this function applies backpressure according to its configured
-`overflow-policy`.
+If the stream's buffer is full, this function applies backpressure
+according to its configured `:overflow-policy`.
 
 Arguments:
 - `STREAM` (warp-stream): The stream to write to.
 - `CHUNK` (any): The data chunk to write.
-- `:CANCEL-TOKEN` (loom-cancel-token, optional): Token to cancel a write
-  blocked by backpressure.
+- `:CANCEL-TOKEN` (loom-cancel-token, optional): A token to cancel a
+  write that is blocked due to backpressure.
 
 Returns:
-- (loom-promise): A promise that resolves to `t` on successful write
-  (buffered or consumed directly). Rejected if stream closed/errored,
-  or if backpressure policy is `:error` and queue is full.
+- (loom-promise): A promise that resolves to `t` on a successful write.
+  It rejects if the stream is closed/errored, or if the backpressure
+  policy is `:error` and the queue is full.
 
 Side Effects:
-- May add `CHUNK` to buffer.
-- May resolve pending read promise.
-- May resolve pending write promise."
+- Modifies the stream's internal state by adding data or waiters."
   (warp--validate-stream stream 'warp:stream-write)
-  (let ((stream-name (warp-stream-name stream))
-        read-waiter-promise write-promise-to-return
-        (chunk-to-enqueue chunk)
-        (buffer-full-check t))
-
+  (let (read-waiter write-promise buffer-full-p)
     (loom:with-mutex! (warp-stream-lock stream)
       (pcase (warp-stream-state stream)
         (:errored
-         (warp:log! :warn stream-name "Write failed: stream in error state.")
-         (setq write-promise-to-return
-               (loom:promise-rejected! (warp-stream-error-obj stream))))
+         (cl-return-from warp:stream-write
+           (loom:promise-rejected! (warp-stream-error-obj stream))))
         (:closed
-         (warp:log! :warn stream-name "Write failed: stream is closed.")
-         (setq write-promise-to-return (loom:promise-rejected!
-                                        (make-instance 'warp-stream-closed-error))))
+         (cl-return-from warp:stream-write
+           (loom:promise-rejected! (make-instance 'warp-stream-closed-error))))
         (:active
-         (setq buffer-full-check (and (> (warp-stream-max-buffer-size stream) 0)
-                                      (>= (loom:queue-length
-                                           (warp-stream-buffer stream))
-                                          (warp-stream-max-buffer-size stream))))
-         (cond
-          ;; Case 1: A reader is already waiting. Hand off directly.
-          ((setq read-waiter-promise (loom:queue-dequeue
-                                      (warp-stream-read-waiters stream)))
-           (warp:log! :trace stream-name
-                      "Handing off chunk to waiting reader.")
-           (setq write-promise-to-return (loom:promise-resolved! t)))
-          ;; Case 2: Buffer is full. Apply overflow policy.
-          (buffer-full-check
-           (pcase (warp-stream-overflow-policy stream)
-             ('block
-              (warp:log! :debug stream-name "Buffer full; blocking writer.")
-              (setq write-promise-to-return (loom:promise
-                                             :cancel-token cancel-token))
-              (loom:queue-enqueue (warp-stream-write-waiters stream)
-                                  (cons chunk-to-enqueue
-                                        write-promise-to-return)))
-             ('drop
-              (warp:log! :warn stream-name "Buffer full; dropping chunk.")
-              (setq write-promise-to-return
-                    (loom:promise-rejected!
-                     (make-instance 'warp-stream-full-error
-                                    :message "Stream buffer full, %s."
-                                    "chunk dropped"))))
-             ('error
-              (warp:log! :error stream-name "Buffer full; signaling error.")
-              (setq write-promise-to-return
-                    (loom:promise-rejected!
-                     (make-instance 'warp-stream-full-error
-                                    :message "Stream buffer full, %s."
-                                    "write rejected.")))
-              (signal 'warp-stream-full-error
-                      "Stream buffer full, write rejected."))))
-          ;; Case 3: The buffer has space. Enqueue the chunk.
-          (t
-           (warp:log! :trace stream-name "Enqueuing chunk to buffer.")
-           (loom:queue-enqueue (warp-stream-buffer stream) chunk-to-enqueue)
-           (setq write-promise-to-return (loom:promise-resolved! t)))))))
+         ;; Case 1: A reader is already waiting. Hand off the data directly.
+         (if-let (waiter (loom:queue-dequeue (warp-stream-read-waiters stream)))
+             (setq read-waiter waiter)
+           ;; Case 2: No readers waiting. Check buffer space.
+           (setq buffer-full-p (and (> (warp-stream-max-buffer-size stream) 0)
+                                    (>= (loom:queue-length (warp-stream-buffer stream))
+                                        (warp-stream-max-buffer-size stream))))
+           (if buffer-full-p
+               ;; Case 2a: Buffer is full. Apply overflow policy.
+               (pcase (warp-stream-overflow-policy stream)
+                 ('block
+                  (setq write-promise (loom:promise :cancel-token cancel-token))
+                  (loom:queue-enqueue (warp-stream-write-waiters stream)
+                                      (cons chunk write-promise)))
+                 ('drop
+                  (setq write-promise (loom:promise-rejected!
+                                       (make-instance 'warp-stream-full-error)))
+                  (warp:log! :warn (warp-stream-name stream) "Buffer full; dropping chunk."))
+                 ('error
+                  (setq write-promise (loom:promise-rejected!
+                                       (make-instance 'warp-stream-full-error)))
+                  (signal 'warp-stream-full-error)))
+             ;; Case 2b: Buffer has space. Enqueue the chunk.
+             (loom:queue-enqueue (warp-stream-buffer stream) chunk)
+             (setq write-promise (loom:promise-resolved! t)))))))
 
-    ;; Perform promise resolutions and potential unblocking *outside* the lock.
-    (when read-waiter-promise
-      (loom:promise-resolve read-waiter-promise chunk-to-enqueue))
-    (when (and (not buffer-full-check)
-               (> (loom:queue-length (warp-stream-write-waiters stream)) 0))
-      (warp--stream-try-unblock-writer stream))
-    (when (not buffer-full-check)
-      (warp--stream-notify-space-waiters stream))
-
-    write-promise-to-return))
+    ;; Perform promise resolutions outside the lock to avoid deadlocks.
+    (when read-waiter (loom:promise-resolve read-waiter chunk))
+    write-promise))
 
 ;;;###autoload
 (cl-defun warp:stream-read (stream &key cancel-token)
   "Read the next chunk of data from `STREAM`.
-If the stream buffer is empty, returns a pending promise that resolves
-when data is available, or when stream closes/errors.
+If the stream buffer is empty, this function returns a pending promise
+that will resolve when data becomes available, or when the stream is
+closed or enters an error state.
 
 Arguments:
 - `STREAM` (warp-stream): The stream to read from.
-- `:CANCEL-TOKEN` (loom-cancel-token, optional): Token to cancel a
-  waiting read operation.
+- `:CANCEL-TOKEN` (loom-cancel-token, optional): A token to cancel a
+  read operation that is waiting for data.
 
 Returns:
-- (loom-promise): A promise resolving with the next data chunk. Resolves
-  with `:eof` if stream closed and buffer empty. Rejects if stream
-  in error state.
+- (loom-promise): A promise resolving with the next data chunk. It
+  resolves with the special value `:eof` if the stream is closed and its
+  buffer is empty. It rejects if the stream is in an error state.
 
 Side Effects:
-- May dequeue a chunk.
-- May unblock a writer."
+- May dequeue an item from the stream's buffer.
+- May unblock a producer that was waiting for buffer space."
   (warp--validate-stream stream 'warp:stream-read)
-  (let ((read-promise (loom:promise :cancel-token cancel-token))
-        (stream-name (warp-stream-name stream))
-        buffer-was-full
-        (chunk-from-buffer nil)) ; Store chunk for outside-lock resolution
-
+  (let (read-promise buffer-was-full dequeued-chunk)
     (when cancel-token
       (loom:cancel-token-add-callback
        cancel-token
        (lambda (reason)
-         (warp:log! :debug stream-name "Read operation cancelled.")
-         (loom:promise-reject read-promise
-                              (or reason (loom:error-create :type 'loom-cancel-error)))
          (loom:with-mutex! (warp-stream-lock stream)
-           (loom:queue-remove (warp-stream-read-waiters stream)
-                              read-promise)))))
+           (loom:queue-remove (warp-stream-read-waiters stream) read-promise))
+         (loom:promise-reject read-promise
+                              (or reason (loom:error-create :type 'loom-cancel-error))))))
 
     (loom:with-mutex! (warp-stream-lock stream)
       (cond
-        ;; Case 1: Stream is already errored. Immediately reject.
-        ((eq (warp-stream-state stream) :errored)
-         (loom:promise-reject read-promise (warp-stream-error-obj stream)))
-        ;; Case 2: Data is available in the buffer. Dequeue it.
-        ((not (loom:queue-empty-p (warp-stream-buffer stream)))
-         (warp:log! :trace stream-name "Reading chunk from buffer.")
-         (setq buffer-was-full (and (> (warp-stream-max-buffer-size stream) 0)
-                                    (= (loom:queue-length
-                                        (warp-stream-buffer stream))
-                                       (warp-stream-max-buffer-size stream))))
-         (setq chunk-from-buffer (loom:queue-dequeue
-                                  (warp-stream-buffer stream))))
-        ;; Case 3: Stream is closed and buffer is empty. Signal end-of-file.
-        ((eq (warp-stream-state stream) :closed)
-         (warp:log! :debug stream-name "Read returning :eof.")
-         (loom:promise-resolve read-promise :eof))
-        ;; Case 4: Buffer empty and stream active. Wait for new data.
-        (t
-         (warp:log! :trace stream-name "Buffer empty. Waiting for data.")
-         (loom:queue-enqueue (warp-stream-read-waiters stream)
-                             read-promise))))
+       ;; Case 1: Data is available in the buffer.
+       ((not (loom:queue-empty-p (warp-stream-buffer stream)))
+        (setq buffer-was-full (and (> (warp-stream-max-buffer-size stream) 0)
+                                   (= (loom:queue-length (warp-stream-buffer stream))
+                                      (warp-stream-max-buffer-size stream))))
+        (setq dequeued-chunk (loom:queue-dequeue (warp-stream-buffer stream)))
+        (setq read-promise (loom:promise-resolved! dequeued-chunk)))
+       ;; Case 2: Stream is closed and buffer is empty.
+       ((eq (warp-stream-state stream) :closed)
+        (setq read-promise (loom:promise-resolved! :eof)))
+       ;; Case 3: Stream is errored.
+       ((eq (warp-stream-state stream) :errored)
+        (setq read-promise (loom:promise-rejected! (warp-stream-error-obj stream))))
+       ;; Case 4: Buffer empty, stream active. Wait for a write.
+       (t
+        (setq read-promise (or read-promise (loom:promise :cancel-token cancel-token)))
+        (loom:queue-enqueue (warp-stream-read-waiters stream) read-promise))))
 
-    ;; Perform promise resolutions and notifications *outside* the lock.
-    (when chunk-from-buffer ; Only if a chunk was dequeued from buffer
-      (loom:promise-resolve read-promise chunk-from-buffer)
+    ;; Perform unblocking outside the lock.
+    (when dequeued-chunk
       (when buffer-was-full (warp--stream-notify-space-waiters stream))
       (warp--stream-try-unblock-writer stream))
 
@@ -363,8 +304,8 @@ Side Effects:
 ;;;###autoload
 (defun warp:stream-close (stream)
   "Close `STREAM`, signaling an end-of-file (EOF) condition.
-This indicates no more data will be written. Any data already in buffer
-is still readable. Idempotent.
+This indicates that no more data will be written. Any data already in
+the buffer remains available for reading. This operation is idempotent.
 
 Arguments:
 - `STREAM` (warp-stream): The stream to close.
@@ -373,36 +314,32 @@ Returns:
 - `nil`.
 
 Side Effects:
-- Sets stream's state to `:closed`.
+- Sets the stream's state to `:closed`.
 - Resolves all pending read promises with `:eof`.
 - Rejects all blocked write promises with `warp-stream-closed-error`."
   (warp--validate-stream stream 'warp:stream-close)
-  (let (read-waiters-to-resolve write-waiters-to-reject
-        space-waiters-to-reject)
+  (let (read-waiters write-waiters space-waiters)
     (loom:with-mutex! (warp-stream-lock stream)
       (unless (eq (warp-stream-state stream) :active)
         (cl-return-from warp:stream-close nil))
       (warp:log! :info (warp-stream-name stream) "Closing stream.")
       (setf (warp-stream-state stream) :closed)
-      (setq read-waiters-to-resolve (loom:queue-drain
-                                     (warp-stream-read-waiters stream)))
-      (setq write-waiters-to-reject (mapcar #'cdr (loom:queue-drain
-                                                    (warp-stream-write-waiters
-                                                     stream))))
-      (setq space-waiters-to-reject (loom:queue-drain
-                                     (warp-stream-space-waiters stream))))
+      (setq read-waiters (loom:queue-drain (warp-stream-read-waiters stream)))
+      (setq write-waiters (mapcar #'cdr (loom:queue-drain
+                                         (warp-stream-write-waiters stream))))
+      (setq space-waiters (loom:queue-drain
+                           (warp-stream-space-waiters stream))))
     ;; Settle all pending promises outside the lock.
-    (dolist (p read-waiters-to-resolve) (loom:promise-resolve p :eof))
+    (dolist (p read-waiters) (loom:promise-resolve p :eof))
     (let ((err (make-instance 'warp-stream-closed-error)))
-      (dolist (p (append write-waiters-to-reject
-                          space-waiters-to-reject))
-        (loom:promise-reject p err)))
-    nil))
+      (dolist (p (append write-waiters space-waiters))
+        (loom:promise-reject p err)))))
 
 ;;;###autoload
 (defun warp:stream-error (stream error-obj)
-  "Put `STREAM` into an error state, propagating `ERROR-OBJ` to all
-parties. This signals a fatal, unrecoverable error. Idempotent.
+  "Put `STREAM` into an error state.
+This signals a fatal, unrecoverable error. All pending and future
+operations on the stream will be rejected with `ERROR-OBJ`.
 
 Arguments:
 - `STREAM` (warp-stream): The stream to put into an error state.
@@ -412,11 +349,10 @@ Returns:
 - `nil`.
 
 Side Effects:
-- Sets stream's state to `:errored`.
+- Sets the stream's state to `:errored`.
 - Rejects all pending read and write promises with `ERROR-OBJ`."
   (warp--validate-stream stream 'warp:stream-error)
-  (let (read-waiters-to-reject write-waiters-to-reject
-        space-waiters-to-reject)
+  (let (read-waiters write-waiters space-waiters)
     (loom:with-mutex! (warp-stream-lock stream)
       (unless (eq (warp-stream-state stream) :active)
         (cl-return-from warp:stream-error nil))
@@ -424,30 +360,23 @@ Side Effects:
                  "Putting stream into error state: %S" error-obj)
       (setf (warp-stream-state stream) :errored)
       (setf (warp-stream-error-obj stream) error-obj)
-      (setq read-waiters-to-reject (loom:queue-drain
-                                    (warp-stream-read-waiters stream)))
-      (setq write-waiters-to-reject (mapcar #'cdr (loom:queue-drain
-                                                    (warp-stream-write-waiters
-                                                     stream))))
-      (setq space-waiters-to-reject (loom:queue-drain
-                                     (warp-stream-space-waiters stream))))
-    ;; Settle all pending promises outside the lock.
-    (dolist (p (append read-waiters-to-reject write-waiters-to-reject
-                        space-waiters-to-reject))
-      (loom:promise-reject p error-obj))
-    nil))
+      (setq read-waiters (loom:queue-drain (warp-stream-read-waiters stream)))
+      (setq write-waiters (mapcar #'cdr (loom:queue-drain
+                                         (warp-stream-write-waiters stream))))
+      (setq space-waiters (loom:queue-drain
+                           (warp-stream-space-waiters stream))))
+    (dolist (p (append read-waiters write-waiters space-waiters))
+      (loom:promise-reject p error-obj))))
 
 ;;;###autoload
 (defun warp:stream-wait-for-space (stream)
   "Return a promise that resolves when the stream's buffer is not full.
-This allows a producer to wait for capacity before writing.
 
 Arguments:
 - `STREAM` (warp-stream): The stream to check.
 
 Returns:
-- (loom-promise): A promise resolving to `t` as soon as there is at
-  least one free slot in buffer."
+- (loom-promise): A promise resolving to `t` when space is available."
   (warp--validate-stream stream 'warp:stream-wait-for-space)
   (let ((p nil))
     (loom:with-mutex! (warp-stream-lock stream)
@@ -461,13 +390,11 @@ Returns:
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API: Stream Constructors & Processors
-;;
-;; Functions for creating streams from lists and processing stream data.
 
 ;;;###autoload
 (defun warp:stream-from-list (list)
-  "Create a new stream and immediately write all items from `LIST` to it.
-After all items are written, the stream is closed.
+  "Create a new stream and write all items from `LIST` to it.
+The stream is closed after all items are written.
 
 Arguments:
 - `LIST` (list): A list of items to populate the stream with.
@@ -476,8 +403,6 @@ Returns:
 - (warp-stream): A new, populated, and closed stream."
   (let* ((name "stream-from-list")
          (stream (warp:stream :name name)))
-    (warp:log! :debug name "Creating stream from list with %d items."
-               (length list))
     (dolist (item list) (warp:stream-write stream item))
     (warp:stream-close stream)
     stream))
@@ -485,105 +410,83 @@ Returns:
 ;;;###autoload
 (cl-defun warp:stream-for-each (stream callback &key cancel-token)
   "Apply `CALLBACK` to each chunk of data from `STREAM` as it arrives.
-This is a primary way to consume a stream. It creates a recursive,
-promise-based loop.
+This is a primary way to consume a stream.
 
 Arguments:
 - `STREAM` (warp-stream): The stream to consume.
-- `CALLBACK` (function): `(lambda (chunk))` that takes an item and
-  returns transformed item (or promise).
-- `:CANCEL-TOKEN` (loom-cancel-token, optional): Token to cancel
-  consumption loop.
+- `CALLBACK` (function): `(lambda (chunk))` that takes an item.
+- `:CANCEL-TOKEN` (loom-cancel-token, optional): Token to cancel the loop.
 
 Returns:
-- (loom-promise): A promise resolving to `t` when stream fully
-  consumed, or rejecting if stream or callback errors."
+- (loom-promise): A promise resolving to `t` when the stream is fully
+  consumed, or rejecting if an error occurs."
   (warp--validate-stream stream 'warp:stream-for-each)
   (unless (functionp callback) (error "CALLBACK must be a function"))
-  (let ((stream-name (warp-stream-name stream)))
-    (warp:log! :debug stream-name "Starting for-each loop.")
-    (cl-labels
-        ((read-loop ()
-           (if (and cancel-token (loom:cancel-token-cancelled-p cancel-token))
-               (loom:promise-rejected! (loom:error-create :type 'loom-cancel-error))
-             (loom:then
-              (warp:stream-read stream :cancel-token cancel-token)
-              (lambda (chunk)
-                (if (eq chunk :eof)
-                    (progn (warp:log! :debug stream-name "for-each: finished.")
-                           (loom:promise-resolved! t))
-                  (progn
-                    (warp:log! :trace stream-name "for-each: processing chunk.")
-                    (loom:then (funcall callback chunk) #'read-loop))))
-              (lambda (err) (loom:promise-rejected! err))))))
-      (read-loop))))
+  (cl-labels
+      ((read-loop ()
+         (if (and cancel-token (loom:cancel-token-cancelled-p cancel-token))
+             (loom:promise-rejected! (loom:error-create :type 'loom-cancel-error))
+           (loom:then
+            (warp:stream-read stream :cancel-token cancel-token)
+            (lambda (chunk)
+              (if (eq chunk :eof)
+                  (loom:promise-resolved! t)
+                (loom:then (funcall callback chunk) #'read-loop)))))))
+    (read-loop)))
 
 ;;;###autoload
 (defun warp:stream-drain (stream)
-  "Read all data from `STREAM` until it is closed, and return a list
-of all the collected chunks.
+  "Read all data from `STREAM` and return it as a list.
 
 Arguments:
 - `STREAM` (warp-stream): The stream to drain.
 
 Returns:
-- (loom-promise): A promise resolving with a list of all chunks read
-  from stream, in order."
+- (loom-promise): A promise resolving with a list of all chunks."
   (warp--validate-stream stream 'warp:stream-drain)
-  (let ((stream-name (warp-stream-name stream)))
-    (warp:log! :debug stream-name "Draining stream.")
-    (cl-labels
-        ((drain-loop (acc)
-           (loom:then
-            (warp:stream-read stream)
-            (lambda (chunk)
-              (if (eq chunk :eof)
-                  (progn
-                    (warp:log! :debug stream-name
-                               "Drain complete. Got %d items." (length acc))
-                    (nreverse acc))
-                (drain-loop (cons chunk acc)))))))
-      (drain-loop '()))))
+  (cl-labels
+      ((drain-loop (acc)
+         (loom:then
+          (warp:stream-read stream)
+          (lambda (chunk)
+            (if (eq chunk :eof)
+                (nreverse acc)
+              (drain-loop (cons chunk acc)))))))
+    (drain-loop '())))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API: Stream Combinators
-;;
-;; Functions for composing and transforming streams.
 
 (defun warp--stream-combinator-helper (source-stream processor-fn)
-  "Internal helper to create a derived stream by applying `PROCESSOR-FN`.
-This abstracts boilerplate for consumer loop and derived stream lifecycle.
+  "Internal helper to create a derived stream.
 
 Arguments:
 - `SOURCE-STREAM` (warp-stream): The stream to read from.
-- `PROCESSOR-FN` (function): `(lambda (chunk dest-stream))` processes
-  one item and may write to destination.
+- `PROCESSOR-FN` (function): `(lambda (chunk dest-stream))` that processes
+  an item and may write to the destination stream.
 
 Returns:
 - (warp-stream): The new, derived stream."
   (let* ((source-name (warp-stream-name source-stream))
          (dest-stream (warp:stream :name (format "derived-%s" source-name))))
-    (warp:log! :debug source-name "Creating derived stream '%s'."
-               (warp-stream-name dest-stream))
-    ;; Start a `for-each` loop on the source stream.
+    ;; Start a consumer loop on the source stream.
     (let ((promise (warp:stream-for-each
                     source-stream
                     (lambda (chunk) (funcall processor-fn chunk dest-stream)))))
-      ;; Ensure the destination stream's lifecycle matches the source's.
+      ;; Ensure the new stream's lifecycle matches the source's.
       (loom:then promise
-                 (lambda (_result) (warp:stream-close dest-stream))
+                 (lambda (_) (warp:stream-close dest-stream))
                  (lambda (err) (warp:stream-error dest-stream err))))
     dest-stream))
 
 ;;;###autoload
 (defun warp:stream-map (source-stream map-fn)
-  "Create a new stream by applying an asynchronous `MAP-FN` to each item
-from the `SOURCE-STREAM`.
+  "Create a new stream by applying `MAP-FN` to each item from `SOURCE-STREAM`.
 
 Arguments:
 - `SOURCE-STREAM` (warp-stream): The input stream.
-- `MAP-FN` (function): `(lambda (chunk))` takes an item and returns
-  transformed item (or promise resolving to it).
+- `MAP-FN` (function): A function `(lambda (chunk))` that returns a
+  transformed item (or a promise that resolves to one).
 
 Returns:
 - (warp-stream): A new stream that will emit the transformed items."
@@ -592,18 +495,16 @@ Returns:
    source-stream
    (lambda (chunk dest-stream)
      (loom:then (funcall map-fn chunk)
-                (lambda (mapped-chunk)
-                  (warp:stream-write dest-stream mapped-chunk))))))
+                (lambda (mapped) (warp:stream-write dest-stream mapped))))))
 
 ;;;###autoload
 (defun warp:stream-filter (source-stream predicate-fn)
-  "Create a new stream containing only the items from `SOURCE-STREAM`
-that satisfy the asynchronous `PREDICATE-FN`.
+  "Create a new stream with only items that satisfy `PREDICATE-FN`.
 
 Arguments:
 - `SOURCE-STREAM` (warp-stream): The input stream.
-- `PREDICATE-FN` (function): `(lambda (chunk))` returns non-nil (or
-  promise resolving to non-nil) if item should be included.
+- `PREDICATE-FN` (function): A predicate `(lambda (chunk))` that returns
+  non-nil (or a promise resolving to non-nil) to keep an item.
 
 Returns:
 - (warp-stream): A new stream that will emit the filtered items."
@@ -612,169 +513,10 @@ Returns:
    source-stream
    (lambda (chunk dest-stream)
      (loom:then (funcall predicate-fn chunk)
-                (lambda (should-keep)
-                  (when should-keep (warp:stream-write dest-stream chunk)))))))
-
-;;;###autoload
-(defun warp:stream-take (source-stream n)
-  "Create a new stream that emits only the first `N` items from the
-`SOURCE-STREAM` and then closes.
-
-Arguments:
-- `SOURCE-STREAM` (warp-stream): The input stream.
-- `N` (integer): The number of items to take.
-
-Returns:
-- (warp-stream): A new stream that will emit at most `N` items."
-  (warp--validate-stream source-stream 'warp:stream-take)
-  (unless (and (integerp n) (>= n 0)) (error "N must be non-negative"))
-  (if (zerop n)
-      (let ((s (warp:stream))) (warp:stream-close s) s)
-    (let* ((dest (warp:stream)) (counter 0) (token (loom:cancel-token)))
-      (warp:log! :debug (warp-stream-name source-stream)
-                 "Creating 'take' stream for %d items." n)
-      (let ((promise
-             (warp:stream-for-each
-              source-stream
-              (lambda (chunk)
-                (cl-incf counter)
-                (let ((write-p (warp:stream-write dest chunk)))
-                  (loom:finally write-p
-                                (lambda ()
-                                  (when (>= counter n)
-                                    (loom:cancel-token-signal token)))))))
-              :cancel-token token)))
-        (loom:then promise
-                   (lambda (_result) (warp:stream-close dest))
-                   (lambda (err) (warp:stream-error dest err))))
-      dest)))
-
-;;;###autoload
-(defun warp:stream-drop (source-stream n)
-  "Create a new stream that skips the first `N` items from the
-`SOURCE-STREAM` and then emits all subsequent items.
-
-Arguments:
-- `SOURCE-STREAM` (warp-stream): The input stream.
-- `N` (integer): The number of items to drop from the beginning.
-
-Returns:
-- (warp-stream): A new stream that emits items after the first `N`."
-  (warp--validate-stream source-stream 'warp:stream-drop)
-  (unless (and (integerp n) (>= n 0)) (error "N must be non-negative"))
-  (let ((dest (warp:stream)) (counter 0))
-    (warp:log! :debug (warp-stream-name source-stream)
-               "Creating 'drop' stream, skipping %d items." n)
-    (let ((promise
-           (warp:stream-for-each
-            source-stream
-            (lambda (chunk)
-              (cl-incf counter)
-              (when (> counter n) (warp:stream-write dest chunk))))))
-      (loom:then promise
-                 (lambda (_result) (warp:stream-close dest))
-                 (lambda (err) (warp:stream-error dest err))))
-    dest))
-
-;;;###autoload
-(defun warp:stream-tee (source-stream count)
-  "Create `COUNT` new streams that all receive a copy of every item from
-the `SOURCE-STREAM`.
-
-Arguments:
-- `SOURCE-STREAM` (warp-stream): The input stream to duplicate.
-- `COUNT` (integer): The number of output streams to create.
-
-Returns:
-- (list): A list of `COUNT` new `warp-stream` objects."
-  (warp--validate-stream source-stream 'warp:stream-tee)
-  (let* ((dests (cl-loop repeat count collect
-                         (warp:stream :name (format "tee-%s"
-                                                    (warp-stream-name
-                                                     source-stream))))))
-    (let ((promise (warp:stream-for-each
-                    source-stream
-                    (lambda (chunk)
-                      (loom:all (mapcar (lambda (d)
-                                          (warp:stream-write d chunk))
-                                        dests))))))
-      (loom:then promise
-                 (lambda (_result) (dolist (d dests) (warp:stream-close d)))
-                 (lambda (err) (dolist (d dests) (warp:stream-error d err)))))
-    dests))
-
-;;;###autoload
-(defun warp:stream-merge (streams)
-  "Merge multiple `STREAMS` into a single output stream.
-Items are emitted on the output stream as they become available from
-any of the input streams, without any guaranteed order.
-
-Arguments:
-- `STREAMS` (list): A list of `warp-stream` objects to merge.
-
-Returns:
-- (warp-stream): A new stream that emits items from all source streams."
-  (let* ((dest (warp:stream :name "merged-stream"))
-         (remaining (length streams))
-         (lock (loom:lock "warp:stream-merge")))
-    (dolist (source streams)
-      (loom:then
-       (warp:stream-for-each source (lambda (chunk)
-                                      (warp:stream-write dest chunk)))
-       (lambda (_result)
-         (loom:with-mutex! lock
-           (cl-decf remaining)
-           (when (zerop remaining) (warp:stream-close dest))))
-       (lambda (err)
-         (loom:with-mutex! lock
-           (unless (warp:stream-is-closed-p dest)
-             (warp:stream-error dest err))))))
-    dest))
-
-;;;###autoload
-(cl-defun warp:stream-batch (source-stream &key size timeout)
-  "Group items from `SOURCE-STREAM` into batches, emitted as lists.
-A batch is emitted either when it reaches `SIZE` or when `TIMEOUT`
-elapses after the first item was added.
-
-Arguments:
-- `SOURCE-STREAM` (warp-stream): The input stream.
-- `:size` (integer, optional): Max number of items in a batch.
-- `:timeout` (number, optional): Max time (seconds) to wait before
-  flushing an incomplete batch.
-
-Returns:
-- (warp-stream): A new stream that emits lists of items."
-  (unless (or size timeout)
-    (error "Either :size or :timeout must be provided"))
-  (let* ((dest (warp:stream)) (batch '()) (timer nil)
-         (lock (loom:lock "warp:stream-batch")))
-    (cl-flet ((flush-batch ()
-                (loom:with-mutex! lock
-                  (when timer (cancel-timer timer) (setq timer nil))
-                  (when batch
-                    (let ((b (nreverse batch)))
-                      (setq batch '())
-                      (warp:stream-write dest b))))))
-      (let ((proc (warp:stream-for-each
-                   source-stream
-                   (lambda (chunk)
-                     (loom:with-mutex! lock
-                       (push chunk batch)
-                       (when (and timeout (not timer))
-                         (setq timer (run-with-timer timeout nil
-                                                       #'flush-batch)))
-                       (when (and size (>= (length batch) size))
-                         (flush-batch)))))))
-        (loom:then proc
-                   (lambda (_result) (flush-batch) (warp:stream-close dest))
-                   (lambda (err) (warp:stream-error dest err))))
-      dest)))
+                (lambda (keep) (when keep (warp:stream-write dest-stream chunk)))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API: Introspection
-;;
-;; Functions for querying the state of a stream.
 
 ;;;###autoload
 (defun warp:stream-is-closed-p (stream)
@@ -822,4 +564,4 @@ Returns:
       :error-object ,(warp-stream-error-obj stream))))
 
 (provide 'warp-stream)
-;;; warp-stream el ends here
+;;; warp-stream.el ends here
