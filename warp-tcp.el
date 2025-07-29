@@ -1,9 +1,9 @@
-;;; warp-tcp.el --- Raw TCP Socket Communication Transport for warp -*- lexical-binding: t; -*-
+;;; warp-tcp.el --- Raw TCP Socket Transport for Warp -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
 ;; This module provides the concrete implementation for the `:tcp`
-;; communication transport protocol within the warp concurrency
+;; communication transport protocol within the Warp concurrency
 ;; framework. It integrates with `warp-transport.el` to offer a
 ;; standardized interface for both client-side connections and
 ;; server-side listening over raw TCP sockets.
@@ -12,11 +12,10 @@
 ;;
 ;; - **Abstract Protocol Implementation:** Registers the `:tcp` protocol
 ;;   with `warp-transport.el`, providing the full suite of transport
-;;   functions (`connect-fn`, `listen-fn`, `close-fn`, etc.).
+;;   functions (`connect-fn`, `close-fn`, etc.).
 ;;
-;; - **Unified Connection Object:** This module no longer uses custom
-;;   structs. All TCP-specific data (like the underlying Emacs process
-;;   for a client, or the listener process and client list for a server)
+;; - **Unified Connection Object:** This module does not use a custom
+;;   struct. All TCP-specific data (like the underlying Emacs process)
 ;;   is stored within the generic `warp-transport-connection` object,
 ;;   ensuring seamless integration with the transport layer.
 ;;
@@ -30,9 +29,6 @@
 ;; - **Health Monitoring:** Provides a `health-check-fn` that verifies
 ;;   process liveness, allowing the generic transport layer to trigger
 ;;   recovery actions like auto-reconnect.
-;;
-;; This module adheres to the abstract `warp:transport-*` interface,
-;; ensuring seamless integration for higher-level warp primitives.
 
 ;;; Code:
 
@@ -42,10 +38,12 @@
 (require 'cl-lib)
 (require 'loom)
 (require 'braid)
+(require 's)
 
 (require 'warp-error)
 (require 'warp-log)
 (require 'warp-transport)
+(require 'warp-state-machine)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -77,10 +75,13 @@
   "Parse a TCP address string into a `(HOST . PORT)` cons cell.
 
 Arguments:
-- ADDRESS (string): The address string (e.g., \"tcp://host:port\").
+- `ADDRESS` (string): The address string (e.g., \"tcp://host:port\").
 
 Returns:
 - (cons): A cons cell of the form `(\"host\" . port-number)`.
+
+Side Effects:
+- None.
 
 Signals:
 - `warp-tcp-error`: If the address string is malformed."
@@ -88,12 +89,66 @@ Signals:
                        (substring address (length "tcp://")) address))
          (parts (split-string stripped ":" t)))
     (unless (>= (length parts) 2)
-      (signal 'warp-tcp-error
-              (list (warp:error! :type 'warp-tcp-error
-                                 :message (format "Invalid TCP address: %s" address)))))
+      (error 'warp-tcp-error (format "Invalid TCP address: %s" address)))
     (let* ((port-str (car (last parts)))
            (host-str (string-join (butlast parts) ":")))
       (cons host-str (string-to-number port-str)))))
+
+(defun warp-tcp--setup-new-client (server-proc server-connection client-registry)
+  "Set up a new client connection accepted by the server.
+This function is called from the server's sentinel. It creates a new
+`warp-transport-connection` for the client, configures its filters and
+sentinels, and transitions its state to connected.
+
+Arguments:
+- `SERVER-PROC` (process): The main server listener process.
+- `SERVER-CONNECTION` (warp-transport-connection): The server connection.
+- `CLIENT-REGISTRY` (hash-table): The hash table to store the new client.
+
+Returns: `nil`.
+
+Side Effects:
+- Creates a new `warp-transport-connection`.
+- Sets process filters and sentinels on the new client's process.
+- Modifies the `CLIENT-REGISTRY`."
+  (let* (;; The new client process handle is stored in a property of the
+         ;; main server process by Emacs's networking library.
+         (client-proc (process-get server-proc 'new-connection))
+         (client-socket (process-get server-proc 'connection))
+         (client-host (car client-socket))
+         (client-port (cadr client-socket))
+         (client-addr (format "tcp://%s:%d" client-host client-port))
+         ;; Create a new, fully-managed connection object for this client,
+         ;; inheriting its configuration from the parent server.
+         (client-conn (warp-transport--create-connection-instance
+                       :tcp client-addr
+                       (cl-struct-to-plist
+                        (warp-transport-connection-config server-connection)))))
+    ;; Associate the raw process with the new connection object.
+    (setf (warp-transport-connection-raw-connection client-conn) client-proc)
+    ;; The filter pushes all incoming data into the transport layer's
+    ;; generic processing pipeline (decryption, decompression, etc.).
+    (set-process-filter
+     client-proc
+     (lambda (_p raw-chunk)
+       (warp-transport--process-incoming-raw-data client-conn raw-chunk)))
+    ;; The sentinel handles unexpected disconnects, triggering the transport
+    ;; layer's generic error and auto-reconnect logic.
+    (set-process-sentinel
+     client-proc
+     (lambda (_p _e)
+       (warp-transport--handle-error
+        client-conn
+        (warp:error! :type 'warp-tcp-connection-error
+                     :message "Client disconnected."))))
+    ;; Register the new client and transition its state to connected.
+    (puthash (warp-transport-connection-id client-conn) client-conn
+             client-registry)
+    (warp:state-machine-emit (warp-transport-connection-state-machine
+                              client-conn) :success)
+    (warp:log! :info "warp-tcp" "Accepted client %s on server %s"
+               (warp-transport-connection-id client-conn)
+               (warp-transport-connection-id server-connection))))
 
 ;;----------------------------------------------------------------------
 ;;; Protocol Implementation
@@ -101,38 +156,36 @@ Signals:
 
 (defun warp-tcp-protocol--connect-fn (connection)
   "The `:connect-fn` for the `:tcp` transport (client-side).
-This function creates a raw TCP client connection, sets up the necessary
-filters and sentinels for integration with `warp-transport`, and returns
-the underlying Emacs process.
+Creates a raw TCP client connection and sets up its filters/sentinels.
 
 Arguments:
-- CONNECTION (warp-transport-connection): The connection object provided
-  by the transport layer.
+- `CONNECTION` (warp-transport-connection): The connection object.
 
 Returns:
-- (loom-promise): A promise that resolves with the raw Emacs network process on
-  success, or rejects with an error on failure."
+- (loom-promise): A promise that resolves with the raw Emacs network
+  process on success, or rejects with an error on failure."
   (let ((address (warp-transport-connection-address connection)))
     (braid! (warp-tcp--parse-address address)
       (:let* ((host (car <>))
-              (port (cdr <>))
-              (proc-name (format "warp-tcp-client-%s:%d" host port))
-              (process (make-network-process :name proc-name
-                                             :host host :service port
-                                             :coding 'no-conversion
-                                             :noquery t)))
+             (port (cdr <>))
+             (proc-name (format "warp-tcp-client-%s:%d" host port))
+             (process (make-network-process
+                       :name proc-name
+                       :host host :service port
+                       :coding 'no-conversion
+                       :noquery t)))
         ;; The sentinel handles process death by notifying the transport layer.
         (set-process-sentinel
          process
          (lambda (proc _event)
-           (let ((err (warp:error! :type 'warp-tcp-connection-error
-                                   :message (format "TCP client process %s died."
-                                                    (process-name proc)))))
-             ;; This generic handler will manage state and reconnects.
+           (let ((err (warp:error!
+                       :type 'warp-tcp-connection-error
+                       :message (format "TCP client process %s died."
+                                        (process-name proc)))))
+             ;; This generic handler manages state and reconnects.
              (warp-transport--handle-error connection err))))
 
-        ;; The filter pushes all incoming raw data into the transport layer's
-        ;; message stream for generic processing.
+        ;; The filter pushes incoming data to the transport layer's stream.
         (set-process-filter
          process
          (lambda (_proc raw-chunk)
@@ -150,68 +203,34 @@ Returns:
 
 (defun warp-tcp-protocol--listen-fn (server-connection)
   "The `:listen-fn` for the `:tcp` transport (server-side).
-This function creates a TCP listener process. The sentinel on this
-process is responsible for accepting new clients and creating new, fully
-managed `warp-transport-connection` objects for each one.
+Creates a TCP listener process. Its sentinel is responsible for
+accepting new clients and creating connection objects for them.
 
 Arguments:
-- SERVER-CONNECTION (warp-transport-connection): The connection object
+- `SERVER-CONNECTION` (warp-transport-connection): The connection object
   representing the server listener.
 
 Returns:
-- (loom-promise): A promise that resolves with a plist containing the raw server
-  process and client registry, or rejects with an error."
+- (loom-promise): A promise that resolves with a plist containing the raw
+  server process and a client registry, or rejects with an error."
   (let ((address (warp-transport-connection-address server-connection)))
     (braid! (warp-tcp--parse-address address)
       (:let* ((host (car <>))
-              (port (cdr <>))
-              (client-registry (make-hash-table :test 'equal))
-              (server-proc
-               (make-network-process
-                :name (format "tcp-server-%s:%d" host port)
-                :server t :host host :service port :coding 'no-conversion
-                ;; The sentinel is the core of the server logic.
-                :sentinel
-                (lambda (proc _event)
-                  (when (eq (process-status proc) 'connect)
-                    (let* ((client-socket (process-get proc 'connection))
-                           (client-host (car client-socket))
-                           (client-port (cadr client-socket))
-                           (client-addr (format "tcp://%s:%d"
-                                                client-host client-port))
-                           ;; This is the raw process handle for the new client.
-                           (client-proc (process-get proc 'new-connection)))
-                      ;; For each new client, create a NEW transport connection.
-                      (let ((client-conn (warp-transport--create-connection-instance
-                                          :tcp client-addr
-                                          (cl-struct-to-plist
-                                           (warp-transport-connection-config
-                                            server-connection)))))
-                        ;; Associate the raw process with the new connection object.
-                        (setf (warp-transport-connection-raw-connection client-conn)
-                              client-proc)
-                        ;; Set up the filter and sentinel for the new client.
-                        (set-process-filter
-                         client-proc
-                         (lambda (_p raw-chunk)
-                           (warp-transport--process-incoming-raw-data client-conn raw-chunk)))
-                        (set-process-sentinel
-                         client-proc
-                         (lambda (_p _e)
-                           (warp-transport--handle-error
-                            client-conn
-                            (warp:error! :type 'warp-tcp-connection-error
-                                         :message "Client disconnected."))))
-                        ;; Finalize the connection setup.
-                        (puthash (warp-transport-connection-id client-conn)
-                                 client-conn client-registry)
-                        (warp-transport--transition-state client-conn :connected)
-                        (warp:log! :info "warp-tcp"
-                                   "Accepted client %s on server %s"
-                                   (warp-transport-connection-id client-conn)
-                                   (warp-transport-connection-id server-connection)))))))))
-        ;; The raw connection for a server is a plist containing its
-        ;; listener process and the hash table for client connections.
+             (port (cdr <>))
+             (client-registry (make-hash-table :test 'equal))
+             (server-proc
+              (make-network-process
+               :name (format "tcp-server-%s:%d" host port)
+               :server t :host host :service port :coding 'no-conversion
+               ;; The sentinel is the core of the server logic; it fires
+               ;; every time a new client connects.
+               :sentinel
+               (lambda (proc _event)
+                 (when (eq (process-status proc) 'connect)
+                   (warp-tcp--setup-new-client
+                    proc server-connection client-registry))))))
+        ;; The "raw connection" for a server is a plist containing its
+        ;; listener process and the hash table that will store clients.
         `(:process ,server-proc :clients ,client-registry))
       (:catch
        (lambda (err)
@@ -223,11 +242,10 @@ Returns:
 
 (defun warp-tcp-protocol--close-fn (connection _force)
   "The `:close-fn` for the `:tcp` transport.
-Handles closing both client and server connections.
 
 Arguments:
-- CONNECTION (warp-transport-connection): The connection to close.
-- _FORCE (boolean): Unused, as TCP closure is immediate.
+- `CONNECTION` (warp-transport-connection): The connection to close.
+- `_FORCE` (boolean): Unused, as TCP closure is immediate.
 
 Returns:
 - (loom-promise): A promise that resolves with `t` when closed."
@@ -238,7 +256,7 @@ Returns:
           (warp:log! :info "warp-tcp" "Closing client connection: %s"
                      (warp-transport-connection-address connection))
           (when (process-live-p raw-conn)
-            (set-process-sentinel raw-conn nil)
+            (set-process-sentinel raw-conn nil) ; Prevent sentinel firing
             (delete-process raw-conn)))
       ;; --- This is a server connection ---
       (let ((server-proc (plist-get raw-conn :process))
@@ -258,12 +276,10 @@ Returns:
 
 (defun warp-tcp-protocol--send-fn (connection data)
   "The `:send-fn` for the `:tcp` transport.
-Receives serialized binary `data` and sends it to the client process.
-This function does not work on server listener objects.
 
 Arguments:
-- CONNECTION (warp-transport-connection): The client connection.
-- DATA (string): The binary data (unibyte string) to send.
+- `CONNECTION` (warp-transport-connection): The client connection.
+- `DATA` (string): The binary data (unibyte string) to send.
 
 Returns:
 - (loom-promise): A promise that resolves with `t` on success."
@@ -282,19 +298,18 @@ Returns:
 
 (defun warp-tcp-protocol--health-check-fn (connection)
   "The `:health-check-fn` for the `:tcp` transport.
-Checks the liveness of the underlying process or processes.
 
 Arguments:
-- CONNECTION (warp-transport-connection): The connection to check.
+- `CONNECTION` (warp-transport-connection): The connection to check.
 
 Returns:
-- (loom-promise): A promise resolving to `t` if healthy, otherwise rejecting."
+- (loom-promise): A promise resolving to `t` if healthy."
   (let ((raw-conn (warp-transport-connection-raw-connection connection))
         (is-healthy t))
     (if (processp raw-conn)
-        ;; Client connection
+        ;; Client connection is healthy if its process is live.
         (setq is-healthy (process-live-p raw-conn))
-      ;; Server connection
+      ;; Server connection is healthy if its listener process is live.
       (let ((server-proc (plist-get raw-conn :process)))
         (unless (process-live-p server-proc) (setq is-healthy nil))))
     (if is-healthy
@@ -305,19 +320,32 @@ Returns:
 
 (defun warp-tcp-protocol--cleanup-fn ()
   "The `:cleanup-fn` for the `:tcp` transport.
-This is called on Emacs exit. The generic transport shutdown handles
-closing active connections, so no specific action is needed here.
+Called on Emacs exit. The generic transport shutdown handles closing
+active connections, so no specific action is needed here.
 
 Returns:
 - `nil`."
   (warp:log! :info "warp-tcp" "Running global TCP cleanup on exit.")
   nil)
 
+(defun warp-tcp-protocol--address-generator-fn (&key id host)
+  "The `:address-generator-fn` for the `:tcp` transport.
+Generates a default TCP address, defaulting to localhost on a high port.
+
+Arguments:
+- `:id` (string): Unused for TCP, but part of the generic signature.
+- `:host` (string): The hostname or IP address. Defaults to localhost.
+
+Returns:
+- (string): A valid TCP address string."
+  (format "tcp://%s:55557" (or host "127.0.0.1")))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Protocol Registration
 
 (warp:deftransport :tcp
   :matcher-fn (lambda (addr) (string-prefix-p "tcp://" addr))
+  :address-generator-fn #'warp-tcp-protocol--address-generator-fn
   :connect-fn #'warp-tcp-protocol--connect-fn
   :listen-fn #'warp-tcp-protocol--listen-fn
   :close-fn #'warp-tcp-protocol--close-fn
