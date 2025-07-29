@@ -750,27 +750,28 @@ Arguments:
 
 Returns:
 - (boolean): `t` if `clock-a` precedes `clock-b`, otherwise `nil`."
-  (let ((at-least-one-less nil))
-    ;; Check that every entry in A is <= the corresponding entry in B.
-    (unless (cl-every (lambda (a-pair)
-                        (let* ((node (car a-pair))
-                               (a-version (cdr a-pair))
-                               (b-version (gethash node clock-b 0)))
-                          (when (< a-version b-version)
-                            (setq at-least-one-less t))
-                          (<= a-version b-version)))
-                      (hash-table-to-alist clock-a))
-      (cl-return-from warp-state-manager--vector-clock-precedes-p nil))
+  (cl-block warp-state-manager--vector-clock-precedes-p
+    (let ((at-least-one-less nil))
+      ;; Check that every entry in A is <= the corresponding entry in B.
+      (unless (cl-every (lambda (a-pair)
+                          (let* ((node (car a-pair))
+                                (a-version (cdr a-pair))
+                                (b-version (gethash node clock-b 0)))
+                            (when (< a-version b-version)
+                              (setq at-least-one-less t))
+                            (<= a-version b-version)))
+                        (hash-table-to-alist clock-a))
+        (cl-return-from warp-state-manager--vector-clock-precedes-p nil))
 
-    ;; Check if any entry in B is not present or is greater in A.
-    (unless at-least-one-less
-      (maphash (lambda (node b-version)
-                 (unless (gethash node clock-a)
-                   (when (> b-version 0)
-                     (setq at-least-one-less t))))
-               clock-b))
+      ;; Check if any entry in B is not present or is greater in A.
+      (unless at-least-one-less
+        (maphash (lambda (node b-version)
+                  (unless (gethash node clock-a)
+                    (when (> b-version 0)
+                      (setq at-least-one-less t))))
+                clock-b))
 
-    at-least-one-less))
+      at-least-one-less)))
 
 (defun warp-state-manager--merge-vector-clocks (clock-a clock-b)
   "Merge two vector clocks into a new clock that reflects both histories.
