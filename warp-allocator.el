@@ -26,17 +26,20 @@
 ;;; Code:
 
 (require 'cl-lib)
-(require 'loom)     
-(require 'braid)    
+(require 'loom)
+(require 'braid)
 
 (require 'warp-config)
-(require 'warp-event) 
+(require 'warp-event)
+(require 'warp-log)
+(require 'warp-error)
+(require 'warp-pool)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
 
 (define-error 'warp-allocator-error
-  "Generic error for `warp-allocator` operations." 
+  "Generic error for `warp-allocator` operations."
   'warp-error)
 
 (define-error 'warp-resource-pool-not-found
@@ -72,31 +75,17 @@ Fields:
 how a specific class of resources should be managed and scaled.
 
 Fields:
-- `name` (string): A unique name for this resource specification
-  (e.g., \"worker-emacs-process\").
-- `resource-type` (keyword): A category keyword for the resource
-  (e.g., `:worker`, `:connection`, `:memory-pool`).
+- `name` (string): A unique name for this resource specification.
+- `resource-type` (keyword): A category keyword for the resource.
 - `min-capacity` (integer): The minimum number of resources to maintain.
 - `max-capacity` (integer): The maximum number of resources allowed.
-- `target-capacity` (integer or nil): An optional desired capacity
-  override. If `nil`, strategies determine the target.
-- `scale-unit` (integer): The number of resources to allocate/deallocate
-  in a single scaling operation.
-- `allocation-fn` (function): A function `(lambda (count))` that
-  asynchronously allocates `count` new resources. Must return a
-  `loom-promise` resolving to a list of the newly allocated resources.
-- `deallocation-fn` (function): A function `(lambda (resources))` that
-  asynchronously deallocates the given list of `resources`. Must return
-  a `loom-promise` resolving to `t` on success.
-- `health-check-fn` (function or nil): An optional function
-  `(lambda (resource))` that performs a health check on a single
-  resource. Returns `:healthy`, `:degraded`, `:unhealthy`, or `nil`.
-- `cost-fn` (function or nil): An optional function
-  `(lambda (count resource-type))` that calculates the cost of
-  allocating `count` resources.
-- `constraints` (list): A list of constraint functions
-  `(lambda (pool proposed-change))` that return `t` if the change is
-  allowed, or `nil` (or signal an error) if not.
+- `target-capacity` (integer): An optional desired capacity override.
+- `scale-unit` (integer): How many resources to add/remove at a time.
+- `allocation-fn` (function): `(lambda (count))` -> promise for new resources.
+- `deallocation-fn` (function): `(lambda (resources))` -> promise for `t`.
+- `health-check-fn` (function): `(lambda (resource))` -> status keyword.
+- `cost-fn` (function): `(lambda (count type))` -> cost of allocation.
+- `constraints` (list): `(lambda (pool change))` -> boolean.
 - `metadata` (plist): Arbitrary metadata about the resource type."
   (name nil :type string)
   (resource-type nil :type keyword)
@@ -118,22 +107,14 @@ Fields:
 operational metrics for a specific resource type.
 
 Fields:
-- `spec` (warp-resource-spec): The specification defining this pool's
-  resource type and its constraints.
-- `active-resources` (list): A list of currently active resource objects
-  managed by this pool.
-- `pending-allocations` (integer): Number of resources currently being
-  allocated (in-flight allocation requests).
-- `pending-deallocations` (integer): Number of resources currently being
-  deallocated.
-- `last-scale-time` (float): The `float-time` of the most recent
-  scaling action (up or down).
-- `scale-cooldown` (float): Minimum time (in seconds) between
-  scaling operations for this pool, to prevent flapping.
-- `allocation-history` (list): A historical log of recent allocation
-  decisions (e.g., timestamps of scale-up/down).
-- `metrics` (plist): A property list of real-time metrics for this
-  specific resource pool (e.g., utilization, error rates)."
+- `spec` (warp-resource-spec): The specification defining this pool.
+- `active-resources` (list): A list of currently active resource objects.
+- `pending-allocations` (integer): Count of in-flight allocation requests.
+- `pending-deallocations` (integer): Count of in-flight deallocations.
+- `last-scale-time` (float): `float-time` of the most recent scaling action.
+- `scale-cooldown` (float): Min time between scaling operations.
+- `allocation-history` (list): A log of recent allocation decisions.
+- `metrics` (plist): Real-time metrics for this pool."
   (spec nil :type warp-resource-spec)
   (active-resources nil :type list)
   (pending-allocations 0 :type integer)
@@ -151,19 +132,13 @@ algorithms that the manager can use to decide when and how to scale
 resource pools.
 
 Fields:
-- `name` (string): A unique name for the strategy (e.g.,
-  \"cpu-utilization-scaler\").
-- `decision-fn` (function): The core decision-making function
-  `(lambda (pool metrics))` that returns a keyword:
-    - `:scale-up`: Increase capacity.
-    - `:scale-down`: Decrease capacity.
-    - `:maintain`: Keep current capacity.
-    - `:target-capacity` (integer): Directly set target capacity.
-- `target-calculator-fn` (function or nil): An optional function
-  `(lambda (pool metrics))` that calculates a desired target capacity,
-  used by strategies returning `:target-capacity`.
+- `name` (string): A unique name for the strategy.
+- `decision-fn` (function): The core logic `(lambda (pool metrics))` that
+  returns `:scale-up`, `:scale-down`, `:maintain`, or a target integer.
+- `target-calculator-fn` (function): `(lambda (pool metrics))` that
+  calculates a desired target capacity.
 - `priority` (integer): Higher priority strategies are evaluated first.
-- `enabled-p` (boolean): `t` if the strategy is active, `nil` otherwise."
+- `enabled-p` (boolean): `t` if the strategy is active."
   (name nil :type string)
   (decision-fn (cl-assert nil) :type function)
   (target-calculator-fn nil :type (or null function))
@@ -175,89 +150,70 @@ Fields:
                (:copier nil))
   "Manager for resource allocation across multiple pools. This is the
 central orchestrator that periodically evaluates resource pools against
-defined strategies and constraints, initiating scaling actions as needed.
+defined strategies and constraints.
 
 Fields:
 - `name` (string): A unique name for the manager instance.
 - `config` (warp-allocator-config): The allocator's configuration.
-- `pools` (hash-table): A hash table mapping pool names (strings) to
-  `warp-resource-pool` objects.
-- `strategies` (list): A sorted list of `warp-allocation-strategy`
-  objects, ordered by `priority` (highest first).
-- `constraints` (list): A list of global constraint functions
-  `(lambda (manager pool-name pool proposed-change))` that return `t`
-  if a proposed change is allowed, or `nil` (or signal an error) if not.
-- `lock` (loom-lock): A mutex to ensure thread-safe access to the
-  manager's internal state.
-- `event-system` (warp-event-system or nil): A reference to the event
-  system for emitting operational events.
-- `poll-instance` (loom-poll or nil): The dedicated `loom-poll`
-  instance for periodic evaluations. ; NEW: for loom-poll
-- `running-p` (boolean): `t` if the manager is active and performing
-  evaluations."
+- `pools` (hash-table): Maps pool names to `warp-resource-pool` objects.
+- `strategies` (list): A sorted list of `warp-allocation-strategy` objects.
+- `constraints` (list): Global constraint functions `(lambda (manager ...))`.
+- `lock` (loom-lock): A mutex for thread-safe access to internal state.
+- `event-system` (warp-event-system): For emitting operational events.
+- `poll-instance` (loom-poll): For periodic evaluations.
+- `running-p` (boolean): `t` if the manager is active."
   (name nil :type string)
-  (config (cl-assert nil) :type warp-allocator-config)
+  (config (cl-assert nil) :type allocator-config)
   (pools (make-hash-table :test 'equal) :type hash-table)
   (strategies nil :type list)
   (constraints nil :type list)
-  (lock (loom:lock "allocator-lock") :type loom-lock)
-  (event-system nil :type (or null warp-event-system))
-  (poll-instance nil :type (or null loom-poll)) 
+  (lock (loom:lock "allocator-lock") :type t)
+  (event-system nil :type (or null t))
+  (poll-instance nil :type (or null t))
   (running-p nil :type boolean))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Private Functions
 
 (defun warp-allocator--evaluate-all (manager)
-  "Evaluates all registered resource pools and makes allocation decisions.
-This function iterates through all pools managed by the `manager` and
-triggers an individual evaluation for each. Errors during a single pool's
-evaluation are caught, logged, and emitted as events, but do not stop
-the evaluation of other pools.
+  "Evaluates all registered resource pools.
+This is the main function for the periodic evaluation timer. It iterates
+through all pools and triggers an individual evaluation for each one.
 
 Arguments:
 - `manager` (warp-allocator): The allocator manager instance.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Calls `warp-allocator--evaluate-pool` for each pool.
-- May emit `:resource-evaluation-error` events via the event system."
+- May emit `:resource-evaluation-error` events."
   (loom:with-mutex! (warp-allocator-lock manager)
     (maphash (lambda (pool-name pool)
+               ;; Errors in one pool's evaluation should not stop others.
                (condition-case err
                    (warp-allocator--evaluate-pool manager pool-name pool)
                  (error
-                  (when (warp-allocator-event-system manager)
+                  (when-let (es (warp-allocator-event-system manager))
                     (warp:emit-event-with-options
-                     :resource-evaluation-error
+                     es :resource-evaluation-error
                      `(:pool-name ,pool-name :error ,err)
-                     :source-id
-                     (warp-event-system-worker-id
-                      (warp-allocator-event-system manager))
+                     :source-id (warp-allocator-name manager)
                      :distribution-scope :local)))))
              (warp-allocator-pools manager))))
 
 (defun warp-allocator--evaluate-pool (manager pool-name pool)
-  "Evaluates a single resource pool and makes allocation decisions based
-on configured strategies and current metrics. This is the core logic
-for determining whether a pool needs to scale.
+  "Evaluates a single resource pool against configured strategies.
 
 Arguments:
 - `manager` (warp-allocator): The allocator manager.
 - `pool-name` (string): The name of the pool being evaluated.
 - `pool` (warp-resource-pool): The resource pool to evaluate.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
-- May initiate scale-up or scale-down operations by calling
-  `warp-allocator--scale-up` or `warp-allocator--scale-down`.
-- Updates `warp-resource-pool-last-scale-time` if a scaling action
-  is initiated.
-- Logs scaling decisions."
+- May initiate scale-up or scale-down operations."
   (let* ((spec (warp-resource-pool-spec pool))
          (current-capacity (length (warp-resource-pool-active-resources pool)))
          (now (float-time))
@@ -266,22 +222,21 @@ Side Effects:
          (strategy-decision nil)
          (strategy-target-capacity nil))
 
-    ;; Check if we're in cooldown period
+    ;; 1. Check cooldown period to prevent rapid, repeated scaling ("flapping").
     (when (> (- now last-scale) cooldown)
       (let ((metrics (warp-allocator--calculate-pool-metrics pool)))
 
-        ;; 1. Evaluate explicit target capacity from spec first
+        ;; 2. A hardcoded target capacity in the spec takes highest precedence.
         (when (warp-resource-spec-target-capacity spec)
           (setq strategy-decision :target-capacity
                 strategy-target-capacity (warp-resource-spec-target-capacity
                                           spec)))
 
-        ;; 2. Run through strategies to get allocation decision if no
-        ;;    explicit target capacity set
+        ;; 3. If no override, evaluate strategies in order of priority.
         (unless strategy-decision
           (dolist (strategy (warp-allocator-strategies manager))
             (when (and (warp-allocation-strategy-enabled-p strategy)
-                       (not strategy-decision)) ; Only take the first decision
+                       (not strategy-decision))
               (let ((result (funcall
                              (warp-allocation-strategy-decision-fn strategy)
                              pool metrics)))
@@ -292,7 +247,7 @@ Side Effects:
                   ((pred keywordp)
                    (setq strategy-decision result)))))))
 
-        ;; Execute allocation decision
+        ;; 4. Execute the final scaling decision.
         (when strategy-decision
           (pcase strategy-decision
             (:scale-up
@@ -320,20 +275,13 @@ Side Effects:
             (:maintain nil)))))))
 
 (defun warp-allocator--calculate-pool-metrics (pool)
-  "Calculate metrics for a resource pool. This function aggregates basic
-operational data for a given resource pool, such as current capacity,
-pending allocations, and utilization. These metrics are then consumed
-by allocation strategies to make scaling decisions.
+  "Calculate metrics for a resource pool for strategy evaluation.
 
 Arguments:
-- `pool` (warp-resource-pool): The resource pool to calculate metrics for.
+- `pool` (warp-resource-pool): The pool to calculate metrics for.
 
 Returns:
-- (plist): A property list containing the calculated metrics:
-  `:active-count` (integer), `:pending-allocations` (integer),
-  `:pending-deallocations` (integer), `:utilization` (float),
-  `:min-capacity` (integer), `:max-capacity` (integer),
-  `:scale-unit` (integer)."
+- (plist): A property list containing calculated metrics."
   (let* ((active-count (length (warp-resource-pool-active-resources pool)))
          (spec (warp-resource-pool-spec pool))
          (max-cap (warp-resource-spec-max-capacity spec))
@@ -348,34 +296,17 @@ Returns:
       :max-capacity ,max-cap
       :scale-unit ,(warp-resource-spec-scale-unit spec))))
 
-(cl-defun warp-allocator--scale-up (manager
-                                    pool-name
-                                    pool
-                                    &key target-count)
-  "Scales up a resource pool by allocating new resources. This function
-determines the number of resources to add (based on `scale-unit` or
-`target-count` and `max-capacity`) and then asynchronously calls the
-pool's `allocation-fn`. It updates pending allocation counts and records
-the scaling event.
+(cl-defun warp-allocator--scale-up (manager pool-name pool &key target-count)
+  "Scales up a resource pool by allocating new resources.
 
 Arguments:
 - `manager` (warp-allocator): The allocator manager.
 - `pool-name` (string): The name of the pool to scale up.
 - `pool` (warp-resource-pool): The resource pool to scale up.
-- `:target-count` (integer or nil): If provided, scale up to this exact
-  count, respecting `max-capacity`. If `nil`, scale up by `scale-unit`.
+- `:target-count` (integer): If provided, scale up to this exact count.
 
 Returns:
-- (loom-promise): A promise that resolves when the allocation operation
-  completes.
-
-Side Effects:
-- Increments `warp-resource-pool-pending-allocations`.
-- Updates `warp-resource-pool-last-scale-time`.
-- Calls the `warp-resource-spec-allocation-fn` asynchronously.
-- Updates `warp-resource-pool-active-resources` on successful allocation.
-- Emits `:resource-scale-up-initiated` and `:resource-scale-up-completed`
-  or `:resource-allocation-failed` events."
+- (loom-promise): A promise that resolves with the new resources."
   (let* ((spec (warp-resource-pool-spec pool))
          (current-count (length (warp-resource-pool-active-resources pool)))
          (scale-unit (warp-resource-spec-scale-unit spec))
@@ -387,100 +318,63 @@ Side Effects:
          (allocation-count (- final-target current-count)))
 
     (when (> allocation-count 0)
+      ;; Immediately update state to reflect pending allocations.
       (loom:with-mutex! (warp-allocator-lock manager)
         (cl-incf (warp-resource-pool-pending-allocations pool)
                  allocation-count)
         (setf (warp-resource-pool-last-scale-time pool) (float-time)))
 
-      (when (warp-allocator-event-system manager)
+      ;; Emit event that scaling has started.
+      (when-let (es (warp-allocator-event-system manager))
         (warp:emit-event-with-options
-         :resource-scale-up-initiated
-         `(:pool-name ,pool-name
-           :resource-type ,(warp-resource-spec-resource-type spec)
-           :current-count ,current-count
-           :target-count ,final-target
-           :allocated-count ,allocation-count)
-         :source-id (warp-event-system-worker-id
-                     (warp-allocator-event-system manager))
-         :distribution-scope :local))
+         es :resource-scale-up-initiated
+         `(:pool-name ,pool-name :count ,allocation-count)
+         :source-id (warp-allocator-name manager)))
 
-      ;; Execute allocation
+      ;; Asynchronously call the user-provided allocation function.
       (braid! (funcall (warp-resource-spec-allocation-fn spec)
                        allocation-count)
         (:then (lambda (new-resources)
+                 ;; On success, finalize state and emit completion event.
                  (loom:with-mutex! (warp-allocator-lock manager)
                    (cl-decf (warp-resource-pool-pending-allocations pool)
                             allocation-count)
                    (setf (warp-resource-pool-active-resources pool)
                          (append (warp-resource-pool-active-resources pool)
                                  new-resources)))
-                 (when (warp-allocator-event-system manager)
+                 (when-let (es (warp-allocator-event-system manager))
                    (warp:emit-event-with-options
-                    :resource-scale-up-completed
-                    `(:pool-name ,pool-name
-                      :resource-type ,(warp-resource-spec-resource-type spec)
-                      :new-count
-                      ,(length (warp-resource-pool-active-resources pool))
-                      :allocated-resources ,new-resources)
-                    :source-id
-                    (warp-event-system-worker-id
-                     (warp-allocator-event-system manager))
-                    :distribution-scope :local))
+                    es :resource-scale-up-completed
+                    `(:pool-name ,pool-name :resources ,new-resources)
+                    :source-id (warp-allocator-name manager)))
                  new-resources))
         (:catch (lambda (err)
+                  ;; On failure, revert pending state and emit failure event.
                   (loom:with-mutex! (warp-allocator-lock manager)
                     (cl-decf (warp-resource-pool-pending-allocations pool)
                              allocation-count))
-                  (when (warp-allocator-event-system manager)
+                  (when-let (es (warp-allocator-event-system manager))
                     (warp:emit-event-with-options
-                     :resource-allocation-failed
-                     `(:pool-name ,pool-name
-                       :resource-type ,(warp-resource-spec-resource-type spec)
-                       :action :scale-up
-                       :count ,allocation-count
-                       :error ,err)
-                     :source-id
-                     (warp-event-system-worker-id
-                      (warp-allocator-event-system manager))
-                     :distribution-scope :local))
+                     es :resource-allocation-failed
+                     `(:pool-name ,pool-name :error ,err)
+                     :source-id (warp-allocator-name manager)))
                   (loom:rejected!
                    (warp:error! :type 'warp-allocator-error
-                                :message (format "Failed to scale up pool %S: %S"
-                                                 pool-name err)
+                                :message (format "Failed to scale up pool %S"
+                                                 pool-name)
                                 :cause err))))))))
 
-(cl-defun warp-allocator--scale-down (manager
-                                      pool-name
-                                      pool
-                                      &key target-count)
-  "Scales down a resource pool by deallocating resources. This function
-determines the number of resources to remove (based on `scale-unit` or
-`target-count` and `min-capacity`), selects resources to deallocate
-(e.g., least-recently-used, or unhealthy ones), and then asynchronously
-calls the pool's `deallocation-fn`. It updates pending deallocation
-counts and records the scaling event.
+(cl-defun warp-allocator--scale-down (manager pool-name pool &key target-count)
+  "Scales down a resource pool by deallocating resources.
 
 Arguments:
 - `manager` (warp-allocator): The allocator manager.
 - `pool-name` (string): The name of the pool to scale down.
 - `pool` (warp-resource-pool): The resource pool to scale down.
-- `:target-count` (integer or nil): If provided, scale down to this
-  exact count, respecting `min-capacity`. If `nil`, scale down by
-  `scale-unit`.
+- `:target-count` (integer): If provided, scale down to this exact count.
 
 Returns:
-- (loom-promise): A promise that resolves when the deallocation
-  operation completes.
-
-Side Effects:
-- Increments `warp-resource-pool-pending-deallocations`.
-- Updates `warp-resource-pool-last-scale-time`.
-- Calls the `warp-resource-spec-deallocation-fn` asynchronously.
-- Updates `warp-resource-pool-active-resources` on successful
-  deallocation.
-- Emits `:resource-scale-down-initiated` and
-  `:resource-scale-down-completed` or `:resource-deallocation-failed`
-  events."
+- (loom-promise): A promise resolving when deallocation is complete."
   (let* ((spec (warp-resource-pool-spec pool))
          (current-count (length (warp-resource-pool-active-resources pool)))
          (scale-unit (warp-resource-spec-scale-unit spec))
@@ -493,98 +387,77 @@ Side Effects:
          (resources-to-deallocate nil))
 
     (when (> deallocation-count 0)
-      ;; Simple selection: deallocate from the end of the list.
-      ;; A more sophisticated allocator would select based on health,
-      ;; idle time, etc.
+      ;; For now, we deallocate the most recently added resources.
+      ;; A more advanced strategy could select unhealthy or idle resources.
       (setq resources-to-deallocate
             (cl-subseq (warp-resource-pool-active-resources pool)
                        (- current-count deallocation-count)))
 
+      ;; Update state and emit event to signal start of deallocation.
       (loom:with-mutex! (warp-allocator-lock manager)
         (cl-incf (warp-resource-pool-pending-deallocations pool)
                  deallocation-count)
         (setf (warp-resource-pool-last-scale-time pool) (float-time)))
-
-      (when (warp-allocator-event-system manager)
+      (when-let (es (warp-allocator-event-system manager))
         (warp:emit-event-with-options
-         :resource-scale-down-initiated
-         `(:pool-name ,pool-name
-           :resource-type ,(warp-resource-spec-resource-type spec)
-           :current-count ,current-count
-           :target-count ,final-target
-           :deallocated-count ,deallocation-count
+         es :resource-scale-down-initiated
+         `(:pool-name ,pool-name :count ,deallocation-count
            :resources ,resources-to-deallocate)
-         :source-id
-         (warp-event-system-worker-id
-          (warp-allocator-event-system manager))
-         :distribution-scope :local))
+         :source-id (warp-allocator-name manager)))
 
-      ;; Execute deallocation
+      ;; Asynchronously call the user-provided deallocation function.
       (braid! (funcall (warp-resource-spec-deallocation-fn spec)
                        resources-to-deallocate)
         (:then (lambda (_)
+                 ;; On success, finalize state and emit completion event.
                  (loom:with-mutex! (warp-allocator-lock manager)
                    (cl-decf (warp-resource-pool-pending-deallocations pool)
                             deallocation-count)
                    (setf (warp-resource-pool-active-resources pool)
                          (cl-subseq (warp-resource-pool-active-resources pool)
                                     0 final-target)))
-                 (when (warp-allocator-event-system manager)
+                 (when-let (es (warp-allocator-event-system manager))
                    (warp:emit-event-with-options
-                    :resource-scale-down-completed
-                    `(:pool-name ,pool-name
-                      :resource-type ,(warp-resource-spec-resource-type spec)
-                      :new-count
-                      ,(length (warp-resource-pool-active-resources pool))
-                      :deallocated-resources
-                      ,resources-to-deallocate)
-                    :source-id
-                    (warp-event-system-worker-id
-                     (warp-allocator-event-system manager))
-                    :distribution-scope :local))
+                    es :resource-scale-down-completed
+                    `(:pool-name ,pool-name)
+                    :source-id (warp-allocator-name manager)))
                  t))
         (:catch (lambda (err)
+                  ;; On failure, revert pending state and emit failure event.
                   (loom:with-mutex! (warp-allocator-lock manager)
                     (cl-decf (warp-resource-pool-pending-deallocations pool)
                              deallocation-count))
-                  (when (warp-allocator-event-system manager)
+                  (when-let (es (warp-allocator-event-system manager))
                     (warp:emit-event-with-options
-                     :resource-deallocation-failed
-                     `(:pool-name ,pool-name
-                       :resource-type ,(warp-resource-spec-resource-type spec)
-                       :action :scale-down
-                       :count ,deallocation-count
-                       :error ,err)
-                     :source-id
-                     (warp-event-system-worker-id
-                      (warp-allocator-event-system manager))
-                     :distribution-scope :local))
+                     es :resource-deallocation-failed
+                     `(:pool-name ,pool-name :error ,err)
+                     :source-id (warp-allocator-name manager)))
                   (loom:rejected!
                    (warp:error! :type 'warp-allocator-error
-                                :message (format "Failed to scale down pool %S: %S"
-                                                 pool-name err)
+                                :message (format "Failed to scale down pool %S"
+                                                 pool-name)
                                 :cause err))))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;###autoload
-(cl-defun warp:allocator-create (name &key event-system config-options)
-  "Create a new resource allocator manager. This function initializes the
-core structure for managing and scaling different types of resources.
+(cl-defun warp:allocator-create (&rest options)
+  "Create a new resource allocator manager.
 
 Arguments:
-- `name` (string): A unique name for the allocator manager instance.
-- `:event-system` (warp-event-system or nil, optional): An optional
-  reference to the `warp-event-system` for emitting events related to
-  resource allocation decisions and outcomes.
-- `:config-options` (plist, optional): A property list of configuration
-  options for the `warp-allocator-config` struct.
+- `&rest OPTIONS` (plist): A property list of options:
+  - `:name` (string): A unique name for the allocator instance.
+  - `:event-system` (warp-event-system, optional): For emitting events.
+  - `:config-options` (plist, optional): Options for `allocator-config`.
 
 Returns:
 - (warp-allocator): A new, unstarted allocator manager instance."
-  (let ((config (apply #'make-warp-allocator-config config-options))
-        (allocator-name (format "allocator-%s" name)))
+  (let* ((name (plist-get options :name))
+         (event-system (plist-get options :event-system))
+         (config-options (plist-get options :config-options))
+         (config (apply #'make-allocator-config config-options))
+         (allocator-name (format "allocator-%s" name)))
     (%%make-warp-allocator
      :name allocator-name
      :config config
@@ -593,119 +466,104 @@ Returns:
 
 ;;;###autoload
 (defun warp:allocator-register-pool (manager pool-name spec)
-  "Register a new resource pool with the manager. Once registered, the
-manager will periodically evaluate this pool and, if running, initiate
-scaling actions based on its configured strategies.
+  "Register a new resource pool with the manager.
 
 Arguments:
 - `manager` (warp-allocator): The allocator manager instance.
 - `pool-name` (string): A unique name for this resource pool.
-- `spec` (warp-resource-spec): The specification for the resources in
-  this pool.
+- `spec` (warp-resource-spec): The specification for the resources.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
-- Adds the `warp-resource-pool` to the manager's internal `pools` hash
-  table.
-- If an `event-system` is configured, emits a `:resource-pool-registered`
-  event."
+- Adds the pool to the manager's internal `pools` hash table.
+- Emits a `:resource-pool-registered` event if configured."
   (loom:with-mutex! (warp-allocator-lock manager)
     (let ((pool (make-warp-resource-pool :spec spec)))
-      (puthash pool-name pool
-               (warp-allocator-pools manager))
-      (when (warp-allocator-event-system manager)
+      (puthash pool-name pool (warp-allocator-pools manager))
+      (when-let (es (warp-allocator-event-system manager))
         (warp:emit-event-with-options
-         :resource-pool-registered
+         es :resource-pool-registered
          `(:pool-name ,pool-name :spec ,spec)
-         :source-id
-         (warp-event-system-worker-id (warp-allocator-event-system manager))
-         :distribution-scope :local)))))
+         :source-id (warp-allocator-name manager)
+         :distribution-scope :local))))
+  nil)
 
 ;;;###autoload
 (defun warp:allocator-add-strategy (manager strategy)
-  "Add an allocation strategy to the manager. Strategies are evaluated
-in order of their `priority` (higher priority first) to determine
-scaling actions.
+  "Add an allocation strategy to the manager.
 
 Arguments:
 - `manager` (warp-allocator): The allocator manager.
 - `strategy` (warp-allocation-strategy): The strategy to add.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
-- Adds the `warp-allocation-strategy` to the manager's internal
-  `strategies` list and re-sorts the list by priority."
+- Adds the strategy to the manager's `strategies` list and re-sorts it."
   (loom:with-mutex! (warp-allocator-lock manager)
     (push strategy (warp-allocator-strategies manager))
     (setf (warp-allocator-strategies manager)
           (sort (warp-allocator-strategies manager)
-                (lambda (a b) (> (warp-allocation-strategy-priority a)
-                                 (warp-allocation-strategy-priority b)))))))
+                (lambda (a b)
+                  (> (warp-allocation-strategy-priority a)
+                     (warp-allocation-strategy-priority b))))))
+  nil)
 
 ;;;###autoload
 (defun warp:allocator-start (manager)
-  "Start the resource allocator manager. This initiates the periodic
-evaluation loop, where the manager will regularly check resource pools
-and apply scaling strategies.
+  "Start the resource allocator manager's periodic evaluation loop.
 
 Arguments:
 - `manager` (warp-allocator): The allocator manager instance.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Sets the manager's `running-p` flag to `t`.
-- Registers `warp-allocator--evaluate-all` as a periodic task with
-  its `loom-poll` instance."
+- Registers and starts a periodic task with its `loom-poll` instance."
   (loom:with-mutex! (warp-allocator-lock manager)
     (unless (warp-allocator-running-p manager)
       (setf (warp-allocator-running-p manager) t)
-      (loom:poll-register-periodic-task
-       (warp-allocator-poll-instance manager)
-       (intern (format "%s-evaluation-task"
-                       (warp-allocator-name manager)))
-       (lambda () (warp-allocator--evaluate-all manager))
-       :interval (warp-allocator-config-evaluation-interval
-                  (warp-allocator-config manager))
-       :immediate t) ; Run immediately upon start
-      ;; The loom-poll-register-periodic-task itself starts the poll
-      ;; if it's not already running, so no explicit loom:poll-start here.
-      (warp:log! :info (warp-allocator-name manager)
-                 "Allocator started. Evaluation task registered."))))
+      (let ((poller (warp-allocator-poll-instance manager))
+            (interval (allocator-config-evaluation-interval
+                       (warp-allocator-config manager))))
+        (loom:poll-register-periodic-task
+         poller
+         (intern (format "%s-evaluation-task" (warp-allocator-name manager)))
+         (lambda () (warp-allocator--evaluate-all manager))
+         :interval interval
+         :immediate t)
+        (loom:poll-start poller)
+        (warp:log! :info (warp-allocator-name manager)
+                   "Allocator started. Evaluation task registered.")))))
+  nil)
 
 ;;;###autoload
 (defun warp:allocator-stop (manager)
-  "Stop the resource allocator manager. This halts the periodic
-evaluation loop and cleans up the associated `loom-poll` instance.
+  "Stop the resource allocator manager.
 
 Arguments:
 - `manager` (warp-allocator): The allocator manager instance.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Sets the manager's `running-p` flag to `nil`.
-- Unregisters the evaluation task from its `loom-poll` instance.
 - Shuts down its `loom-poll` instance."
   (loom:with-mutex! (warp-allocator-lock manager)
     (when (warp-allocator-running-p manager)
       (setf (warp-allocator-running-p manager) nil)
       (let ((task-id (intern (format "%s-evaluation-task"
-                                      (warp-allocator-name manager))))
+                                     (warp-allocator-name manager))))
             (poll-instance (warp-allocator-poll-instance manager)))
         (when poll-instance
           (loom:poll-unregister-periodic-task poll-instance task-id)
-          ;; Shut down the dedicated poll instance
           (loom:poll-shutdown poll-instance)
           (setf (warp-allocator-poll-instance manager) nil)))
       (warp:log! :info (warp-allocator-name manager)
                  "Allocator stopped. Poll instance shut down."))))
+  nil)
 
 (provide 'warp-allocator)
 ;;; warp-allocator.el ends here
