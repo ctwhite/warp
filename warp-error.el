@@ -41,8 +41,7 @@
 ;;; Error Definitions
 
 (define-error 'warp-error
-  "A generic error occurred in the Warp framework."
-  'loom-error)
+  "A generic error occurred in the Warp framework.")
 
 (define-error 'warp-init-failure
   "A critical error occurred during Warp system initialization."

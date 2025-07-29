@@ -1,5 +1,4 @@
-;;; warp-env.el --- Consistent Environment Variable Management for Warp -*-
-;;; lexical-binding: t; -*-
+;;; warp-env.el --- Consistent Environment Variable Management for Warp -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
@@ -17,9 +16,6 @@
 ;;     environment variables in one place.
 ;; 3.  **Refactorability**: If an environment variable's string name
 ;;     needs to change, it can be updated in a single location.
-;; 4.  **Consolidated Logic**: Includes the `warp:load-worker-config`
-;;     function, which centralizes the logic for parsing these
-;;     environment variables into a structured worker configuration object.
 
 ;;; Code:
 
@@ -38,15 +34,16 @@
   Fields:
   - `ipc-id` (string): The key for the unique identifier for this process.
   - `worker-id` (string): The key for the worker's unique identifier.
-  - `worker-rank` (string): The key for a worker's assigned numerical rank.
-  - `master-contact` (string): The key for the network address of the master.
-  - `log-channel` (string): The key for the address of a centralized log server.
-  - `cluster-id` (string): The key for the ID of the cluster the worker belongs to.
-  - `security-level` (string): The key indicating the worker's security policy.
-  - `max-requests` (string): The key for the max concurrent requests a worker handles.
-  - `launch-id` (string): The key for a unique ID assigned to a launch attempt.
-  - `launch-token` (string): The key for a cryptographic token for authentication.
-  - `worker-transport-options` (string): The key for serialized transport options."
+  - `worker-rank` (string): The key for a worker's assigned rank.
+  - `master-contact` (string): The key for the master's network address.
+  - `log-channel` (string): The key for the centralized log server address.
+  - `cluster-id` (string): The key for the ID of the worker's cluster.
+  - `security-level` (string): The key for the worker's security policy.
+  - `max-requests` (string): The key for the worker's max concurrent requests.
+  - `launch-id` (string): The key for a unique ID for a launch attempt.
+  - `launch-token` (string): The key for a cryptographic auth token.
+  - `worker-transport-options` (string): The key for serialized transport
+    options for the worker's connection back to the master."
   (ipc-id "WARP_IPC_ID" :type string :read-only t)
   (worker-id "WARP_WORKER_ID" :type string :read-only t)
   (worker-rank "WARP_WORKER_RANK" :type string :read-only t)
@@ -57,7 +54,8 @@
   (max-requests "WARP_MAX_REQUESTS" :type string :read-only t)
   (launch-id "WARP_LAUNCH_ID" :type string :read-only t)
   (launch-token "WARP_LAUNCH_TOKEN" :type string :read-only t)
-  (worker-transport-options "WARP_WORKER_TRANSPORT_OPTIONS" :type string :read-only t))
+  (worker-transport-options "WARP_WORKER_TRANSPORT_OPTIONS"
+                            :type string :read-only t))
 
 (defvar warp--env-config (%%make-warp-env-config)
   "A singleton instance of `warp-env-config`.")
@@ -67,7 +65,7 @@
 
 ;;;###autoload
 (defmacro warp:env (env-key-symbol)
-  "A macro to safely access the **string name** of a Warp environment variable.
+  "A macro to safely access the **string name** of a Warp env variable.
 This should be used when constructing the environment list for child
 processes to ensure canonical keys are used.
 
@@ -91,7 +89,6 @@ Returns:
 - (string or nil): The string value of the variable, or `nil` if not set."
   (getenv (cl-struct-slot-value 'warp-env-config env-key-symbol
                                 warp--env-config)))
-
 
 (provide 'warp-env)
 ;;; warp-env.el ends here

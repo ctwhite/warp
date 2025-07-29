@@ -438,11 +438,11 @@ Returns:
 
       ;; 2. Verify the worker's cryptographic signature.
       (let* ((data-to-verify (format "%s:%s" worker-id received-token))
-            (valid-p (ignore-errors
+             (valid-p (ignore-errors
                         (warp:crypto-verify-signature
-                        data-to-verify
-                        (warp:crypto-base64url-decode worker-sig)
-                        worker-pub-key))))
+                         data-to-verify
+                         (warp:crypto-base64url-decode worker-sig)
+                         worker-pub-key))))
         (unless valid-p
           (warp:log! :warn "warp-process" "Worker signature failed for %s."
                     worker-id))

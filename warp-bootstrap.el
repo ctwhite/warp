@@ -31,17 +31,12 @@
 (require 'warp-cluster)
 (require 'warp-component)
 
-;; Forward declarations
-(declare-function loom:init "loom")
-(declare-function loom:shutdown "loom")
-(declare-function warp:component-system-create "warp-component")
-(declare-function warp:defcomponent "warp-component")
-(declare-function warp:cluster-create "warp-cluster")
-(declare-function warp:cluster-start "warp-cluster")
-(declare-function warp:cluster-wait-for-ready "warp-cluster")
-
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; 1. Component System Assembly
+;;; Public API
+
+;;----------------------------------------------------------------------
+;;; Component System Assembly
+;;----------------------------------------------------------------------
 
 ;;;###autoload
 (cl-defmacro warp:bootstrap-system (&key name context definitions)
@@ -74,11 +69,12 @@ Side Effects:
                 collect `(warp:defcomponent system ,def))
      system))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; 2. Application Lifecycle Management
+;;----------------------------------------------------------------------
+;;; Application Lifecycle Management
+;;----------------------------------------------------------------------
 
 ;;;###autoload
-(cl-defun warp:init ()
+(defun warp:init ()
   "Initialize the core libraries (Loom) that Warp depends on.
 This function serves as the single, top-level entry point for any user
 application or script that intends to use the Warp framework.
@@ -90,7 +86,7 @@ Returns: `t`."
   t)
 
 ;;;###autoload
-(cl-defun warp:shutdown ()
+(defun warp:shutdown ()
   "Shut down the core libraries (Loom) that Warp depends on.
 
 Returns: `nil`."

@@ -53,7 +53,7 @@
 
 (define-error 'warp-exec-error
   "Generic error for `warp-exec` operations."
-  'warp-errors-base-error)
+  'warp-error)
 
 (define-error 'warp-exec-timeout
   "Code execution timed out."
@@ -75,24 +75,16 @@
 
 Fields:
 - `max-execution-time` (float): Maximum execution time in seconds for
-  code evaluation. This acts as a safeguard against infinite loops or
-  resource-exhaustion attacks in executed code.
-- `max-memory-usage` (integer): Maximum memory usage in bytes for code
-  execution.
-- `max-allocation-count` (integer): Maximum number of object
-  allocations during execution.
-- `require-signatures-strict` (boolean): If non-nil, the `:strict`
-  policy requires a valid digital signature. When this is enabled, any
-  `warp-secure-form` must be signed by a key trusted by the worker to
-  be executed. This relies on `warp--worker-get-public-key-string`
-  being defined and returning the worker's public key.
-- `enable-cache` (boolean): If non-nil, cache validated forms for
-  improved performance.
+  code evaluation.
+- `max-memory-usage` (integer): Maximum memory usage in bytes.
+- `max-allocation-count` (integer): Maximum object allocations.
+- `require-signatures-strict` (boolean): If `t`, the `:strict` policy
+  requires a valid digital signature on a `warp-secure-form`.
+- `enable-cache` (boolean): If `t`, cache validated forms.
 - `cache-max-size` (integer): Maximum number of forms to cache.
-- `enable-metrics` (boolean): If non-nil, collect execution metrics
-  and statistics.
-- `audit-level` (keyword): Level of audit logging: `:minimal`,
-  `:normal`, `:verbose`, or `:debug`."
+- `enable-metrics` (boolean): If `t`, collect execution metrics.
+- `audit-level` (keyword): Level of audit logging (`:minimal`,
+  `:normal`, `:verbose`, or `:debug`)."
   (max-execution-time 30.0 :type float :validate (> $ 0.0))
   (max-memory-usage (* 50 1024 1024) :type integer :validate (> $ 0))
   (max-allocation-count 100000 :type integer :validate (> $ 0))
@@ -163,8 +155,7 @@ list of allowed functions.")
   "Statistics for cache performance (hits, misses, evictions).")
 
 (defvar warp-exec--active-contexts (make-hash-table :test 'equal)
-  "Hash table of currently active execution contexts. Maps audit-ID
-to `warp-execution-context`.")
+  "Hash table of active execution contexts. Maps audit-ID to context.")
 
 (defvar warp-exec--global-metrics
   '(:total-executions 0
@@ -188,25 +179,17 @@ for execution under policies like `:ultra-strict` or `:strict`.
 
 Fields:
 - `form` (t): The actual Lisp S-expression to be evaluated.
-- `signature` (string or nil): Optional digital signature of the form
-  for authenticity.
-- `allowed-functions` (list): A specific whitelist of symbols this
-  `form` may call.
-- `required-capabilities` (list): A list of capabilities (keywords)
-  required by this form for execution.
-- `namespace-whitelist` (list): A list of allowed symbol namespaces
-  (strings or symbols) for functions called by the form.
-- `context` (string or nil): Optional string describing the form's
-  origin or purpose.
-- `hash` (string or nil): SHA-256 hash of the form for integrity
-  checking.
+- `signature` (string): Optional digital signature of the form.
+- `allowed-functions` (list): A specific whitelist of symbols.
+- `required-capabilities` (list): A list of capabilities required.
+- `namespace-whitelist` (list): A list of allowed symbol namespaces.
+- `context` (string): Optional string describing the form's origin.
+- `hash` (string): SHA-256 hash of the form for integrity checking.
 - `priority` (symbol): Execution priority (`:normal`, `:high`, etc.).
-- `max-execution-time` (float or nil): Custom timeout in seconds for
-  this specific form's evaluation.
-- `max-memory` (integer or nil): Custom maximum memory usage in bytes
-  for this form's execution.
-- `cached-validation` (boolean or nil): Internal flag indicating if
-  this form was validated from cache."
+- `max-execution-time` (float): Custom timeout in seconds for this form.
+- `max-memory` (integer): Custom maximum memory usage in bytes.
+- `cached-validation` (boolean): Internal flag indicating if this form
+  was validated from cache."
   (form nil :type t :json-key "form")
   (signature nil :type (or null string) :json-key "signature")
   (allowed-functions nil :type list :json-key "allowedFunctions")
@@ -229,10 +212,8 @@ security policy, acting as a deliberate declaration of trust.
 
 Fields:
 - `form` (t): The Lisp S-expression to be evaluated.
-- `context` (string or nil): Optional string about the form's origin or
-  purpose.
-- `trusted-source` (string or nil): A string identifying the trusted
-  source."
+- `context` (string): Optional string about the form's origin or purpose.
+- `trusted-source` (string): A string identifying the trusted source."
   (form nil :type t :json-key "form")
   (context nil :type (or null string) :json-key "context")
   (trusted-source nil :type (or null string) :json-key "trustedSource"))
@@ -244,17 +225,12 @@ Fields:
   "Execution context with resource monitoring and capabilities.
 
 Fields:
-- `start-time` (list or nil): Emacs `current-time` when execution began.
-- `memory-baseline` (integer or nil): Baseline memory usage in bytes
-  before execution.
-- `allocation-count` (integer): Number of allocations made during
-  execution (conceptual).
-- `granted-capabilities` (list): A list of capabilities granted to this
-  execution context.
-- `audit-id` (string or nil): Unique identifier for this execution
-  session for auditing.
-- `thread-id` (string or nil): Identifier of the thread executing the
-  code."
+- `start-time` (list): `current-time` when execution began.
+- `memory-baseline` (integer): Baseline memory usage before execution.
+- `allocation-count` (integer): Allocations made during execution.
+- `granted-capabilities` (list): Capabilities granted to this context.
+- `audit-id` (string): Unique identifier for this execution session.
+- `thread-id` (string): Identifier of the executing thread."
   (start-time nil :type (or null list) :json-key "startTime")
   (memory-baseline nil :type (or null integer) :json-key "memoryBaseline")
   (allocation-count 0 :type integer :json-key "allocationCount")
@@ -269,14 +245,12 @@ Fields:
   "Metrics collected during code execution.
 
 Fields:
-- `execution-time` (float): Total time taken for execution in seconds.
-- `memory-used` (integer): Total memory used by the execution in bytes.
+- `execution-time` (float): Total time for execution in seconds.
+- `memory-used` (integer): Total memory used in bytes.
 - `allocations-made` (integer): Number of object allocations made.
-- `functions-called` (list or nil): List of unique functions called.
-- `security-violations` (list or nil): List of security violations
-  detected during execution.
-- `result-type` (symbol or nil): Type of the value returned by the
-  executed form.
+- `functions-called` (list): List of unique functions called.
+- `security-violations` (list): List of security violations detected.
+- `result-type` (symbol): Type of the value returned by the form.
 - `cache-hit` (boolean): True if validation used a cached result."
   (execution-time 0.0 :type float :json-key "executionTime")
   (memory-used 0 :type integer :json-key "memoryUsed")
@@ -295,34 +269,25 @@ Fields:
 
 (defun warp-exec--cache-key (form-hash signature)
   "Generate a unique cache key from a form's hash and its signature.
-This key is used to store and retrieve validation results, ensuring
-that the cache correctly differentiates between different forms and
-different signatures.
 
 Arguments:
-- `form-hash` (string or nil): The SHA-256 hash of the Lisp form.
-- `signature` (string or nil): The digital signature string.
+- `FORM-HASH` (string): The hash of the form.
+- `SIGNATURE` (string): The signature of the form.
 
 Returns:
-- (string): A unique string suitable for use as a hash table key."
+- (string): A unique key for use in the cache hash table."
   (format "%s:%s" (or form-hash "") (or signature "")))
 
 (defun warp-exec--cache-get (key config)
   "Retrieve a cached validation result.
-If caching is enabled and a result is found for the given key, it is
-returned. Cache hit statistics are updated.
 
 Arguments:
-- `key` (string): The cache key generated by `warp-exec--cache-key`.
-- `config` (exec-config): The current execution configuration.
+- `KEY` (string): The cache key.
+- `CONFIG` (exec-config): The current execution configuration.
 
 Returns:
-- (plist or nil): The cached validation result (a plist) if found and
-  caching is enabled, otherwise `nil`.
-
-Side Effects:
-- Increments `warp-exec--cache-stats :hits` if a cached result is found."
-  (when (warp-exec-config-enable-cache config)
+- The cached validation result, or `nil` if not found or disabled."
+  (when (exec-config-enable-cache config)
     (let ((result (gethash key warp-exec--validation-cache)))
       (when result
         (cl-incf (plist-get warp-exec--cache-stats :hits))
@@ -330,57 +295,46 @@ Side Effects:
 
 (defun warp-exec--cache-put (key validation-result config)
   "Store a validation result in the cache.
-If caching is enabled, the result is stored with a timestamp. If the
-cache size limit is reached, older entries are evicted. Cache miss
-statistics are updated.
 
 Arguments:
-- `key` (string): The cache key.
-- `validation-result` (plist): The result of the validation process,
-  which is a plist of details about the form's safety.
-- `config` (exec-config): The current execution configuration.
+- `KEY` (string): The cache key.
+- `VALIDATION-RESULT` (any): The result of the validation to store.
+- `CONFIG` (exec-config): The current execution configuration.
 
 Returns:
 - `nil`.
 
 Side Effects:
-- Adds an entry to `warp-exec--validation-cache`.
-- May trigger `warp-exec--cache-evict-oldest` if cache capacity is
-  exceeded.
-- Updates `warp-exec--cache-stats :misses` and `warp-exec--cache-stats
-  :evictions`."
-  (when (warp-exec-config-enable-cache config)
+- Puts the result into `warp-exec--validation-cache`.
+- May evict old entries if the cache is full."
+  (when (exec-config-enable-cache config)
     (when (>= (hash-table-count warp-exec--validation-cache)
-              (warp-exec-config-cache-max-size config))
+              (exec-config-cache-max-size config))
       (warp-exec--cache-evict-oldest)
       (cl-incf (plist-get warp-exec--cache-stats :evictions)))
     (puthash key (cons (current-time) validation-result)
              warp-exec--validation-cache)
-    (cl-incf (plist-get warp-exec--cache-stats :misses))))
+    (cl-incf (plist-get warp-exec--cache-stats :misses)))
+  nil)
 
 (defun warp-exec--cache-evict-oldest ()
   "Evict a small batch of the oldest entries from the cache.
-This is a simple Least Recently Used (LRU) approximate eviction
-strategy. It finds the oldest few entries and removes them to make
-space for new ones when the cache hits its maximum size.
 
-Arguments: None.
+Arguments:
+- None.
 
-Returns: `nil`.
+Returns:
+- `nil`.
 
 Side Effects:
-- Modifies `warp-exec--validation-cache` by removing entries."
+- Removes up to 100 of the oldest entries from the cache."
   (let ((oldest-keys '())
         (oldest-time (current-time)))
-    ;; Iterate through the cache to find the entries with the oldest timestamps.
     (maphash (lambda (key value)
                (when (time-less-p (car value) oldest-time)
                  (setq oldest-time (car value))
                  (push key oldest-keys)))
              warp-exec--validation-cache)
-    ;; Evict a small batch (e.g., 10%) of the oldest items to free up space.
-    ;; `(min 100 (length oldest-keys))` ensures we don't try to evict more
-    ;; than 100 items or more than currently exist.
     (dolist (key (cl-subseq oldest-keys 0 (min 100 (length oldest-keys))))
       (remhash key warp-exec--validation-cache))))
 
@@ -390,93 +344,80 @@ Side Effects:
 
 (defun warp-exec--compute-form-hash (form)
   "Compute the SHA-256 hash of a Lisp form for integrity checking.
-The form is first converted to a canonical string representation to
-ensure consistent hashing.
 
 Arguments:
-- `form` (t): The Lisp S-expression to hash.
+- `FORM` (any): The Lisp s-expression.
 
 Returns:
-- (string): The SHA-256 hash digest as a hexadecimal string."
+- (string): The SHA-256 hash of the form's printed representation."
   (warp:crypto-hash (prin1-to-string form) 'sha256))
 
 (defun warp-exec--verify-signature (form public-key-getter)
   "Verify the digital signature of a `warp-secure-form`.
-This function extracts the signed content (canonical form string) and
-the signature from `form`, then uses the provided `public-key-getter`
-function to obtain the public key for verification.
 
 Arguments:
-- `form` (warp-secure-form): The secure form with `form` and `signature`
-    fields.
-- `public-key-getter` (function): A nullary function that returns the
-    public key string (ASCII-armored GPG block) used for verification.
-    This function is typically provided by the worker's key manager.
+- `FORM` (warp-secure-form): The secure form object.
+- `PUBLIC-KEY-GETTER` (function): A function that returns the public key.
 
 Returns:
 - `t` if the signature is valid.
 
+Side Effects:
+- None.
+
 Signals:
-- `warp-exec-security-violation`: If the form has no signature, the
-    public key cannot be obtained, or if the signature verification
-    fails cryptographically."
+- `warp-exec-security-violation`: If the signature is missing, the key
+  is unavailable, or verification fails."
   (let* ((signature (warp-secure-form-signature form))
          (public-key (funcall public-key-getter)))
     (unless signature
       (signal (warp:error! :type 'warp-exec-security-violation
                            :message "Form has no signature.")))
     (unless public-key
-      (signal (warp:error! :type 'warp-exec-security-violation
-                           :message "Public key not available for verification.")))
-    (unless (warp:crypto-verify-signature (prin1-to-string
-                                           (warp-secure-form-form form))
-                                          (warp:crypto-base64url-decode
-                                           signature)
-                                          public-key)
+      (signal (warp:error!
+               :type 'warp-exec-security-violation
+               :message "Public key not available for verification.")))
+    (unless (warp:crypto-verify-signature
+             (prin1-to-string (warp-secure-form-form form))
+             (warp:crypto-base64url-decode signature)
+             public-key)
       (signal (warp:error! :type 'warp-exec-security-violation
                            :message "Digital signature verification failed.")))))
 
 (defun warp-exec--validate-form-integrity (form-obj)
   "Validate the integrity of a `warp-secure-form` using its hash.
-If the form has a hash field, this function recomputes the hash of the
-form's content and compares it against the stored hash. This detects
-any tampering.
 
 Arguments:
-- `form-obj` (warp-secure-form): The secure form to validate.
+- `FORM-OBJ` (warp-secure-form): The secure form object.
 
 Returns:
-- `t` if hash is missing or matches.
+- `t` if the hash matches.
+
+Side Effects:
+- None.
 
 Signals:
 - `warp-exec-security-violation`: If the computed hash does not match
-  the stored hash, indicating tampering."
+  the hash stored in the form object."
   (when-let (stored-hash (warp-secure-form-hash form-obj))
     (let ((computed-hash (warp-exec--compute-form-hash
                           (warp-secure-form-form form-obj))))
       (unless (string= stored-hash computed-hash)
-        (signal (warp:error! :type 'warp-exec-security-violation
-                             :message "Form integrity check failed (hash mismatch)."
-                             :context `(:expected ,stored-hash
-                                        :computed ,computed-hash)))))
-    t))
+        (signal (warp:error!
+                 :type 'warp-exec-security-violation
+                 :message "Form integrity check failed (hash mismatch)."
+                 :context `(:expected ,stored-hash
+                            :computed ,computed-hash))))))
+  t)
 
 (defun warp-exec--analyze-form-complexity (form)
   "Analyze the complexity and potential risk factors of a Lisp form.
-This function recursively traverses the form, calculating its depth,
-node count, function call count, and identifying potentially risky
-built-in functions (`eval`, `load`, `call-process`). A higher
-complexity score indicates a potentially more resource-intensive or
-risky form.
 
 Arguments:
-- `form` (t): The Lisp S-expression to analyze.
+- `FORM` (any): The Lisp s-expression to analyze.
 
 Returns:
-- (plist): A property list containing complexity metrics:
-  `:depth` (integer), `:node-count` (integer), `:function-calls`
-  (integer), `:risky-patterns` (list of symbols), and
-  `:complexity-score` (integer)."
+- (plist): A property list with complexity metrics."
   (let ((depth 0)
         (node-count 0)
         (function-calls 0)
@@ -484,73 +425,53 @@ Returns:
     (cl-labels ((analyze (expr level)
                   (setq depth (max depth level))
                   (cl-incf node-count)
-
                   (cond
                    ((symbolp expr)
                     (when (fboundp expr)
                       (cl-incf function-calls)
-                      ;; Check for potentially risky built-in functions.
                       (when (string-match-p
                              "\\(eval\\|load\\|require\\|call-process\\)"
                              (symbol-name expr))
                         (push expr risky-patterns))))
-
                    ((consp expr)
-                    ;; Recursively analyze car and cdr of the cons cell.
                     (analyze (car expr) (1+ level))
                     (when (cdr expr)
                       (if (consp (cdr expr))
                           (mapc (lambda (x) (analyze x (1+ level))) (cdr expr))
                         (analyze (cdr expr) (1+ level))))))))
       (analyze form 0)
-      ;; Compute a simple heuristic score based on various metrics.
       `(:depth ,depth
         :node-count ,node-count
         :function-calls ,function-calls
         :risky-patterns ,(cl-remove-duplicates risky-patterns)
         :complexity-score ,(+ depth (* 0.1 node-count) (* 2 function-calls)
-                             (* 10 (length risky-patterns)))))))
+                            (* 10 (length risky-patterns)))))))
 
 (defun warp-exec--namespace-allowed-p (symbol namespace-whitelist)
   "Check if a symbol is allowed based on namespace rules.
-This function verifies if the symbol's name starts with any of the
-prefixes specified in the `namespace-whitelist`. This provides a
-coarser-grained control than a full whitelist, allowing all functions
-within certain Emacs Lisp namespaces (e.g., `cl-`, `s-`).
 
 Arguments:
-- `symbol` (symbol): The symbol to check (e.g., `'cl-mapcar`).
-- `namespace-whitelist` (list): A list of strings or symbols
-  representing allowed namespace prefixes (e.g., '(\"cl-\" \"s-\")).
+- `SYMBOL` (symbol): The symbol to check.
+- `NAMESPACE-WHITELIST` (list): A list of allowed symbol prefixes.
 
 Returns:
-- (boolean): `t` if the symbol's name begins with an allowed namespace
-  prefix, `nil` otherwise. Returns `t` if `namespace-whitelist` is `nil`
-  (meaning no namespace restrictions apply)."
+- `t` if the symbol's name starts with one of the whitelisted prefixes."
   (or (null namespace-whitelist)
       (cl-some (lambda (ns)
                  (string-prefix-p (format "%s" ns) (symbol-name symbol)))
                namespace-whitelist)))
 
 (defun warp-exec--scan-form (form whitelist namespace-whitelist)
-  "Recursively scan a Lisp form for non-whitelisted functions and namespace
-violations. This is a static analysis step to identify disallowed calls.
+  "Recursively scan a Lisp form for non-whitelisted functions and
+namespace violations.
 
 Arguments:
-- `form` (t): The Lisp S-expression to scan.
-- `whitelist` (list): A list of allowed function/macro symbols (e.g.,
-  `'car`, `'cdr`).
-- `namespace-whitelist` (list): A list of allowed symbol namespaces
-  (strings or symbols).
+- `FORM` (any): The Lisp s-expression to scan.
+- `WHITELIST` (list): A list of allowed function symbols.
+- `NAMESPACE-WHITELIST` (list): A list of allowed namespace prefixes.
 
 Returns:
-- (plist): A property list containing detected violations and functions
-  called:
-  `:violations` (list of plists, e.g., `((:type :not-whitelisted :symbol X))`
-  or `((:type :namespace-violation :symbol Y))`), and `:called-functions`
-  (list of symbols unique functions found).
-
-Side Effects: None."
+- (plist): A property list containing `:violations` and `:called-functions`."
   (let ((violations '())
         (called-functions '()))
     (cl-labels ((scan (expr)
@@ -564,10 +485,8 @@ Side Effects: None."
                         (push `(:type :not-whitelisted :symbol ,expr)
                               violations))))
                    ((consp expr)
-                    (scan (car expr)) ;; Scan the function/operator position
+                    (scan (car expr))
                     (when (cdr expr)
-                      ;; Scan arguments. If cdr is a list, map over elements.
-                      ;; If not a list (e.g., dotted pair), scan directly.
                       (if (consp (cdr expr))
                           (mapc #'scan (cdr expr))
                         (scan (cdr expr))))))))
@@ -577,26 +496,22 @@ Side Effects: None."
 
 (defun warp-exec--create-execution-context (capabilities config)
   "Create a new execution context with resource monitoring enabled.
-This context tracks execution time, memory usage, and allocations for a
-single code evaluation session.
 
 Arguments:
-- `capabilities` (list): A list of capabilities (keywords) granted to
-  this context, representing specific permissions (e.g., `:file-read`).
-- `config` (exec-config): The current execution configuration.
+- `CAPABILITIES` (list): A list of capabilities to grant this context.
+- `CONFIG` (exec-config): The current execution configuration.
 
 Returns:
-- (warp-execution-context): A new execution context struct.
+- (warp-execution-context): The newly created context object.
 
 Side Effects:
-- Registers the new context in `warp-exec--active-contexts` for tracking.
-- Logs context creation."
-  (let* ((audit-id (format "exec-%d-%s" (emacs-pid) (uuidgen)))
+- Registers the new context in the `warp-exec--active-contexts` table."
+  (let* ((audit-id (format "exec-%d-%s%04x" (emacs-pid)
+                           (format-time-string "%s") (random 65536)))
          (context (warp-execution-context-create
                    :start-time (current-time)
-                   ;; Get current total memory usage as baseline.
                    :memory-baseline (nth 1 (memory-use-counts))
-                   :allocation-count 0 ;; Reset for new context
+                   :allocation-count 0
                    :granted-capabilities capabilities
                    :audit-id audit-id
                    :thread-id (format "%S" (current-thread)))))
@@ -607,79 +522,61 @@ Side Effects:
 
 (defun warp-exec--monitor-resources (context config)
   "Monitor resource usage during execution.
-This function is called periodically (via a timer) to check if the
-executing code has exceeded configured memory or allocation limits.
-It signals errors immediately if limits are breached.
+This function is called periodically by a timer.
 
 Arguments:
-- `context` (warp-execution-context): The execution context to monitor.
-- `config` (exec-config): The current execution configuration.
-
-Returns: `nil`.
-
-Signals:
-- `warp-exec-resource-limit-exceeded`: If memory or allocation limits
-  are breached, causing the execution to be terminated."
-  (let* ((current-memory (nth 1 (memory-use-counts))) ; Total memory
-         (baseline (warp-execution-context-memory-baseline context))
-         (memory-diff (- current-memory baseline)))
-
-    ;; Check memory usage against the configured limit.
-    (when (> memory-diff (warp-exec-config-max-memory-usage config))
-      (signal 'warp-exec-resource-limit-exceeded
-              (warp:error!
-               :type 'warp-exec-resource-limit-exceeded
-               :message (format "Memory limit exceeded (%.1fMB/%sMB)"
-                                (/ (float memory-diff) 1024 1024)
-                                (/ (float (warp-exec-config-max-memory-usage
-                                           config)) 1024 1024))
-               :context `(:limit ,(warp-exec-config-max-memory-usage config)
-                          :used ,memory-diff
-                          :audit-id ,(warp-execution-context-audit-id
-                                      context)))))
-
-    ;; Conceptually, increment allocation count.
-    ;; In a high-fidelity system, this would require instrumenting `cons`, etc.
-    ;; For this example, it's a simple, approximate counter.
-    (setf (warp-execution-context-allocation-count context)
-          (1+ (warp-execution-context-allocation-count context)))
-
-    ;; Check allocation count against the configured limit.
-    (when (> (warp-execution-context-allocation-count context)
-             (warp-exec-config-max-allocation-count config))
-      (signal 'warp-exec-resource-limit-exceeded
-              (warp:error!
-               :type 'warp-exec-resource-limit-exceeded
-               :message "Allocation limit exceeded"
-               :context `(:limit ,(warp-exec-config-max-allocation-count config)
-                          :audit-id ,(warp-execution-context-audit-id
-                                      context)))))))
-
-(defmacro warp-exec--with-resource-monitoring (seconds context config &rest body)
-  "Execute `BODY` with resource monitoring and an overall execution timeout.
-This macro sets up two critical safeguards:
-1. A main timer that will interrupt execution if `seconds` passes.
-2. A periodic monitoring timer that calls `warp-exec--monitor-resources`
-   to check for memory and allocation limits.
-It ensures that all timers are cancelled and the `context` is
-deregistered from `warp-exec--active-contexts` upon completion or error.
-
-Arguments:
-- `seconds` (float): The maximum time allowed for the execution of `BODY`.
-- `context` (warp-execution-context): The execution context created for
-  this run, used to track resources and for auditing.
-- `config` (exec-config): The current execution configuration, providing
-  the resource limits.
-- `body` (forms): The Lisp forms to execute under monitoring.
+- `CONTEXT` (warp-execution-context): The context being monitored.
+- `CONFIG` (exec-config): The current execution configuration.
 
 Returns:
-- The result of `BODY`'s evaluation.
+- `nil`.
 
-Signals:
-- `warp-exec-timeout`: If the execution times out.
-- `warp-exec-resource-limit-exceeded`: If memory or allocation limits
-  are breached by `warp-exec--monitor-resources`.
-- Any other error signaled by `BODY` during its execution."
+Side Effects:
+- May signal a `warp-exec-resource-limit-exceeded` error."
+  (let* ((current-memory (nth 1 (memory-use-counts)))
+         (baseline (warp-execution-context-memory-baseline context))
+         (memory-diff (- current-memory baseline)))
+    (when (> memory-diff (exec-config-max-memory-usage config))
+      (signal 'warp-exec-resource-limit-exceeded
+              (list
+               (warp:error!
+                :type 'warp-exec-resource-limit-exceeded
+                :message (format "Memory limit exceeded (%.1fMB/%.1fMB)"
+                                 (/ (float memory-diff) 1024 1024)
+                                 (/ (float (exec-config-max-memory-usage
+                                            config)) 1024 1024))
+                :context `(:limit ,(exec-config-max-memory-usage config)
+                           :used ,memory-diff
+                           :audit-id ,(warp-execution-context-audit-id
+                                       context))))))
+    (setf (warp-execution-context-allocation-count context)
+          (1+ (warp-execution-context-allocation-count context)))
+    (when (> (warp-execution-context-allocation-count context)
+             (exec-config-max-allocation-count config))
+      (signal 'warp-exec-resource-limit-exceeded
+              (list
+               (warp:error!
+                :type 'warp-exec-resource-limit-exceeded
+                :message "Allocation limit exceeded"
+                :context `(:limit ,(exec-config-max-allocation-count config)
+                           :audit-id ,(warp-execution-context-audit-id
+                                       context))))))))
+
+(defmacro warp-exec--with-resource-monitoring (seconds context config &rest body)
+  "Execute `BODY` with resource monitoring and an overall timeout.
+This macro sets up two timers that race against the execution of `BODY`:
+1. A one-shot timer for the total allowed execution time.
+2. A periodic timer that calls `warp-exec--monitor-resources`.
+It ensures timers and context are cleaned up regardless of outcome.
+
+Arguments:
+- `SECONDS` (float): The total execution timeout.
+- `CONTEXT` (warp-execution-context): The context for this execution.
+- `CONFIG` (exec-config): The current execution configuration.
+- `&rest BODY` (forms): The code to execute.
+
+Returns:
+- The result of `BODY`."
   (declare (indent 2))
   (let ((timer-var (make-symbol "timer"))
         (monitor-timer-var (make-symbol "monitor-timer"))
@@ -689,44 +586,35 @@ Signals:
            (,exception-var nil))
        (unwind-protect
            (progn
-             ;; Set up the main execution timeout timer.
+             ;; Set a one-shot timer for the overall execution timeout.
              (setq ,timer-var
-                   (run-at-time ,seconds nil
-                                (lambda ()
-                                  ;; If the timer fires, set an exception
-                                  ;; flag that will be checked after `body` runs.
-                                  (setq ,exception-var
-                                        (warp:error!
-                                         :type 'warp-exec-timeout
-                                         :message (format "Timeout after %s seconds"
-                                                          ,seconds)
-                                         :context `(:audit-id
-                                                    ,(warp-execution-context-audit-id
-                                                      ,context)))))))
-
-             ;; Set up the periodic resource monitoring timer.
-             ;; It runs every 0.1 seconds to check memory/allocations.
+                   (run-at-time
+                    ,seconds nil
+                    (lambda ()
+                      (setq ,exception-var
+                            (warp:error!
+                             :type 'warp-exec-timeout
+                             :message (format "Timeout after %s seconds"
+                                              ,seconds)
+                             :context `(:audit-id
+                                        ,(warp-execution-context-audit-id
+                                          ,context)))))))
+             ;; Set a periodic timer for fine-grained resource monitoring.
              (setq ,monitor-timer-var
-                   (run-with-timer 0.1 0.1
-                                   (lambda ()
-                                     (condition-case err
-                                         (warp-exec--monitor-resources ,context ,config)
-                                       (error
-                                        ;; If `monitor-resources` signals an error,
-                                        ;; capture it here. The main `progn` will
-                                        ;; re-signal it after `body` completes.
-                                        (setq ,exception-var err))))))
-
-             ;; Execute the main body of code.
+                   (run-with-timer
+                    0.1 0.1
+                    (lambda ()
+                      (condition-case err
+                          (warp-exec--monitor-resources ,context ,config)
+                        (error
+                         (setq ,exception-var err))))))
+             ;; Execute the body of code.
              (let ((result (progn ,@body)))
-               ;; After body execution, check if any timer callback
-               ;; captured an exception. If so, re-signal it.
+               ;; If any timer fired and set an exception, signal it now.
                (when ,exception-var
-                 (signal (loom-error-type ,exception-var)
-                         (loom-error-data ,exception-var)))
+                 (signal (car ,exception-var) (cdr ,exception-var)))
                result))
-
-         ;; Cleanup block: Ensure all timers are cancelled and context removed.
+         ;; Cleanup: always cancel timers and remove the execution context.
          (when ,timer-var (cancel-timer ,timer-var))
          (when ,monitor-timer-var (cancel-timer ,monitor-timer-var))
          (loom:with-mutex! (loom:lock "warp-exec-active-contexts-lock")
@@ -735,88 +623,62 @@ Signals:
 
 (defun warp-exec--create-sandbox-environment (config)
   "Create a restricted environment alist for safe code execution.
-This environment limits access to the file system, external processes,
-and other sensitive Emacs Lisp resources by rebinding certain global
-variables.
 
 Arguments:
-- `config` (exec-config): The current execution configuration, used
-    to derive certain sandbox parameters like `gc-cons-threshold`.
+- `CONFIG` (exec-config): The current execution configuration.
 
 Returns:
-- (alist): An alist of `(variable . value)` pairs suitable for
-  `cl-progv` or `let` that define the sandboxed environment."
-  `((inhibit-read-only . t)         ; Allow modifying buffers
-    (enable-local-variables . nil)  ; Prevent loading dangerous local vars
-    (inhibit-message . t)           ; Suppress messages to *Messages* buffer
-    ;; Set gc-cons-threshold to control memory churn.
-    ;; Here, it's 1/10th of the maximum allowed memory usage.
-    (gc-cons-threshold . ,(/ (warp-exec-config-max-memory-usage config) 10))
-    (max-specpdl-size . 2000)       ; Limit stack depth for recursion
-    (max-lisp-eval-depth . 1000)    ; Limit evaluation recursion depth
-    (default-directory . ,temporary-file-directory) ; Restrict FS access
-    (load-path . nil)               ; Prevent loading from arbitrary paths
-    (auto-save-default . nil)       ; Disable auto-save
-    (make-backup-files . nil)       ; Disable backup files
-    (create-lockfiles . nil)        ; Disable lock files
-    (debug-on-error . nil)          ; Prevent debugger on errors
-    (debug-on-quit . nil)))         ; Prevent debugger on quit
+- (alist): An alist of variable bindings for `cl-progv`."
+  `((inhibit-read-only . t)
+    (enable-local-variables . nil)
+    (inhibit-message . t)
+    (gc-cons-threshold . ,(/ (exec-config-max-memory-usage config) 10))
+    (max-specpdl-size . 2000)
+    (max-lisp-eval-depth . 1000)
+    (default-directory . ,temporary-file-directory)
+    (load-path . nil)
+    (auto-save-default . nil)
+    (make-backup-files . nil)
+    (create-lockfiles . nil)
+    (debug-on-error . nil)
+    (debug-on-quit . nil)))
 
 (defun warp-exec--execute-in-sandbox (lisp-form context config)
-  "Execute a Lisp form within a sandboxed environment with resource
-monitoring and a timeout. This is the core runtime execution function
-for all policies.
+  "Execute a Lisp form within a sandboxed environment.
 
 Arguments:
-- `lisp-form` (t): The Lisp S-expression to execute.
-- `context` (warp-execution-context): The execution context, which
-  tracks runtime metrics.
-- `config` (exec-config): The current execution configuration, which
-  provides global limits and settings.
+- `LISP-FORM` (any): The s-expression to evaluate.
+- `CONTEXT` (warp-execution-context): The current execution context.
+- `CONFIG` (exec-config): The current execution configuration.
 
 Returns:
-- The result of the `lisp-form` evaluation.
-
-Signals:
-- `warp-exec-timeout`: If execution times out.
-- `warp-exec-resource-limit-exceeded`: If memory or allocation limits
-  are breached.
-- Any error signaled by the `lisp-form` itself (these will be wrapped
-  by the calling strategy function)."
-  (let ((effective-timeout (or (and
-                                (warp-secure-form-p lisp-form)
-                                (warp-secure-form-max-execution-time
-                                 lisp-form))
-                               (warp-exec-config-max-execution-time
-                                config))))
+- The result of evaluating `LISP-FORM`."
+  (let ((effective-timeout (or (and (warp-secure-form-p lisp-form)
+                                    (warp-secure-form-max-execution-time
+                                     lisp-form))
+                               (exec-config-max-execution-time config))))
     (warp-exec--with-resource-monitoring effective-timeout context config
       (cl-progv (mapcar #'car (warp-exec--create-sandbox-environment config))
-                (mapcar #'cdr (warp-exec--create-sandbox-environment config))
+          (mapcar #'cdr (warp-exec--create-sandbox-environment config))
         (eval lisp-form t)))))
 
 (defun warp-exec--handle-execution-result (result context config validation-data
-                                          security-violation-p initial-err)
-  "Helper to process the outcome of a code execution.
-This function collects metrics, logs the result, and wraps any errors
-in `warp-exec-security-violation`.
+                                                  security-violation-p
+                                                  initial-err)
+  "Process the outcome of a code execution, update metrics, and
+settle the final promise.
 
 Arguments:
-- `result`: The return value of the executed Lisp form (if successful).
-- `context` (warp-execution-context): The execution context.
-- `config` (exec-config): The `exec-config` instance.
-- `validation-data` (plist): The result from `warp-exec--validate-form`,
-    containing `functions` and `cache-hit` info.
-- `security-violation-p` (boolean): `t` if a security violation was
-    detected, `nil` otherwise.
-- `initial-err` (error-object or nil): The original error object if
-    execution failed, `nil` otherwise.
+- `RESULT`: The value returned by the executed code.
+- `CONTEXT` (warp-execution-context): The execution context.
+- `CONFIG` (exec-config): The current execution configuration.
+- `VALIDATION-DATA` (plist): Data from the static analysis phase.
+- `SECURITY-VIOLATION-P` (boolean): Whether a violation occurred.
+- `INITIAL-ERR`: The error condition if one was signaled.
 
-Returns: (loom-promise): A promise that resolves to `result` on success,
-    or rejects with a `warp-exec-security-violation` error.
-
-Side Effects:
-- Updates `warp-exec--global-metrics`.
-- Logs execution details."
+Returns:
+- (loom-promise): A promise that is resolved or rejected with the
+  final outcome."
   (let* ((end-time (current-time))
          (exec-time (time-to-seconds
                      (time-subtract end-time
@@ -828,17 +690,15 @@ Side Effects:
                                    (warp-execution-context-memory-baseline
                                     context))
                    :allocations-made
-                   (warp-execution-context-allocation-count
-                    context)
-                   :functions-called
-                   (plist-get validation-data :functions)
+                   (warp-execution-context-allocation-count context)
+                   :functions-called (plist-get validation-data :functions)
                    :security-violations
                    (when security-violation-p
                      (list (format "%S" initial-err)))
                    :result-type (type-of result)
                    :cache-hit (plist-get validation-data :cache-hit))))
 
-    (when (warp-exec-config-enable-metrics config)
+    (when (exec-config-enable-metrics config)
       (warp-exec--update-global-metrics
        exec-time (null initial-err) security-violation-p metrics))
 
@@ -858,23 +718,14 @@ Side Effects:
 
 (defun warp-exec--validate-form (form-obj config)
   "Validate a Lisp form for security and integrity, using caching.
-This function performs static analysis (complexity, whitelist scan),
-integrity checks (if a hash is present), and caches validation results
-for performance.
 
 Arguments:
-- `form-obj` (warp-secure-form): The Lisp form object to validate.
-- `config` (exec-config): The current execution configuration.
+- `FORM-OBJ` (warp-secure-form): The secure form to validate.
+- `CONFIG` (exec-config): The current execution configuration.
 
 Returns:
-- (plist): A property list indicating validation success (`:valid t`)
-  or failure (`:valid nil`) along with relevant details like complexity
-  metrics, called functions, and any security violations. Also includes
-  `:cache-hit` boolean.
-
-Signals:
-- `warp-exec-security-violation`: If critical security violations are
-  detected during static analysis or integrity checks."
+- (plist): A plist containing the validation result (`:valid`), and
+  other analysis data."
   (let* ((form-hash (warp-secure-form-hash form-obj))
          (signature (warp-secure-form-signature form-obj))
          (cache-key (warp-exec--cache-key form-hash signature))
@@ -886,48 +737,38 @@ Signals:
           (warp:log! :debug "warp-exec" "Using cached validation result.")
           (setf (warp-secure-form-cached-validation form-obj) t)
           cached-result)
-      ;; Perform full validation if not in cache.
       (let ((validation-result
              (condition-case err
                  (progn
-                   ;; Basic integrity check (hash mismatch detection).
                    (warp-exec--validate-form-integrity form-obj)
-
-                   ;; Complexity analysis (log warnings for high complexity).
                    (let* ((form (warp-secure-form-form form-obj))
                           (complexity (warp-exec--analyze-form-complexity
-                                       form)))
+                                       form))
+                          (whitelist (or (warp-secure-form-allowed-functions
+                                          form-obj)
+                                         warp-exec--strict-default-whitelist))
+                          (namespace-wl (warp-secure-form-namespace-whitelist
+                                         form-obj))
+                          (scan-result (warp-exec--scan-form form whitelist
+                                                             namespace-wl)))
                      (when (> (plist-get complexity :complexity-score) 1000)
                        (warp:log! :warn "warp-exec"
                                   "High complexity form detected: %s"
                                   (plist-get complexity :complexity-score)))
-
-                     ;; Security scanning (whitelist and namespace violations).
-                     (let* ((whitelist (or
-                                        (warp-secure-form-allowed-functions
-                                         form-obj)
-                                        warp-exec--strict-default-whitelist))
-                            (namespace-wl
-                             (warp-secure-form-namespace-whitelist
-                              form-obj))
-                            (scan-result (warp-exec--scan-form
-                                          form whitelist namespace-wl)))
-
-                       (when (plist-get scan-result :violations)
-                         (signal 'warp-exec-security-violation
-                                 (warp:error!
-                                  :type 'warp-exec-security-violation
-                                  :message "Security violations detected"
-                                  :context `(:violations
-                                             ,(plist-get scan-result
-                                                         :violations)))))
-
-                       `(:valid t :complexity ,complexity
-                         :functions ,(plist-get scan-result :called-functions)
-                         :cache-hit ,cache-hit-p))))
-                 (error `(:valid nil :error ,err :cache-hit ,cache-hit-p)))))
-
-        ;; Cache the result for future identical forms.
+                     (when (plist-get scan-result :violations)
+                       (signal 'warp-exec-security-violation
+                               (list
+                                (warp:error!
+                                 :type 'warp-exec-security-violation
+                                 :message "Security violations detected"
+                                 :context
+                                 `(:violations
+                                   ,(plist-get scan-result
+                                               :violations))))))
+                     `(:valid t :complexity ,complexity
+                       :functions ,(plist-get scan-result :called-functions)
+                       :cache-hit ,cache-hit-p))))
+               (error `(:valid nil :error ,err :cache-hit ,cache-hit-p)))))
         (warp-exec--cache-put cache-key validation-result config)
         validation-result))))
 
@@ -937,152 +778,108 @@ Signals:
 
 (defun warp-exec--ultra-strict-strategy-fn (form config public-key-getter-fn)
   "Execute a form using the `:ultra-strict` policy.
-This strategy is for highly sensitive, untrusted code and enforces:
-1. The `form` MUST be wrapped in `warp-secure-form`.
-2. Integrity check via SHA-256 hash.
-3. Mandatory digital signature verification.
-4. A dynamic, per-form function whitelist and namespace whitelist.
-5. Execution within a tightly sandboxed environment with strict resource
-   limits and capability checks.
-6. Comprehensive metrics and auditing.
+This policy requires a `warp-secure-form`, validates it against a
+dynamic per-form whitelist, and *always* verifies its digital signature.
 
 Arguments:
-- `form` (t): The Lisp form to execute (expected to be `warp-secure-form`).
-- `config` (exec-config): The current execution configuration.
-- `public-key-getter-fn` (function): A nullary function that returns the
-    public key string for signature verification.
+- `FORM` (any): The form to execute, must be `warp-secure-form`.
+- `CONFIG` (exec-config): The current execution configuration.
+- `PUBLIC-KEY-GETTER-FN` (function): A function to retrieve the key for
+  signature verification.
 
 Returns:
-- (loom-promise): A promise that resolves with the execution result.
-
-Signals:
-- `warp-exec-security-violation`: If any security checks fail."
+- (loom-promise): A promise that settles with the execution result."
   (braid! t
     (:then (lambda (_)
-             ;; Ensure the form is properly wrapped for this policy.
              (unless (warp-secure-form-p form)
                (signal (warp:error!
                         :type 'warp-exec-security-violation
-                        :message "Ultra-strict policy requires `warp-secure-form`."
-                        :context `(:form-type ,(type-of form)))))
-
-             ;; 1. Validate the form (static analysis, hash integrity, caching).
+                        :message "Ultra-strict policy requires `warp-secure-form`.")))
+             ;; Perform static validation: hash, signature, whitelist.
              (let ((validation-result (warp-exec--validate-form form config)))
                (unless (plist-get validation-result :valid)
                  (signal (plist-get validation-result :error)))
-
-               ;; 2. Mandatory digital signature verification.
-               ;; This confirms the code's authenticity from a trusted source.
                (warp-exec--verify-signature form public-key-getter-fn)
-
-               ;; 3. Create a dedicated execution context.
+               ;; If validation passes, create a monitored context and execute.
                (let ((execution-context
                       (warp-exec--create-execution-context
-                       (warp-secure-form-required-capabilities form)
-                       config)))
+                       (warp-secure-form-required-capabilities form) config)))
                  (warp:log! :info "warp-exec"
-                            "Executing with ultra-strict policy. Audit ID: %s"
-                            (warp-execution-context-audit-id
-                             execution-context))
-                 ;; 4. Execute the form in a sandboxed environment.
+                            "Executing with :ultra-strict. Audit ID: %s"
+                            (warp-execution-context-audit-id execution-context))
                  (braid! (warp-exec--execute-in-sandbox
                           (warp-secure-form-form form) execution-context config)
                    (:then (lambda (result)
-                            ;; On success, report metrics and return result.
-                            (loom:await (warp-exec--handle-execution-result
-                                         result execution-context config
-                                         validation-result nil nil)))
+                            (loom:await
+                             (warp-exec--handle-execution-result
+                              result execution-context config validation-result
+                              nil nil))))
                    (:catch (lambda (err)
-                             ;; On failure, report metrics for the error and re-signal.
-                             (loom:await (warp-exec--handle-execution-result
-                                          nil execution-context config
-                                          validation-result t err)))
-                            (loom:rejected! err))))))))))
+                             (loom:await
+                              (warp-exec--handle-execution-result
+                               nil execution-context config validation-result
+                               t err)))
+                           (loom:rejected! err)))))))))
 
 (defun warp-exec--strict-strategy-fn (form config public-key-getter-fn)
   "Execute a form using the `:strict` policy.
-This strategy is for untrusted code and enforces:
-1. The `form` MUST be wrapped in `warp-secure-form`.
-2. Integrity check via SHA-256 hash.
-3. Digital signature verification (if enabled by `config`).
-4. A dynamic, per-form function whitelist and optional namespace whitelist.
-5. Execution within a sandboxed environment with resource limits.
-6. Metrics and auditing.
+This policy is similar to `:ultra-strict` but signature verification
+can be disabled via configuration.
 
 Arguments:
-- `form` (t): The Lisp form to execute (expected to be `warp-secure-form`).
-- `config` (exec-config): The current execution configuration.
-- `public-key-getter-fn` (function): A nullary function that returns the
-    public key string for signature verification (only used if configured).
+- `FORM` (any): The form to execute, must be `warp-secure-form`.
+- `CONFIG` (exec-config): The current execution configuration.
+- `PUBLIC-KEY-GETTER-FN` (function): A function to retrieve the key for
+  signature verification.
 
 Returns:
-- (loom-promise): A promise that resolves with the execution result.
-
-Signals:
-- `warp-exec-security-violation`: If any security checks fail."
+- (loom-promise): A promise that settles with the execution result."
   (braid! t
     (:then (lambda (_)
-             ;; Ensure the form is properly wrapped for this policy.
              (unless (warp-secure-form-p form)
                (signal (warp:error!
                         :type 'warp-exec-security-violation
-                        :message "Strict policy requires `warp-secure-form`."
-                        :context `(:form-type ,(type-of form)))))
-
-             ;; 1. Validate the form (static analysis, hash integrity, caching).
+                        :message "Strict policy requires `warp-secure-form`.")))
              (let ((validation-result (warp-exec--validate-form form config)))
                (unless (plist-get validation-result :valid)
                  (signal (plist-get validation-result :error)))
-
-               ;; 2. Optional digital signature verification (if configured).
-               (when (warp-exec-config-require-signatures-strict config)
+               (when (exec-config-require-signatures-strict config)
                  (warp-exec--verify-signature form public-key-getter-fn))
-
-               ;; 3. Create a dedicated execution context.
                (let ((execution-context
                       (warp-exec--create-execution-context
-                       (warp-secure-form-required-capabilities form)
-                       config)))
+                       (warp-secure-form-required-capabilities form) config)))
                  (warp:log! :info "warp-exec"
-                            "Executing with :strict policy. Audit ID: %s"
-                            (warp-execution-context-audit-id
-                             execution-context))
-                 ;; 4. Execute the form in a sandboxed environment.
+                            "Executing with :strict. Audit ID: %s"
+                            (warp-execution-context-audit-id execution-context))
                  (braid! (warp-exec--execute-in-sandbox
                           (warp-secure-form-form form) execution-context config)
                    (:then (lambda (result)
-                            ;; On success, report metrics and return result.
-                            (loom:await (warp-exec--handle-execution-result
-                                         result execution-context config
-                                         validation-result nil nil)))
+                            (loom:await
+                             (warp-exec--handle-execution-result
+                              result execution-context config validation-result
+                              nil nil))))
                    (:catch (lambda (err)
-                             ;; On failure, report metrics for the error and re-signal.
-                             (loom:await (warp-exec--handle-execution-result
-                                          nil execution-context config
-                                          validation-result t err)))
-                            (loom:rejected! err))))))))))
+                             (loom:await
+                              (warp-exec--handle-execution-result
+                               nil execution-context config validation-result
+                               t err)))
+                           (loom:rejected! err)))))))))
 
 (defun warp-exec--moderate-strategy-fn (form config)
   "Execute a form using the `:moderate` policy.
-This strategy is for semi-trusted code. It uses a predefined, broad
-whitelist (`warp-exec--moderate-whitelist`) and applies resource
-limits. It performs static analysis for violations.
+This policy validates a raw Lisp form against a predefined, global
+whitelist of safe functions.
 
 Arguments:
-- `form` (t): The Lisp form to execute (can be any form or a
-  `warp-secure-form`).
-- `config` (exec-config): The current execution configuration.
+- `FORM` (any): The Lisp s-expression to execute.
+- `CONFIG` (exec-config): The current execution configuration.
 
 Returns:
-- (loom-promise): A promise that resolves with the execution result.
-
-Signals:
-- `warp-exec-security-violation`: If security violations are detected."
+- (loom-promise): A promise that settles with the execution result."
   (let* ((lisp-form (if (warp-secure-form-p form)
                         (warp-secure-form-form form) form)))
     (braid! t
       (:then (lambda (_)
-               ;; 1. Create a dedicated execution context with basic capabilities.
                (let ((execution-context
                       (warp-exec--create-execution-context
                        '(:safe-execution) config)))
@@ -1090,11 +887,11 @@ Signals:
                             "Moderate execution. Audit ID: %s"
                             (warp-execution-context-audit-id
                              execution-context))
-                 ;; 2. Perform static analysis against the moderate whitelist.
+                 ;; Statically scan the form against the moderate whitelist.
                  (let* ((scan-result (warp-exec--scan-form
                                       lisp-form
                                       warp-exec--moderate-whitelist
-                                      nil))) ; No namespace whitelist for moderate
+                                      nil)))
                    (when (plist-get scan-result :violations)
                      (signal (warp:error!
                               :type 'warp-exec-security-violation
@@ -1102,52 +899,45 @@ Signals:
                               :context `(:violations
                                          ,(plist-get scan-result
                                                      :violations)))))
-                   ;; 3. Execute the form in a sandboxed environment.
+                   ;; If scan passes, execute in the sandbox.
                    (braid! (warp-exec--execute-in-sandbox
                             lisp-form execution-context config)
                      (:then (lambda (result)
-                              ;; On success, report metrics and return result.
-                              (loom:await (warp-exec--handle-execution-result
-                                           result execution-context config
-                                           `(:functions ,(plist-get scan-result :called-functions))
-                                           nil nil)))
+                              (loom:await
+                               (warp-exec--handle-execution-result
+                                result execution-context config
+                                `(:functions
+                                  ,(plist-get scan-result :called-functions))
+                                nil nil))))
                      (:catch (lambda (err)
-                               ;; On failure, report metrics for the error and re-signal.
-                               (loom:await (warp-exec--handle-execution-result
-                                            nil execution-context config
-                                            `(:functions ,(plist-get scan-result :called-functions))
-                                            t err)))
-                              (loom:rejected! err))))))))))
+                               (loom:await
+                                (warp-exec--handle-execution-result
+                                 nil execution-context config
+                                 `(:functions
+                                   ,(plist-get scan-result :called-functions))
+                                 t err)))
+                             (loom:rejected! err))))))))))
 
 (defun warp-exec--permissive-strategy-fn (form config)
   "Execute a form using the `:permissive` policy.
-This strategy is for fully trusted code. It requires the `form` to be
-wrapped in `warp-unrestricted-lisp-form` as an explicit
-declaration of trust. It bypasses whitelisting but still enforces
-a timeout and resource limits.
+This policy performs no static validation but requires the form to be
+wrapped in a `warp-unrestricted-lisp-form` as an explicit declaration
+of trust.
 
 Arguments:
-- `form` (t): The Lisp form to execute (expected to be
-  `warp-unrestricted-lisp-form`).
-- `config` (exec-config): The current execution configuration.
+- `FORM` (any): The form to execute, must be `warp-unrestricted-lisp-form`.
+- `CONFIG` (exec-config): The current execution configuration.
 
 Returns:
-- (loom-promise): A promise that resolves with the execution result.
-
-Signals:
-- `warp-exec-security-violation`: If `form` is not a
-  `warp-unrestricted-lisp-form`."
+- (loom-promise): A promise that settles with the execution result."
   (braid! t
     (:then (lambda (_)
-             ;; Ensure the form is properly wrapped for this policy.
              (unless (warp-unrestricted-lisp-form-p form)
                (signal (warp:error!
                         :type 'warp-exec-security-violation
-                        :message "Permissive policy requires %s."
-                        " `warp-unrestricted-lisp-form`."
-                        :context `(:form-type ,(type-of form)))))
+                        :message (concat "Permissive policy requires "
+                                         "`warp-unrestricted-lisp-form`."))))
              (let* ((lisp-form (warp-unrestricted-lisp-form-form form))
-                    ;; 1. Create a dedicated execution context with arbitrary eval capability.
                     (execution-context
                      (warp-exec--create-execution-context
                       '(:eval-arbitrary) config)))
@@ -1155,72 +945,64 @@ Signals:
                           "Permissive execution. Audit ID: %s"
                           (warp-execution-context-audit-id
                            execution-context))
-               ;; 2. Execute the form in a sandboxed environment.
                (braid! (warp-exec--execute-in-sandbox
                         lisp-form execution-context config)
                  (:then (lambda (result)
-                          ;; On success, report metrics and return result.
                           (loom:await (warp-exec--handle-execution-result
                                        result execution-context config
-                                       nil nil nil))) ;; No validation data for this policy
+                                       nil nil nil))))
                  (:catch (lambda (err)
-                           ;; On failure, report metrics for the error and re-signal.
                            (loom:await (warp-exec--handle-execution-result
                                         nil execution-context config
                                         nil t err)))
-                          (loom:rejected! err))))))))
+                         (loom:rejected! err)))))))))
 
 ;;----------------------------------------------------------------------
 ;;; Metrics and Monitoring
 ;;----------------------------------------------------------------------
 
 (defun warp-exec--update-global-metrics (execution-time success-p
-                                        security-violation-p metrics-detail)
+                                                      security-violation-p
+                                                      _metrics-detail)
   "Update global execution statistics.
-This function increments counters for total, successful, failed, and
-security-violation executions. It also updates the average execution
-time and cache hit rate.
 
 Arguments:
-- `execution-time` (float): Time taken for the last execution in seconds.
-- `success-p` (boolean): `t` if the last execution was successful.
-- `security-violation-p` (boolean): `t` if a security violation
-  occurred during the execution.
-- `metrics-detail` (warp-execution-metrics or nil): Detailed metrics
-  from the last execution, if collected.
+- `EXECUTION-TIME` (float): The time taken for this execution.
+- `SUCCESS-P` (boolean): Whether the execution completed without error.
+- `SECURITY-VIOLATION-P` (boolean): Whether a violation occurred.
+- `_METRICS-DETAIL` (warp-execution-metrics): Detailed metrics (unused).
 
-Returns: `nil`.
+Returns:
+- `nil`.
 
 Side Effects:
-- Modifies `warp-exec--global-metrics`."
-  (let ((config (make-warp-exec-config))) ; Get current config
-    (when (warp-exec-config-enable-metrics config)
-      (cl-incf (plist-get warp-exec--global-metrics :total-executions))
-      (if success-p
-          (cl-incf (plist-get warp-exec--global-metrics :successful-executions))
-        (cl-incf (plist-get warp-exec--global-metrics :failed-executions)))
+- Modifies the `warp-exec--global-metrics` plist."
+  (when (exec-config-enable-metrics (make-exec-config))
+    (cl-incf (plist-get warp-exec--global-metrics :total-executions))
+    (if success-p
+        (cl-incf (plist-get warp-exec--global-metrics :successful-executions))
+      (cl-incf (plist-get warp-exec--global-metrics :failed-executions)))
 
-      (when security-violation-p
-        (cl-incf (plist-get warp-exec--global-metrics :security-violations)))
+    (when security-violation-p
+      (cl-incf (plist-get warp-exec--global-metrics :security-violations)))
 
-      ;; Update rolling average execution time.
-      (let* ((total (plist-get warp-exec--global-metrics :total-executions))
-             (current-avg (plist-get
-                           warp-exec--global-metrics :average-execution-time))
-             (new-avg (if (> total 0)
-                          (/ (+ (* current-avg (1- total)) execution-time)
-                             total)
-                        execution-time)))
-        (setf (plist-get warp-exec--global-metrics :average-execution-time)
-              new-avg))
+    ;; Update the moving average for execution time.
+    (let* ((total (plist-get warp-exec--global-metrics :total-executions))
+           (current-avg (plist-get warp-exec--global-metrics
+                                   :average-execution-time))
+           (new-avg (if (> total 0)
+                        (/ (+ (* current-avg (1- total)) execution-time) total)
+                      execution-time)))
+      (setf (plist-get warp-exec--global-metrics :average-execution-time)
+            new-avg))
 
-      ;; Update cache hit rate based on global cache stats.
-      (let* ((hits (plist-get warp-exec--cache-stats :hits))
-             (misses (plist-get warp-exec--cache-stats :misses))
-             (total-requests (+ hits misses)))
-        (when (> total-requests 0)
-          (setf (plist-get warp-exec--global-metrics :cache-hit-rate)
-                (/ (float hits) total-requests)))))))
+    ;; Update the cache hit rate.
+    (let* ((hits (plist-get warp-exec--cache-stats :hits))
+           (misses (plist-get warp-exec--cache-stats :misses))
+           (total-requests (+ hits misses)))
+      (when (> total-requests 0)
+        (setf (plist-get warp-exec--global-metrics :cache-hit-rate)
+              (/ (float hits) total-requests))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
@@ -1228,38 +1010,14 @@ Side Effects:
 ;;;###autoload
 (cl-defun warp-exec-create-secure-form (form &rest options)
   "Create a secure Lisp form with advanced options and integrity hash.
-This is the recommended way to package code for policies like
-`:ultra-strict` and `:strict`. It automatically computes a SHA-256
-hash for integrity validation and can optionally include a digital
-signature (though signing itself is done externally).
 
 Arguments:
-- `FORM` (t): The Lisp S-expression to wrap.
-- `OPTIONS` (plist): A property list of options. Available options:
-    - `:signature` (string, optional): The Base64URL-encoded digital
-      signature of the form.
-    - `:allowed-functions` (list, optional): A specific whitelist of
-      symbols (functions/macros) this `form` may call.
-    - `:required-capabilities` (list, optional): A list of capabilities
-      (keywords like `:file-read`, `:network`) required by this form
-      for execution.
-    - `:namespace-whitelist` (list, optional): A list of allowed symbol
-      namespaces (strings or symbols, e.g., \"cl-\") for functions
-      called by the form.
-    - `:context` (string, optional): An optional string describing the
-      form's origin or purpose, used for auditing.
-    - `:priority` (symbol, optional): Execution priority (`:low`,
-      `:normal`, `:high`).
-    - `:max-execution-time` (float, optional): Custom timeout in
-      seconds for this specific form's evaluation, overriding global.
-    - `:max-memory` (integer, optional): Custom maximum memory usage in
-      bytes for this form's execution, overriding global.
+- `FORM` (any): The s-expression to wrap.
+- `&rest OPTIONS` (plist): A plist of options corresponding to the
+  fields in `warp-secure-form`.
 
 Returns:
-- (warp-secure-form): A new instance of the secure form struct.
-
-Side Effects:
-- Computes a SHA-256 hash of the form."
+- (warp-secure-form): A new secure form object."
   (let ((opts (cl-copy-list options)))
     (warp-secure-form-create
      :form form
@@ -1268,7 +1026,7 @@ Side Effects:
      :required-capabilities (plist-get opts :required-capabilities)
      :namespace-whitelist (plist-get opts :namespace-whitelist)
      :context (plist-get opts :context)
-     :hash (warp-exec--compute-form-hash form) ;; Compute hash on creation
+     :hash (warp-exec--compute-form-hash form)
      :priority (or (plist-get opts :priority) :normal)
      :max-execution-time (plist-get opts :max-execution-time)
      :max-memory (plist-get opts :max-memory))))
@@ -1277,20 +1035,14 @@ Side Effects:
 (defun warp-exec-create-unrestricted-form (form &optional trusted-source
                                                 context)
   "Create an unrestricted Lisp form for `:permissive` execution.
-This wrapper is required to use the `:permissive` policy, acting
-as an explicit declaration that the code is trusted. It indicates
-that this code does not need static analysis or whitelisting,
-though it will still be subject to resource limits.
 
 Arguments:
-- `FORM` (t): The Lisp S-expression to wrap.
-- `TRUSTED-SOURCE` (string, optional): A string identifying the trusted
-  source of this code (e.g., \"internal-script\").
-- `CONTEXT` (string, optional): A string describing the form's origin
-  or purpose.
+- `FORM` (any): The s-expression to wrap.
+- `TRUSTED-SOURCE` (string): A string identifying the trusted source.
+- `CONTEXT` (string): A string describing the form's purpose.
 
 Returns:
-- (warp-unrestricted-lisp-form): A new instance of the struct."
+- (warp-unrestricted-lisp-form): A new unrestricted form object."
   (warp-unrestricted-lisp-form-create
    :form form
    :context context
@@ -1299,19 +1051,13 @@ Returns:
 ;;;###autoload
 (defun warp-exec-get-metrics ()
   "Get current execution metrics and statistics.
-This function provides an overview of the `warp-exec` module's
-performance and security posture.
 
-Arguments: None.
+Arguments:
+- None.
 
 Returns:
-- (plist): A property list containing:
-    - `:global-metrics`: Global counters for executions, failures, etc.
-    - `:cache-stats`: Statistics about the validation cache (hits, misses).
-    - `:active-contexts`: The current number of active code execution
-      contexts.
-  Example: `(:global-metrics (:total-executions 10 ...) :cache-stats
-  (:hits 5 ...) :active-contexts 2)`."
+- (plist): A plist containing global metrics, cache stats, and the
+  number of currently active execution contexts."
   `(:global-metrics ,warp-exec--global-metrics
     :cache-stats ,warp-exec--cache-stats
     :active-contexts ,(hash-table-count warp-exec--active-contexts)))
@@ -1319,17 +1065,15 @@ Returns:
 ;;;###autoload
 (defun warp-exec-clear-cache ()
   "Clear the validation cache and reset cache statistics.
-This function can be used to free memory consumed by cached validation
-results or to force re-validation of all incoming forms.
 
-Arguments: None.
+Arguments:
+- None.
 
-Returns: `nil`.
+Returns:
+- `nil`.
 
 Side Effects:
-- Clears `warp-exec--validation-cache` (all cached entries are removed).
-- Resets `warp-exec--cache-stats` to zero.
-- Logs the cache clearing event."
+- Clears `warp-exec--validation-cache` and `warp-exec--cache-stats`."
   (interactive)
   (clrhash warp-exec--validation-cache)
   (setq warp-exec--cache-stats '(:hits 0 :misses 0 :evictions 0))
@@ -1338,30 +1082,20 @@ Side Effects:
 ;;;###autoload
 (defun warp-exec-emergency-shutdown ()
   "Emergency shutdown of all active executions.
-This function attempts to forcefully terminate any running Emacs Lisp
-code that was executed via `warp-exec` by removing their contexts from
-tracking. This is a last-resort measure.
-Note: This function does not directly `kill-thread` due to Emacs Lisp
-limitations, but it will cause active monitoring/timeout processes
-to stop tracking these executions, potentially leading to their eventual
-termination if they rely on those mechanisms.
 
-Arguments: None.
+Arguments:
+- None.
 
-Returns: `nil`.
+Returns:
+- `nil`.
 
 Side Effects:
-- Removes all active execution contexts from `warp-exec--active-contexts`.
-- Logs a warning for each terminated context and the completion of the
-  emergency shutdown."
+- Clears the table of active execution contexts."
   (interactive)
   (loom:with-mutex! (loom:lock "warp-exec-active-contexts-lock")
-    (maphash (lambda (audit-id context)
+    (maphash (lambda (audit-id _context)
                (warp:log! :warn "warp-exec"
                           "Emergency shutdown of context: %s" audit-id)
-               ;; In a more advanced system, thread-kill might be called
-               ;; here if the context directly maps to a managed thread.
-               ;; For now, just remove from tracking.
                (remhash audit-id warp-exec--active-contexts))
              warp-exec--active-contexts))
   (warp:log! :warn "warp-exec" "Emergency shutdown completed."))
@@ -1369,33 +1103,23 @@ Side Effects:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Module Initialization
 
-;; Register security strategies with the central security policy manager.
-;; Each strategy function receives the form to execute, the general
-;; `exec-config` for this module, and a `public-key-getter-fn` if signature
-;; verification is needed.
-;; The `public-key-getter-fn` is expected to be a nullary function
-;; (e.g., a lambda or `#'my-public-key-getter`) that returns the public key
-;; string. This allows for dependency injection of the public key source.
-;; (Note: `warp--worker-get-public-key-string` is a placeholder for a
-;;  function that would typically be available in `warp-worker.el`
-;;  and provide access to the worker's loaded public key material.)
-
 (defun warp--dummy-public-key-getter ()
   "A dummy public key getter for `warp-exec`'s strict policies.
-In a real `warp-worker` environment, this would retrieve the actual
-public key material from the `key-manager` component. For `warp-exec`
-module's internal definition, it acts as a placeholder."
-  (warp:log! :warn "warp-exec" "Dummy public key getter called. %s."
-             "Ensure real implementation is provided by worker environment.")
-  ;; Return nil or a dummy key if needed for testing.
+In a real `warp-worker` environment, this would be replaced by a function
+that retrieves the actual public key material from the `key-manager`
+component. This placeholder allows the module to be loaded and compiled
+independently."
+  (warp:log! :warn "warp-exec" (concat "Dummy public key getter called. "
+                                       "Ensure a real implementation is "
+                                       "provided by the worker environment."))
   nil)
 
-
+;; Register the security strategies defined in this module with the
+;; central `warp-security-policy` system. This makes them available for
+;; use by components like the `warp-worker`.
 (warp:security-policy-register
  :ultra-strict
- "Maximum security with comprehensive validation, monitoring, and
-restrictions. Requires `warp-secure-form` with signature and
-capabilities. Code must be digitally signed by a trusted source."
+ "Maximum security with validation, monitoring, and signed forms."
  (lambda (form _args config)
    (warp-exec--ultra-strict-strategy-fn form config
                                         #'warp--dummy-public-key-getter))
@@ -1404,31 +1128,23 @@ capabilities. Code must be digitally signed by a trusted source."
 
 (warp:security-policy-register
  :strict
- "Executes code using a dynamic, per-form whitelist with sandboxing.
- Requires `warp-secure-form` and cryptographically signed forms (if
- `require-signatures-strict` is t in `exec-config`). Authenticated
- requests are required at the RPC layer."
+ "Executes code using a dynamic, per-form whitelist with sandboxing."
  (lambda (form _args config)
    (warp-exec--strict-strategy-fn form config
-                                   #'warp--dummy-public-key-getter))
+                                  #'warp--dummy-public-key-getter))
  :requires-auth-fn (lambda (_cmd) t)
  :auth-validator-fn #'warp--security-policy-jwt-auth-validator)
 
 (warp:security-policy-register
  :moderate
- "Executes code using a predefined whitelist of safe functions.
- Applies resource limits and basic security scanning. Does not
- require authenticated requests by default."
+ "Executes code using a predefined whitelist of safe functions."
  (lambda (form _args config) (warp-exec--moderate-strategy-fn form config))
  :requires-auth-fn (lambda (_cmd) nil)
  :auth-validator-fn #'warp--security-policy-no-auth-validator)
 
 (warp:security-policy-register
  :permissive
- "Executes code with minimal restrictions, for trusted sources only.
- Requires `warp-unrestricted-lisp-form` as an explicit trust
- declaration. Applies resource limits but no whitelisting. Does not
- require authenticated requests by default."
+ "Executes code with minimal restrictions, for trusted sources only."
  (lambda (form _args config) (warp-exec--permissive-strategy-fn form config))
  :requires-auth-fn (lambda (_cmd) nil)
  :auth-validator-fn #'warp--security-policy-no-auth-validator)
