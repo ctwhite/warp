@@ -221,8 +221,9 @@ Side Effects:
 ;;; Public API
 
 ;;;###autoload
-(cl-defun warp:master-provision-manager-create (&key name event-system
-                                                    command-router)
+(cl-defun warp:master-provision-manager-create (&key name 
+                                                     event-system
+                                                     command-router)
   "Create a new master-side provisioning manager component.
 
 Arguments:
@@ -257,9 +258,12 @@ Returns:
     manager))
 
 ;;;###autoload
-(cl-defun warp:worker-provision-client-create (&key name worker-id master-id
-                                                   event-system rpc-system
-                                                   connection-manager)
+(cl-defun warp:worker-provision-client-create (&key name 
+                                                    worker-id 
+                                                    master-id
+                                                    event-system 
+                                                    rpc-system
+                                                    connection-manager)
   "Create a new worker-side provisioning client component.
 
 Arguments:
@@ -342,8 +346,11 @@ Returns: (loom-promise): A promise that resolves when all initial
     (loom:all-settled initial-fetch-promises)))
 
 ;;;###autoload
-(defun warp:provision-publish (manager provision-type version provision-obj
-                                     &key target-ids)
+(cl-defun warp:provision-publish (manager 
+                                  provision-type 
+                                  version 
+                                  provision-obj
+                                  &key target-ids)
   "Publish a new provision version (Master-side operation).
 This function stores a new version of a provision and pushes it out
 to workers via a `:provision-update` event.
