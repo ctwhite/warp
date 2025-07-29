@@ -1,4 +1,5 @@
-;;; warp-request-pipeline.el --- Generic Request Processing Pipeline -*- lexical-binding: t; -*-
+;;; warp-request-pipeline.el --- Generic Request Processing Pipeline -*-
+;;; lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
@@ -18,7 +19,7 @@
 ;; - **Phased Processing**: Requests flow through ordered steps like
 ;;   validation, backpressure, and execution.
 ;; - **Centralized Error Handling**: Errors at any stage are caught
-;;   and handled uniformly.
+;;   and handled uniformly by the caller.
 ;; - **Contextual Data**: A request-specific context object flows
 ;;   through the pipeline, accumulating state.
 ;; - **Asynchronous Steps**: Steps are non-blocking and return promises.
@@ -82,8 +83,9 @@ Fields:
   (result nil :type t)
   (current-span nil :type (or null t)))
 
-(cl-defstruct (warp-request-pipeline (:constructor %%make-request-pipeline)
-                                     (:copier nil))
+(cl-defstruct (warp-request-pipeline
+               (:constructor %%make-request-pipeline)
+               (:copier nil))
   "Manages the flow and execution of request processing steps.
 This struct defines a request pipeline as an ordered series of functions
 (steps) that are executed sequentially.
@@ -102,45 +104,27 @@ Fields:
 (defun warp-request-pipeline--step-validate (context)
   "Pipeline Step: Validate the incoming request.
 This is the first line of defense, performing essential sanity checks
-before committing any significant resources to the request.
+before committing significant resources to the request.
 
 Arguments:
 - `CONTEXT` (warp-request-pipeline-context): The pipeline context.
 
-Returns: (loom-promise): A promise that resolves to `t` on success.
+Returns:
+- (loom-promise): A promise that resolves to `t` on success.
+
+Side Effects:
+- Sets the context stage to `:validate`.
 
 Signals:
-- `warp-invalid-request`: If the payload is malformed."
+- (as promise rejection) `warp-invalid-request`: If the payload is
+  malformed."
   (setf (warp-request-pipeline-context-stage context) :validate)
   (let* ((command (warp-request-pipeline-context-command context))
          (worker (warp-request-pipeline-context-worker context)))
     (unless (warp-rpc-command-p command)
-      (warp:log! :warn (warp-worker-id worker) "Invalid RPC command received.")
-      (signal 'warp-invalid-request "Payload is not a valid RPC command.")))
-  (loom:resolved! t))
-
-(defun warp-request-pipeline--step-backpressure (context)
-  "Pipeline Step: Apply backpressure based on worker load.
-This step protects the worker from self-inflicted overload by shedding
-excess traffic when its internal queues are saturated.
-
-Arguments:
-- `CONTEXT` (warp-request-pipeline-context): The pipeline context.
-
-Returns: (loom-promise): A promise that resolves to `t` if the worker
-  can handle the new request.
-
-Signals:
-- `warp-overload-error`: If concurrent request limit is reached."
-  (setf (warp-request-pipeline-context-stage context) :backpressure)
-  (let* ((worker (warp-request-pipeline-context-worker context))
-         (config (warp-worker-config worker))
-         ;; This logic assumes a simple counter on the worker struct.
-         ;; A real implementation would use a more robust metrics component.
-         (active-requests (warp-worker-active-requests worker))
-         (max-requests (warp-worker-config-max-concurrent-requests config)))
-    (when (> active-requests max-requests)
-      (signal 'warp-overload-error "Worker is overloaded.")))
+      (warp:log! :warn (warp-worker-worker-id worker)
+                 "Invalid RPC command received.")
+      (error 'warp-invalid-request "Payload is not a valid RPC command.")))
   (loom:resolved! t))
 
 (defun warp-request-pipeline--step-execute-command (context)
@@ -151,8 +135,13 @@ application-specific command router, which handles the business logic.
 Arguments:
 - `CONTEXT` (warp-request-pipeline-context): The pipeline context.
 
-Returns: (loom-promise): A promise that resolves with the handler's
-  result, or rejects if dispatch fails."
+Returns:
+- (loom-promise): A promise that resolves with the handler's result, or
+  rejects if dispatch fails.
+
+Side Effects:
+- Sets the context stage to `:execute`.
+- Calls the appropriate command handler registered with the router."
   (setf (warp-request-pipeline-context-stage context) :execute)
   (let* ((worker (warp-request-pipeline-context-worker context))
          (command (warp-request-pipeline-context-command context))
@@ -160,10 +149,11 @@ Returns: (loom-promise): A promise that resolves with the handler's
                   (warp-worker-component-system worker) :command-router)))
     (warp:command-router-dispatch router command context)))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
-(defun warp:request-pipeline-create (&key name steps)
+;;;###autoload
+(cl-defun warp:request-pipeline-create (&key name steps)
   "Create a new request processing pipeline instance.
 This constructor assembles a request pipeline from an explicit list of
 processing steps (functions).
@@ -174,29 +164,30 @@ Arguments:
   sequentially. Each function must accept a single argument: the
   `warp-request-pipeline-context`.
 
-Returns: (warp-request-pipeline): A new pipeline instance."
+Returns:
+- (warp-request-pipeline): A new pipeline instance."
   (%%make-request-pipeline
    :name (or name "default-request-pipeline")
    :steps (or steps
               ;; Provide a default set of production-ready steps.
               '(warp-request-pipeline--step-validate
-                warp-request-pipeline--step-backpressure
                 warp-request-pipeline--step-execute-command))))
 
-(defun warp:request-pipeline-process (pipeline message connection)
+;;;###autoload
+(defun warp:request-pipeline-run (pipeline message connection)
   "Process an incoming RPC request through the pipeline.
 This is the main entry point for the pipeline. It creates the initial
-request context and then executes each step in the defined sequence. It
-handles centralized error handling and ensures a response is always sent.
+request context and then executes each step in the defined sequence.
 
 Arguments:
 - `PIPELINE` (warp-request-pipeline): The pipeline instance to execute.
 - `MESSAGE` (warp-rpc-message): The incoming RPC message.
 - `CONNECTION` (t): The transport connection the message came from.
 
-Returns: (loom-promise): A promise that resolves with the final result
-  of the processing."
-  (let* ((worker (warp:component-system-get nil :worker)) ; Assumes context
+Returns:
+- (loom-promise): A promise that resolves with the final result of the
+  processing, or rejects if any step fails."
+  (let* ((worker (warp:component-system-get-context :worker))
          (command (warp-rpc-message-payload message))
          (context (make-warp-request-pipeline-context
                    :worker worker
@@ -205,33 +196,31 @@ Returns: (loom-promise): A promise that resolves with the final result
                    :command command
                    :request-id (warp-rpc-message-correlation-id message)
                    :current-span (warp:trace-start-span
-                                  (format "RPC-%S" (warp-rpc-command-name command))))))
+                                  (format "RPC-%S"
+                                          (warp-rpc-command-name command))))))
     (braid!
-        ;; Chain the pipeline steps together sequentially.
-        (cl-reduce (lambda (promise-chain step-fn)
-                     (braid! promise-chain
-                       (:then (lambda (_) (funcall step-fn context)))))
-                   (warp-request-pipeline-steps pipeline)
-                   :initial-value (loom:resolved! t))
+     ;; This `cl-reduce` is the core of the pipeline. It elegantly chains
+     ;; the asynchronous steps together. It starts with a resolved promise
+     ;; and, for each step, attaches a new `:then` clause to the chain.
+     ;; The result is a single promise that represents the entire sequence.
+     (cl-reduce (lambda (promise-chain step-fn)
+                  (braid! promise-chain
+                    (:then (lambda (_) (funcall step-fn context)))))
+                (warp-request-pipeline-steps pipeline)
+                :initial-value (loom:resolved! t))
 
-      ;; This is the success path, executed after all steps complete.
-      (:then (lambda (result)
-               (setf (warp-request-pipeline-context-result context) result)
-               (warp:rpc-send-response
-                connection message result)
-               (warp:trace-end-span (warp-request-pipeline-context-current-span
-                                     context)
-                                    :status :ok)
-               result))
-      ;; This is the error path, executed if any step fails.
-      (:catch (lambda (err)
-                (setf (warp-request-pipeline-context-result context) err)
-                (warp:rpc-send-response
-                 connection message (loom:error-wrap err))
-                (warp:trace-end-span (warp-request-pipeline-context-current-span
-                                      context)
-                                     :error err)
-                (loom:rejected! err))))))
+     ;; The final `:then` and `:catch` blocks are for cross-cutting
+     ;; concerns, like ensuring the trace span is always closed.
+     (:then (lambda (result)
+              (setf (warp-request-pipeline-context-result context) result)
+              (warp:trace-end-span
+               (warp-request-pipeline-context-current-span context) :status :ok)
+              result))
+     (:catch (lambda (err)
+               (setf (warp-request-pipeline-context-result context) err)
+               (warp:trace-end-span
+                (warp-request-pipeline-context-current-span context) :error err)
+               (loom:rejected! err))))))
 
 (provide 'warp-request-pipeline)
 ;;; warp-request-pipeline.el ends here
