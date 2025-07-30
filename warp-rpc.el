@@ -101,14 +101,14 @@ Fields:
   "Defines the Protobuf mapping for `warp-rpc-message` for efficient
 serialization and deserialization over the network. Each field is mapped
 to a tag number and a Protobuf type."
-  `((type 1 :string)             
+  `((type 1 :string)             ; Message type (e.g., "request", "response")
     (correlation-id 2 :string)
     (sender-id 3 :string)
     (recipient-id 4 :string)
     (timestamp 5 :double)
-    (payload 6 :bytes)          
+    (payload 6 :bytes)          ; Marshalled command or response
     (timeout 7 :double)
-    (metadata 8 :bytes)))       
+    (metadata 8 :bytes)))       ; Marshalled plist
 
 (warp:defschema warp-rpc-command
     ((:constructor make-warp-rpc-command))
@@ -142,11 +142,11 @@ Fields:
 (warp:defprotobuf-mapping warp-rpc-command
   "Defines the Protobuf mapping for `warp-rpc-command`."
   `((name 1 :string)
-    (args 2 :bytes)              
+    (args 2 :bytes)              ; Marshalled args
     (id 3 :string)
     (request-promise-id 4 :string)
     (origin-instance-id 5 :string)
-    (metadata 6 :bytes)))        
+    (metadata 6 :bytes)))        ; Marshalled plist
 
 (warp:defschema warp-rpc-response
     ((:constructor make-warp-rpc-response))
@@ -171,8 +171,8 @@ Fields:
   "Defines the Protobuf mapping for `warp-rpc-response`."
   `((command-id 1 :string)
     (status 2 :string)
-    (payload 3 :bytes)            
-    (error-details 4 :bytes)))    
+    (payload 3 :bytes)            ; Marshalled result
+    (error-details 4 :bytes)))    ; Marshalled loom-error
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definitions
@@ -198,12 +198,15 @@ Fields:
 - `pending-requests` (hash-table): A hash table that stores `loom-promise`s
   for pending outgoing requests. Keyed by their `correlation-id` (string),
   and values are plists containing the promise and its timeout timer.
+- `metrics` (hash-table): A hash-table for storing operational metrics, such
+  as active incoming requests.
 - `lock` (loom-lock): A mutex protecting the `pending-requests` hash table
   from concurrent access, ensuring thread-safe management of outstanding RPCs."
   (name "default-rpc" :type string)
   (component-system (cl-assert nil) :type (or null t))
   (command-router (cl-assert nil) :type (or null t))
   (pending-requests (make-hash-table :test 'equal) :type hash-table)
+  (metrics (make-hash-table :test 'equal) :type hash-table)
   (lock (loom:lock "warp-rpc-system-lock") :type t))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -247,11 +250,11 @@ Side Effects:
                                   rpc-system))))
       (remhash correlation-id (warp-rpc-system-pending-requests rpc-system))
       (warp:log! :warn (warp-rpc-system-name rpc-system)
-                  (format "RPC request '%s' (corr-id: %s) timed out."
-                          (warp-rpc-command-name
-                           (warp-rpc-message-payload
-                            (plist-get pending :original-message)))
-                          correlation-id))
+                  "RPC request '%S' (corr-id: %s) timed out."
+                  (warp-rpc-command-name
+                   (warp-rpc-message-payload
+                    (plist-get pending :original-message)))
+                  correlation-id)
       (loom:promise-reject
        (plist-get pending :promise)
        (warp:error! :type 'warp-rpc-timeout
@@ -285,20 +288,19 @@ Side Effects:
           (make-warp-rpc-message
            :type :response
            :correlation-id (warp-rpc-message-correlation-id message)
-           :sender-id (warp-rpc-message-recipient-id message) 
-           :recipient-id (warp-rpc-message-sender-id message) 
+           :sender-id (warp-rpc-message-recipient-id message)
+           :recipient-id (warp-rpc-message-sender-id message)
            :payload response-obj))
          (cmd-id (warp-rpc-response-command-id response-obj)))
     (warp:log! :debug (warp-rpc-system-name rpc-system)
-               (format "Sending fire-and-forget response for command '%s'
-                        to '%s'."
-                       cmd-id (warp-rpc-message-sender-id message)))
+               "Sending fire-and-forget response for command '%s' to '%s'."
+               cmd-id (warp-rpc-message-sender-id message))
     (braid! (warp:transport-send connection response-message)
-      (:then (lambda (_) t)) ; Resolve with t on success
+      (:then (lambda (_) t))
       (:catch (lambda (err)
                 (warp:log! :error (warp-rpc-system-name rpc-system)
-                           (format "Failed to send response for command '%s': %S"
-                                   cmd-id err))
+                           "Failed to send response for command '%s': %S"
+                           cmd-id err)
                 (loom:rejected! err))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -336,13 +338,19 @@ Side Effects:
    :command-router command-router))
 
 ;;;###autoload
-(cl-defun warp:rpc-request (rpc-system 
-                            connection 
-                            sender-id 
-                            recipient-id 
+(defun warp:rpc-system-metrics (rpc-system)
+  "Returns the metrics hash table for the RPC system."
+  (warp-rpc-system-metrics rpc-system))
+
+;;;###autoload
+(cl-defun warp:rpc-request (rpc-system
+                            connection
+                            sender-id
+                            recipient-id
                             command
-                            &key (timeout 30.0) 
-                                 (expect-response t))
+                            &key (timeout 30.0)
+                                 (expect-response t)
+                                 origin-instance-id)
   "Sends an RPC request and returns a promise for the response.
 This is the primary way for a Warp component to initiate a remote
 procedure call to another node or component in the cluster. It constructs
@@ -391,7 +399,8 @@ Side Effects:
          ;; Get the ID of the current Warp instance where this RPC is initiated.
          ;; This ID is crucial for the remote side to route the response
          ;; back to the correct originating process/instance.
-         (my-origin-instance-id (warp:env-val 'warp-instance-id)))
+         (my-origin-instance-id (or origin-instance-id
+                                    (warp:env-val 'warp-instance-id))))
 
     ;; If a response is expected, register a pending promise in our local
     ;; hash table. This record includes the promise itself and a timer

@@ -377,8 +377,8 @@ Side Effects:
    `(:name :connection-manager
      :deps (:request-pipeline :rpc-system :event-system)
      :factory (lambda (pipeline rpc-system event-system)
-                (warp:connection-manager
-                 :endpoints (list (worker-config-master-contact-address
+                (warp:connection-manager-create
+                 (list (worker-config-master-contact-address
                                    config))
                  :event-system event-system
                  :transport-options (worker-config-master-transport-options
@@ -392,6 +392,9 @@ Side Effects:
                      (pcase (warp-rpc-message-type rpc-msg)
                        ;; Case 1: An incoming request.
                        (:request
+                        (loom:with-mutex! (warp-rpc-system-lock rpc-system)
+                          (cl-incf (gethash :active-request-count
+                                            (warp:rpc-system-metrics rpc-system) 0)))
                         ;; Run the request through the processing pipeline. The
                         ;; pipeline handles validation, authentication, rate
                         ;; limiting, and finally dispatches to a command
@@ -404,12 +407,18 @@ Side Effects:
                           ;; `warp:rpc-handle-request-result`.
                           (:then
                            (lambda (result)
+                             (loom:with-mutex! (warp-rpc-system-lock rpc-system)
+                               (cl-decf (gethash :active-request-count
+                                                 (warp:rpc-system-metrics rpc-system) 0)))
                              (warp:rpc-handle-request-result
                               rpc-system rpc-msg conn result nil)))
                           ;; When the pipeline fails at any step, take the
                           ;; error and send it back as an RPC response.
                           (:catch
                            (lambda (err)
+                             (loom:with-mutex! (warp-rpc-system-lock rpc-system)
+                               (cl-decf (gethash :active-request-count
+                                                 (warp:rpc-system-metrics rpc-system) 0)))
                              (warp:rpc-handle-request-result
                               rpc-system rpc-msg conn nil err)))))
                        ;; Case 2: An incoming response to a request we sent.
@@ -551,20 +560,19 @@ Side Effects:
 
    ;; Optional component for participating in distributed consensus (Raft).
    `(:name :coordinator
-     :deps (:connection-manager :state-manager :event-system :rpc-system) ; Added rpc-system dep
-     :factory (lambda (cm sm es rpc-system) ; Added rpc-system arg
+     :deps (:connection-manager :state-manager :event-system :rpc-system)
+     :factory (lambda (cm sm es rpc-system)
                 (when (worker-config-is-coordinator-node config)
-                  (warp:coordinator-create
-                   (warp-worker-worker-id worker)
-                   (getenv (warp:env 'cluster-id))
-                   sm es
-                   (warp:component-system-get
-                    (warp-worker-component-system worker)
-                    :command-router) ; Pass command router
-                   cm rpc-system ; Pass rpc-system
-                   :config (make-coordinator-config
-                            :cluster-members
-                            (worker-config-coordinator-peers config)))))
+                  (let ((router (warp:component-system-get
+                                  (warp-worker-component-system worker)
+                                  :command-router)))
+                    (warp:coordinator-create
+                     (warp-worker-worker-id worker)
+                     (getenv (warp:env 'cluster-id))
+                     sm es router cm rpc-system
+                     :config (make-coordinator-config
+                              :cluster-members
+                              (worker-config-coordinator-peers config))))))
      :start (lambda (coord _)
               (when coord (loom:await (warp:coordinator-start coord))))
      :stop (lambda (coord _)
@@ -619,7 +627,7 @@ Side Effects:
    ;; Periodically sends health and metrics updates to the master.
    `(:name :heartbeat-service
      :deps (:connection-manager :system-monitor :health-orchestrator
-            :event-system :service-registry :key-manager)
+            :event-system :service-registry :key-manager :rpc-system)
      :priority 60
      :factory (lambda () (make-hash-table)) ; Simple holder for the timer
      :start (lambda (holder system)
@@ -679,19 +687,16 @@ Signals:
          (component-system-id (warp-component-system-id system)))
     ;; Pre-flight checks before sending.
     (unless conn (error "Cannot send ready signal: No connection to master."))
-    (unless worker-sig (error "Failed to generate launch signature:
-                                private key might be missing or invalid."))
-    (unless inbox-address (error "Worker inbox address (master contact)
-                                  not found in environment."))
+    (unless worker-sig (error "Failed to generate launch signature: private key might be missing or invalid."))
+    (unless inbox-address (error "Worker inbox address (master contact) not found in environment."))
     ;; Send the final, signed ready signal RPC.
     (warp:log! :info worker-id "Sending worker ready signal to master...")
     (loom:await
-     (warp:protocol-client-send-worker-ready
-      (warp:protocol-client-create :rpc-system rpc-system)
-      conn worker-id (warp-worker-rank worker)
+     (warp:protocol-send-worker-ready
+      rpc-system conn worker-id (warp-worker-rank worker)
       :starting launch-id master-token worker-sig pub-key
       :inbox-address inbox-address
-      :origin-instance-id component-system-id)))) ; Pass origin ID here
+      :origin-instance-id component-system-id))))
 
 (defun warp-worker--send-heartbeat (worker system)
   "Constructs and sends a liveness heartbeat and metrics update to the master.
@@ -738,11 +743,16 @@ Side Effects:
                   (loom:await
                    (warp:health-orchestrator-get-aggregated-health health))
                 '(:overall-status :unknown)))
+             (active-reqs
+              (loom:with-mutex! (warp-rpc-system-lock rpc-system)
+                (gethash :active-request-count
+                         (warp:rpc-system-metrics rpc-system) 0)))
              ;; Assemble the final metrics payload.
              (metrics
               (make-warp-worker-metrics
                :process-metrics proc-metrics
                :transport-metrics transport-metrics
+               :active-request-count active-reqs
                :health-status (plist-get health-report :overall-status)
                :registered-service-count
                (if registry (warp:registry-count
@@ -757,11 +767,10 @@ Side Effects:
         (warp:log! :debug (warp-worker-worker-id worker)
                    "Sending heartbeat to master. Status: %S"
                    (warp-worker-metrics-health-status metrics))
-        (loom:await (warp:protocol-client-send-worker-ready
-                     (warp:protocol-client-create :rpc-system rpc-system)
-                     conn (warp-worker-worker-id worker) nil
+        (loom:await (warp:protocol-send-worker-ready
+                     rpc-system conn (warp-worker-worker-id worker) nil
                      :running nil nil signed-payload pub-key
-                     :origin-instance-id component-system-id))))))) ; Pass origin ID
+                     :origin-instance-id component-system-id)))))))
 
 (defun warp-worker--worker-sign-data (worker data)
   "Signs `DATA` using the worker's private key.
@@ -791,7 +800,7 @@ Side Effects:
       (warp:log! :trace (warp-worker-worker-id worker)
                  "Signing data with private key from: %s" priv-key-path)
       (warp:crypto-base64url-encode
-       (warp:crypto-sign-data data priv-key-path)))))
+       (warp:crypto-sign data priv-key-path)))))
 
 (defun warp-worker--apply-worker-provision (new-provision old-provision)
   "Applies new worker provision settings dynamically.
@@ -830,17 +839,15 @@ Side Effects:
                 (lambda () (loom:await (warp-worker--send-heartbeat
                                         worker system))))
                heartbeat-svc)
-      (warp:log! :info worker-id (format "Heartbeat interval updated to: %.1fs"
-                                         (worker-config-heartbeat-interval
-                                          new-provision))))
+      (warp:log! :info worker-id "Heartbeat interval updated to: %.1fs"
+                 (worker-config-heartbeat-interval new-provision)))
 
     ;; If the log level has changed, update the global logger.
     (unless (eq (worker-config-log-level new-provision)
                 (worker-config-log-level old-provision))
       (warp:log-set-level (worker-config-log-level new-provision))
-      (warp:log! :info worker-id (format "Log level updated to: %S"
-                                         (worker-config-log-level
-                                          new-provision)))))
+      (warp:log! :info worker-id "Log level updated to: %S"
+                 (worker-config-log-level new-provision))))
   nil)
 
 (defun warp-worker--generate-worker-id ()
@@ -855,9 +862,9 @@ Arguments:
 Returns:
 - (string): A unique string identifier for the worker."
   (format "worker-%s-%d-%s"
-          (or (system-name) "unknown") ; Fallback if hostname is unavailable
+          (or (system-name) "unknown")
           (emacs-pid)
-          (substring (secure-hash 'sha256 (random t)) 0 8))) ; Short hash for uniqueness
+          (substring (secure-hash 'sha256 (random t)) 0 8)))
 
 (defun warp-worker--register-internal-health-checks
     (orchestrator monitor event-system config)
@@ -920,7 +927,7 @@ Side Effects:
                   (format "CPU usage %.1f%% exceeds threshold %.1f%%"
                           cpu threshold))
                (loom:resolved! t))))
-        :critical-p t ; Mark as critical: high CPU can indicate unresponsiveness
+        :critical-p t
         :interval ,(worker-config-health-check-interval config))))
 
     ;; Health check for internal event queue depth. Fails if the queue
@@ -961,7 +968,7 @@ Arguments:
 Returns:
 - (loom-promise): A promise that resolves with the string \"pong\"."
   (warp:log! :debug (warp-rpc-system-name (plist-get context :rpc-system))
-             (format "Received ping from %s." (plist-get context :sender-id)))
+             "Received ping from %s." (plist-get context :sender-id))
   (loom:resolved! "pong"))
 
 (defun warp-handler-register-dynamic-command (command context)
@@ -989,7 +996,7 @@ Side Effects:
   (let* ((worker (plist-get context :worker))
          (system (warp-worker-component-system worker))
          (security-policy (warp:component-system-get system :security-policy))
-         (router (warp:component-system-get system :command-router)) ; Get router directly
+         (router (warp:component-system-get system :command-router))
          (args (warp-rpc-command-args command))
          (s-name (warp-protocol-register-dynamic-command-payload-service-name
                   args))
@@ -1002,20 +1009,18 @@ Side Effects:
                (unless (functionp handler-fn)
                  (loom:rejected!
                   (warp:error! :type 'warp-errors-security-violation
-                               :message (format "Dynamic command form for '%s'
-                                                did not evaluate to a function."
+                               :message (format "Dynamic command form for '%s' did not evaluate to a function."
                                                 cmd-name))))
-               ;; Register the new handler with the command router.
                (loom:await (warp:command-router-add-route
                             router cmd-name :handler-fn handler-fn))
                (warp:log! :info (warp-worker-worker-id worker)
-                          (format "Dynamically registered command '%S' for
-                                   service '%s'." cmd-name s-name))
+                          "Dynamically registered command '%S' for service '%s'."
+                          cmd-name s-name)
                t))
       (:catch (lambda (err)
                 (warp:log! :error (warp-worker-worker-id worker)
-                           (format "Failed to dynamically register command: %S"
-                                   err))
+                           "Failed to dynamically register command: %S"
+                           err)
                 (loom:rejected! err))))))
 
 (defun warp-handler-evaluate-map-chunk (command context)
@@ -1051,14 +1056,12 @@ Side Effects:
                (unless (functionp fn)
                  (loom:rejected!
                   (warp:error! :type 'warp-errors-security-violation
-                               :message "Form did not evaluate to a function
-                                        for map chunk evaluation.")))
-               ;; Apply the function to each item in the data chunk.
+                               :message "Form did not evaluate to a function for map chunk evaluation.")))
                (make-warp-protocol-cluster-map-result
                 :results (mapcar fn data))))
       (:catch (lambda (err)
                 (warp:log! :error (warp-worker-worker-id worker)
-                           (format "Failed to evaluate map chunk: %S" err))
+                           "Failed to evaluate map chunk: %S" err)
                 (loom:rejected! err))))))
 
 (defun warp-handler-shutdown-worker (command context)
@@ -1080,13 +1083,13 @@ Side Effects:
 - Calls `warp:worker-stop` asynchronously."
   (let ((worker (plist-get context :worker)))
     (warp:log! :info (warp-worker-worker-id worker)
-               (format "Received shutdown command from %s."
-                       (plist-get context :sender-id)))
+               "Received shutdown command from %s."
+               (plist-get context :sender-id))
     (braid! (warp:worker-stop worker)
-      (:then (lambda (_) t)) ; Resolve to t on successful shutdown initiation
+      (:then (lambda (_) t))
       (:catch (lambda (err)
                 (warp:log! :error (warp-worker-worker-id worker)
-                           (format "Error during worker shutdown initiation: %S" err))
+                           "Error during worker shutdown initiation: %S" err)
                 (loom:rejected! err))))))
 
 (defun warp-handler-update-jwt-keys (command context)
@@ -1117,7 +1120,8 @@ Side Effects:
     (warp:log! :info (warp-worker-worker-id worker) "Updating JWT keys...")
     (loom:await (warp:security-policy-update-trusted-keys security-policy
                                                           new-keys))
-    (warp:log! :info (warp-worker-worker-id worker) "JWT keys updated successfully.")
+    (warp:log! :info (warp-worker-worker-id worker)
+               "JWT keys updated successfully.")
     (loom:resolved! t)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -1206,7 +1210,7 @@ Side Effects:
           (loom:resolved! worker))
       (error
        (warp:log! :fatal (warp-worker-worker-id worker)
-                  (format "Worker startup failed: %S" err))
+                  "Worker startup failed: %S" err)
        (loom:rejected! err)))))
 
 ;;;###autoload
@@ -1242,22 +1246,26 @@ Side Effects:
 
     ;; Before shutting down networking, wait for a period to allow
     ;; in-flight requests to finish processing. This is a best-effort drain.
-    (let ((active-requests-metric (gethash :active-request-count
-                                           (warp:rpc-system-metrics rpc-system) 0)) ; Assuming RPC system tracks this
+    (let ((active-requests
+           (loom:with-mutex! (warp-rpc-system-lock rpc-system)
+             (gethash :active-request-count
+                      (warp:rpc-system-metrics rpc-system) 0)))
           (end-time (+ (float-time) timeout)))
-      (while (and (> active-requests-metric 0)
+      (while (and (> active-requests 0)
                   (< (float-time) end-time))
         (warp:log! :info worker-id
-                   (format "Draining active requests (%d remaining)..."
-                           active-requests-metric))
+                   "Draining active requests (%d remaining)..."
+                   active-requests)
         ;; Pause briefly to allow other processes to run and requests to complete.
         (accept-process-output nil 0.5)
-        (setq active-requests-metric (gethash :active-request-count
-                                              (warp:rpc-system-metrics rpc-system) 0)))
-      (when (> active-requests-metric 0)
+        (setq active-requests
+              (loom:with-mutex! (warp-rpc-system-lock rpc-system)
+                (gethash :active-request-count
+                         (warp:rpc-system-metrics rpc-system) 0))))
+      (when (> active-requests 0)
         (warp:log! :warn worker-id
-                   (format "Shutdown timeout: %d requests still active. "
-                           active-requests-metric "Proceeding with forceful termination."))))
+                   "Shutdown timeout: %d requests still active. Proceeding with forceful termination."
+                   active-requests)))
 
     ;; Stop all components in the reverse of their startup order.
     (condition-case err
@@ -1265,7 +1273,7 @@ Side Effects:
           (loom:await (warp:component-system-stop system)) ; Await component system shutdown
           (loom:resolved! t))
       (error
-       (warp:log! :error worker-id (format "Worker shutdown failed: %S" err))
+       (warp:log! :error worker-id "Worker shutdown failed: %S" err)
        (loom:rejected! err)))))
 
 ;;;###autoload
@@ -1324,12 +1332,12 @@ Side Effects:
                    (while t (accept-process-output nil t)))) ; Block until external signal or error
           (:catch (lambda (start-err)
                     (warp:log! :fatal (warp-worker-worker-id worker)
-                               (format "FATAL STARTUP ERROR: %S. Exiting."
-                                       start-err))
+                               "FATAL STARTUP ERROR: %S. Exiting."
+                               start-err)
                     (kill-emacs 1))))) ; Exit Emacs with non-zero status for error
     (error
      (warp:log! :fatal "warp:worker-main"
-                (format "Critical initialization error: %S. Exiting." err))
+                "Critical initialization error: %S. Exiting." err)
      (kill-emacs 1)))) ; Exit Emacs with non-zero status for error
 
 (provide 'warp-worker)
