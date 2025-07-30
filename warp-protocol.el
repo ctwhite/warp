@@ -33,6 +33,10 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Schema Definitions
 
+;;----------------------------------------------------------------------
+;;; Worker RPC Payloads
+;;----------------------------------------------------------------------
+
 (warp:defschema warp-worker-ready-payload
     ((:constructor make-warp-worker-ready-payload))
   "Payload for the `:worker-ready` RPC sent to the master.
@@ -57,9 +61,11 @@ Fields:
   (inbox-address nil :type (or null string)))
 
 (warp:defprotobuf-mapping warp-worker-ready-payload
+  "Protobuf mapping for `warp-worker-ready-payload` for efficient
+binary serialization."
   `((worker-id 1 :string)
     (rank 2 :int32)
-    (status 3 :string)
+    (status 3 :string) 
     (launch-id 4 :string)
     (master-challenge-token 5 :string)
     (worker-signature 6 :string)
@@ -81,10 +87,11 @@ Fields:
   (services nil :type list))
 
 (warp:defprotobuf-mapping warp-worker-heartbeat-payload
+  "Protobuf mapping for `warp-worker-heartbeat-payload`."
   `((worker-id 1 :string)
     (status 2 :string)
     (timestamp 3 :double)
-    (services 4 :bytes)))
+    (services 4 :bytes))) 
 
 (warp:defschema warp-get-init-payload-args
     ((:constructor make-warp-get-init-payload-args))
@@ -98,6 +105,7 @@ Fields:
   (rank nil :type integer))
 
 (warp:defprotobuf-mapping warp-get-init-payload-args
+  "Protobuf mapping for `warp-get-init-payload-args`."
   `((worker-id 1 :string)
     (rank 2 :int32)))
 
@@ -113,8 +121,13 @@ Fields:
   (timestamp (float-time) :type float))
 
 (warp:defprotobuf-mapping warp-ping-payload
+  "Protobuf mapping for `warp-ping-payload`."
   `((message 1 :string)
     (timestamp 2 :double)))
+
+;;----------------------------------------------------------------------
+;;; Map-Reduce RPC Payloads
+;;----------------------------------------------------------------------
 
 (warp:defschema warp-cluster-map-payload
     ((:constructor make-warp-cluster-map-payload))
@@ -127,6 +140,7 @@ Fields:
   (chunk-data nil :type list))
 
 (warp:defprotobuf-mapping warp-cluster-map-payload
+  "Protobuf mapping for `warp-cluster-map-payload`."
   `((function-form 1 :bytes)
     (chunk-data 2 :bytes)))
 
@@ -139,7 +153,12 @@ Fields:
   (results nil :type list))
 
 (warp:defprotobuf-mapping warp-cluster-map-result
+  "Protobuf mapping for `warp-cluster-map-result`."
   `((results 1 :bytes)))
+
+;;----------------------------------------------------------------------
+;;; Provisioning RPC Payloads
+;;----------------------------------------------------------------------
 
 (warp:defschema warp-provision-request-payload
     ((:constructor make-warp-provision-request-payload))
@@ -154,6 +173,7 @@ Fields:
   (provision-type :worker-provision :type keyword))
 
 (warp:defprotobuf-mapping warp-provision-request-payload
+  "Protobuf mapping for `warp-provision-request-payload`."
   `((worker-id 1 :string)
     (current-version 2 :string)
     (provision-type 3 :string)))
@@ -169,6 +189,7 @@ Fields:
   (provision nil :type t))
 
 (warp:defprotobuf-mapping warp-provision-response-payload
+  "Protobuf mapping for `warp-provision-response-payload`."
   `((version 1 :string)
     (provision 2 :bytes)))
 
@@ -187,6 +208,7 @@ Fields:
   (target-ids nil :type (or null list)))
 
 (warp:defprotobuf-mapping warp-provision-update-payload
+  "Protobuf mapping for `warp-provision-update-payload`."
   `((version 1 :string)
     (provision 2 :bytes)
     (provision-type 3 :string)
@@ -202,7 +224,240 @@ Fields:
   (trusted-keys nil :type (or null list)))
 
 (warp:defprotobuf-mapping warp-provision-jwt-keys-payload
+  "Protobuf mapping for `warp-provision-jwt-keys-payload`."
   `((trusted-keys 1 :bytes)))
+
+;;----------------------------------------------------------------------
+;;; Coordination RPC Payloads
+;;----------------------------------------------------------------------
+
+(warp:defschema warp-propagate-event-payload
+    ((:constructor make-warp-propagate-event-payload))
+  "Payload for `propagate-event` RPC sent to the event broker.
+
+Fields:
+- `event` (warp-event): The `warp-event` object to be propagated."
+  (event nil :type warp-event))
+
+(warp:defprotobuf-mapping warp-propagate-event-payload
+  "Protobuf mapping for `warp-propagate-event-payload`."
+  `((event 1 :bytes)))
+
+(warp:defschema warp-coordinator-request-vote-payload
+    ((:constructor make-warp-coordinator-request-vote-payload))
+  "Payload for `RequestVote` RPC in Raft-like consensus.
+
+Fields:
+- `term` (integer): Candidate's term.
+- `candidate-id` (string): Candidate requesting vote.
+- `last-log-index` (integer): Index of candidate's last log entry.
+- `last-log-term` (integer): Term of candidate's last log entry."
+  (term nil :type integer)
+  (candidate-id nil :type string)
+  (last-log-index nil :type integer)
+  (last-log-term nil :type integer))
+
+(warp:defprotobuf-mapping warp-coordinator-request-vote-payload
+  "Protobuf mapping for `warp-coordinator-request-vote-payload`."
+  `((term 1 :int32)
+    (candidate-id 2 :string)
+    (last-log-index 3 :int32)
+    (last-log-term 4 :int32)))
+
+(warp:defschema warp-coordinator-request-vote-response-payload
+    ((:constructor make-warp-coordinator-request-vote-response-payload))
+  "Response payload for `RequestVote` RPC.
+
+Fields:
+- `term` (integer): Current term of responder.
+- `vote-granted-p` (boolean): `t` if candidate received vote.
+- `error` (string): Optional error message if vote not granted."
+  (term nil :type integer)
+  (vote-granted-p nil :type boolean)
+  (error nil :type (or null string)))
+
+(warp:defprotobuf-mapping warp-coordinator-request-vote-response-payload
+  "Protobuf mapping for `warp-coordinator-request-vote-response-payload`."
+  `((term 1 :int32)
+    (vote-granted-p 2 :bool)
+    (error 3 :string)))
+
+(warp:defschema warp-coordinator-append-entries-payload
+    ((:constructor make-warp-coordinator-append-entries-payload))
+  "Payload for `AppendEntries` RPC (heartbeats and log replication).
+
+Fields:
+- `term` (integer): Leader's term.
+- `leader-id` (string): Leader's ID.
+- `prev-log-index` (integer): Index of log entry immediately preceding
+  new ones.
+- `prev-log-term` (integer): Term of `prev-log-index` entry.
+- `entries` (list): Log entries to append (empty for heartbeats).
+- `leader-commit` (integer): Leader's commit index."
+  (term nil :type integer)
+  (leader-id nil :type string)
+  (prev-log-index nil :type integer)
+  (prev-log-term nil :type integer)
+  (entries nil :type list)
+  (leader-commit nil :type integer))
+
+(warp:defprotobuf-mapping warp-coordinator-append-entries-payload
+  "Protobuf mapping for `warp-coordinator-append-entries-payload`."
+  `((term 1 :int32)
+    (leader-id 2 :string)
+    (prev-log-index 3 :int32)
+    (prev-log-term 4 :int32)
+    (entries 5 :bytes) 
+    (leader-commit 6 :int32)))
+
+(warp:defschema warp-coordinator-append-entries-response-payload
+    ((:constructor make-warp-coordinator-append-entries-response-payload))
+  "Response payload for `AppendEntries` RPC.
+
+Fields:
+- `term` (integer): Current term of follower.
+- `success-p` (boolean): `t` if follower contained `prev-log-index` and
+  `prev-log-term`.
+- `error` (string): Optional error message."
+  (term nil :type integer)
+  (success-p nil :type boolean)
+  (error nil :type (or null string)))
+
+(warp:defprotobuf-mapping warp-coordinator-append-entries-response-payload
+  "Protobuf mapping for `warp-coordinator-append-entries-response-payload`."
+  `((term 1 :int32)
+    (success-p 2 :bool)
+    (error 3 :string)))
+
+(warp:defschema warp-coordinator-lock-request-payload
+    ((:constructor make-warp-coordinator-lock-request-payload))
+  "Payload for `acquire-lock` or `release-lock` RPC.
+
+Fields:
+- `lock-name` (string): Name of the distributed lock.
+- `holder-id` (string): ID of the client trying to acquire/release.
+- `expiry-time` (float): Desired expiry for acquisition."
+  (lock-name nil :type string)
+  (holder-id nil :type string)
+  (expiry-time nil :type float))
+
+(warp:defprotobuf-mapping warp-coordinator-lock-request-payload
+  "Protobuf mapping for `warp-coordinator-lock-request-payload`."
+  `((lock-name 1 :string)
+    (holder-id 2 :string)
+    (expiry-time 3 :double)))
+
+(warp:defschema warp-coordinator-lock-response-payload
+    ((:constructor make-warp-coordinator-lock-response-payload))
+  "Response payload for `acquire-lock` or `release-lock` RPC.
+
+Fields:
+- `granted-p` (boolean): `t` if lock was acquired/released, `nil` if denied.
+- `leader-id` (string): Current leader ID, for redirection.
+- `error` (string): Optional error message."
+  (granted-p nil :type boolean)
+  (leader-id nil :type (or null string))
+  (error nil :type (or null string)))
+
+(warp:defprotobuf-mapping warp-coordinator-lock-response-payload
+  "Protobuf mapping for `warp-coordinator-lock-response-payload`."
+  `((granted-p 1 :bool)
+    (leader-id 2 :string)
+    (error 3 :string)))
+
+(warp:defschema warp-coordinator-barrier-increment-payload
+    ((:constructor make-warp-coordinator-barrier-increment-payload))
+  "Payload for `barrier-increment` RPC.
+
+Fields:
+- `barrier-name` (string): Name of the distributed barrier.
+- `participant-id` (string): ID of the participant.
+- `total-participants` (integer): Target count for the barrier."
+  (barrier-name nil :type string)
+  (participant-id nil :type string)
+  (total-participants nil :type integer))
+
+(warp:defprotobuf-mapping warp-coordinator-barrier-increment-payload
+  "Protobuf mapping for `warp-coordinator-barrier-increment-payload`."
+  `((barrier-name 1 :string)
+    (participant-id 2 :string)
+    (total-participants 3 :int32)))
+
+(warp:defschema warp-coordinator-barrier-response-payload
+    ((:constructor make-warp-coordinator-barrier-response-payload))
+  "Response payload for `barrier-increment` RPC.
+
+Fields:
+- `success-p` (boolean): `t` if increment was successful.
+- `current-count` (integer): Current participants at the barrier.
+- `is-met-p` (boolean): `t` if barrier is now met.
+- `error` (string): Optional error message."
+  (success-p nil :type boolean)
+  (current-count nil :type integer)
+  (is-met-p nil :type boolean)
+  (error nil :type (or null string)))
+
+(warp:defprotobuf-mapping warp-coordinator-barrier-response-payload
+  "Protobuf mapping for `warp-coordinator-barrier-response-payload`."
+  `((success-p 1 :bool)
+    (current-count 2 :int32)
+    (is-met-p 3 :bool)
+    (error 4 :string)))
+
+(warp:defschema warp-coordinator-propose-change-payload
+    ((:constructor make-warp-coordinator-propose-change-payload))
+  "Payload for `propose-change` RPC to the leader.
+
+Fields:
+- `key` (list): The state path to change.
+- `value` (t): The new value for the state path."
+  (key nil :type list)
+  (value nil :type t))
+
+(warp:defprotobuf-mapping warp-coordinator-propose-change-payload
+  "Protobuf mapping for `warp-coordinator-propose-change-payload`."
+  `((key 1 :bytes)
+    (value 2 :bytes)))
+
+(warp:defschema warp-coordinator-propose-change-response-payload
+    ((:constructor make-warp-coordinator-propose-change-response-payload))
+  "Response payload for `propose-change` RPC.
+
+Fields:
+- `success-p` (boolean): `t` if change was applied.
+- `error` (string): Optional error message."
+  (success-p nil :type boolean)
+  (error nil :type (or null string)))
+
+(warp:defprotobuf-mapping warp-coordinator-propose-change-response-payload
+  "Protobuf mapping for `warp-coordinator-propose-change-response-payload`."
+  `((success-p 1 :bool)
+    (error 2 :string)))
+
+(warp:defschema warp-get-all-active-workers-args
+    ((:constructor make-warp-get-all-active-workers-args))
+  "Empty args payload for `:get-all-active-workers` RPC from event broker.
+This RPC requests a list of all active worker IDs and their addresses
+from the master's registry.
+
+Fields: None.")
+
+(warp:defprotobuf-mapping warp-get-all-active-workers-args
+  "Protobuf mapping for `warp-get-all-active-workers-args`. No fields."
+  `())
+
+(warp:defschema warp-get-all-active-workers-response-payload
+    ((:constructor make-warp-get-all-active-workers-response-payload))
+  "Response payload for `:get-all-active-workers` RPC.
+
+Fields:
+- `active-workers` (list): A list of plists, where each plist has
+  `:worker-id` (string) and `:inbox-address` (string)."
+  (active-workers nil :type list))
+
+(warp:defprotobuf-mapping warp-get-all-active-workers-response-payload
+  "Protobuf mapping for `warp-get-all-active-workers-response-payload`."
+  `((active-workers 1 :bytes)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definitions
@@ -225,15 +480,20 @@ Fields:
 (defun warp-protocol--make-command
     (name args-constructor &rest args-plist)
   "Construct a `warp-rpc-command` object with its payload.
-This helper standardizes the creation of RPC command objects.
+This helper standardizes the creation of RPC command objects by taking
+a command name, a schema constructor for its arguments, and a plist of
+those arguments, then wrapping them into a `warp-rpc-command` struct.
 
 Arguments:
 - `NAME` (keyword): The symbolic name of the RPC command (e.g., `:ping`).
-- `ARGS-CONSTRUCTOR` (function): The constructor for the payload schema.
-- `&rest ARGS-PLIST` (plist): A property list of arguments for the payload.
+- `ARGS-CONSTRUCTOR` (function): The constructor for the payload schema
+  (e.g., `#'make-warp-ping-payload`).
+- `&rest ARGS-PLIST` (plist): A property list of arguments for the
+  payload, passed directly to `ARGS-CONSTRUCTOR`.
 
 Returns:
-- (warp-rpc-command): A new, fully-formed RPC command object."
+- (warp-rpc-command): A new, fully-formed RPC command object, ready to
+  be included in a `warp-rpc-message`."
   (let ((payload (apply args-constructor args-plist)))
     (make-warp-rpc-command :name name :args payload)))
 
@@ -255,25 +515,49 @@ Returns:
   (%%make-protocol-client :rpc-system rpc-system))
 
 ;;;###autoload
-(cl-defun warp:protocol-client-send-worker-ready
-    (client connection worker-id rank status &key launch-id challenge-token
-                                                  signature public-key
-                                                  inbox-address
-                                                  (expect-response t))
+(cl-defun warp:protocol-client-send-worker-ready (client 
+                                                  connection 
+                                                  worker-id 
+                                                  rank 
+                                                  status &key launch-id 
+                                                              challenge-token
+                                                              signature 
+                                                              public-key
+                                                              inbox-address
+                                                              (expect-response t)
+                                                              origin-instance-id)
   "Send a `:worker-ready` notification from a worker to the master.
+This is the initial handshake RPC used by a worker to announce its
+presence and status to the master, and perform a secure challenge.
 
 Arguments:
 - `CLIENT` (warp-protocol-client): The protocol client instance.
 - `CONNECTION` (t): The active `warp-transport` connection to the master.
 - `WORKER-ID` (string): The unique identifier of the worker.
 - `RANK` (integer): The worker's assigned rank.
-- `STATUS` (keyword): The worker's current status (e.g., `:starting`).
-- `:launch-id` (string): The unique ID of this launch instance.
-- `:challenge-token` (string): The cryptographic challenge from the master.
-- `:signature` (string): The worker's digital signature for auth.
-- `:public-key` (string): The worker's public key material.
-- `:inbox-address` (string): The IPC address the worker is listening on.
-- `:expect-response` (boolean): Whether a response is expected."
+- `STATUS` (keyword): The worker's current status (e.g., `:starting`,
+  `:running`).
+- `:launch-id` (string, optional): A one-time ID for this launch, for
+  security challenge.
+- `:challenge-token` (string, optional): The cryptographic challenge
+  token received from the master.
+- `:signature` (string, optional): The worker's digital signature over
+  the challenge token, for authentication.
+- `:public-key` (string, optional): The worker's public key material,
+  used by the master to verify the signature.
+- `:inbox-address` (string, optional): The IPC address the worker is
+  listening on, for master to send subsequent RPCs.
+- `:expect-response` (boolean, optional): Whether a response is expected
+  from the RPC. Defaults to `t`.
+- `:origin-instance-id` (string, optional): The ID of the component system
+  instance originating this request. **Crucial for remote promise resolution.**
+
+Returns:
+- (loom-promise or nil): A promise for the response if `expect-response`
+  is `t`, otherwise `nil`.
+
+Side Effects:
+- Calls `warp:rpc-request` to send the message."
   (let ((cmd (warp-protocol--make-command
               :worker-ready #'make-warp-worker-ready-payload
               :worker-id worker-id :rank rank :status status
@@ -284,12 +568,19 @@ Arguments:
               :inbox-address inbox-address)))
     (warp:rpc-request (warp-protocol-client-rpc-system client)
                       connection worker-id "master" cmd
-                      :expect-response expect-response)))
+                      :expect-response expect-response
+                      :origin-instance-id origin-instance-id)))
 
 ;;;###autoload
-(cl-defun warp:protocol-client-send-heartbeat
-    (client connection worker-id status services &key (expect-response nil))
+(cl-defun warp:protocol-client-send-heartbeat (client 
+                                               connection 
+                                               worker-id 
+                                               status 
+                                               services 
+                                               &key (expect-response nil)
+                                                    origin-instance-id)
   "Send a periodic `:heartbeat` from a worker to the master.
+Heartbeats are used to report the worker's liveness and current metrics.
 
 Arguments:
 - `CLIENT` (warp-protocol-client): The protocol client instance.
@@ -297,36 +588,70 @@ Arguments:
 - `WORKER-ID` (string): The ID of the worker sending the heartbeat.
 - `STATUS` (keyword): The worker's current operational status.
 - `SERVICES` (list): A list describing services hosted by the worker.
-- `:expect-response` (boolean): Whether a response is expected."
+- `:expect-response` (boolean, optional): Whether a response is expected.
+  Defaults to `nil` (fire-and-forget).
+- `:origin-instance-id` (string, optional): The ID of the component system
+  instance originating this request. **Crucial for remote promise resolution.**
+
+Returns:
+- (loom-promise or nil): A promise for the response if `expect-response`
+  is `t`, otherwise `nil`.
+
+Side Effects:
+- Calls `warp:rpc-request` to send the message."
   (let ((cmd (warp-protocol--make-command
               :heartbeat #'make-warp-worker-heartbeat-payload
               :worker-id worker-id :status status :services services)))
     (warp:rpc-request (warp-protocol-client-rpc-system client)
                       connection worker-id "master" cmd
-                      :expect-response expect-response)))
+                      :expect-response expect-response
+                      :origin-instance-id origin-instance-id)))
 
 ;;;###autoload
-(cl-defun warp:protocol-ping (rpc-system connection sender-id recipient-id
-                                         &key (expect-response t))
+(cl-defun warp:protocol-ping (rpc-system 
+                              connection 
+                              sender-id 
+                              recipient-id
+                              &key (expect-response t)
+                                   origin-instance-id)
   "Send a `:ping` RPC to check liveness between two nodes.
+This is a basic liveness probe or round-trip time measurement.
 
 Arguments:
 - `RPC-SYSTEM` (warp-rpc-system): The RPC system managing the request.
 - `CONNECTION` (t): The `warp-transport` connection to the target node.
 - `SENDER-ID` (string): The unique ID of the node sending the ping.
 - `RECIPIENT-ID` (string): The unique ID of the node being pinged.
-- `:expect-response` (boolean): Whether a response is expected."
+- `:expect-response` (boolean, optional): Whether a response is expected.
+  Defaults to `t`.
+- `:origin-instance-id` (string, optional): The ID of the component system
+  instance originating this request. **Crucial for remote promise resolution.**
+
+Returns:
+- (loom-promise or nil): A promise for the response (e.g., "pong") if
+  `expect-response` is `t`, otherwise `nil`.
+
+Side Effects:
+- Calls `warp:rpc-request` to send the message."
   (let ((cmd (warp-protocol--make-command
               :ping #'make-warp-ping-payload
               :message "ping")))
     (warp:rpc-request rpc-system connection sender-id recipient-id cmd
-                      :expect-response expect-response)))
+                      :expect-response expect-response
+                      :origin-instance-id origin-instance-id)))
 
 ;;;###autoload
-(cl-defun warp:protocol-client-request-map-chunk
-    (client connection master-id worker-id function-form chunk-data
-            &key (expect-response t))
+(cl-defun warp:protocol-client-request-map-chunk (client 
+                                                  connection 
+                                                  master-id 
+                                                  worker-id 
+                                                  function-form 
+                                                  chunk-data
+                                                  &key (expect-response t) 
+                                                       origin-instance-id)
   "Request a worker to evaluate a map function over a chunk of data.
+This RPC is part of a distributed map-reduce pattern, allowing a master
+to distribute computation to workers.
 
 Arguments:
 - `CLIENT` (warp-protocol-client): The protocol client instance.
@@ -335,27 +660,54 @@ Arguments:
 - `WORKER-ID` (string): The target worker's unique ID.
 - `FUNCTION-FORM` (form): S-expression that evaluates to the map function.
 - `CHUNK-DATA` (list): The list of data items for the worker to process.
-- `:expect-response` (boolean): Whether a response is expected."
+- `:expect-response` (boolean, optional): Whether a response is expected.
+  Defaults to `t`.
+- `:origin-instance-id` (string, optional): The ID of the component system
+  instance originating this request. **Crucial for remote promise resolution.**
+
+Returns:
+- (loom-promise or nil): A promise for the `warp-cluster-map-result` if
+  `expect-response` is `t`, otherwise `nil`.
+
+Side Effects:
+- Calls `warp:rpc-request` to send the message."
   (let ((cmd (warp-protocol--make-command
               :evaluate-map-chunk #'make-warp-cluster-map-payload
               :function-form function-form :chunk-data chunk-data)))
     (warp:rpc-request (warp-protocol-client-rpc-system client)
                       connection master-id worker-id cmd
-                      :expect-response expect-response)))
+                      :expect-response expect-response
+                      :origin-instance-id origin-instance-id)))
 
 ;;;###autoload
-(cl-defun warp:protocol-request-provision
-    (client connection worker-id current-version provision-type
-            &key (expect-response t))
+(cl-defun warp:protocol-request-provision (client 
+                                           connection 
+                                           worker-id 
+                                           current-version 
+                                           provision-type
+                                           &key (expect-response t) 
+                                                 origin-instance-id)
   "Send a `:provision-request` RPC from a worker to the master.
+Workers use this to fetch their configuration or other provisioning data.
 
 Arguments:
 - `CLIENT` (warp-protocol-client): The protocol client instance.
 - `CONNECTION` (t): The active `warp-transport` connection to the master.
 - `WORKER-ID` (string): The ID of the worker requesting the provision.
 - `CURRENT-VERSION` (string): The version of the provision the worker has.
-- `PROVISION-TYPE` (keyword): The type of provision requested.
-- `:expect-response` (boolean): Whether a response is expected."
+- `PROVISION-TYPE` (keyword): The type of provision requested (e.g.,
+  `:worker-provision`, `:jwt-keys`).
+- `:expect-response` (boolean, optional): Whether a response is expected.
+  Defaults to `t`.
+- `:origin-instance-id` (string, optional): The ID of the component system
+  instance originating this request. **Crucial for remote promise resolution.**
+
+Returns:
+- (loom-promise or nil): A promise for the `warp-provision-response-payload`
+  if `expect-response` is `t`, otherwise `nil`.
+
+Side Effects:
+- Calls `warp:rpc-request` to send the message."
   (let ((cmd (warp-protocol--make-command
               :get-provision #'make-warp-provision-request-payload
               :worker-id worker-id
@@ -363,24 +715,45 @@ Arguments:
               :provision-type provision-type)))
     (warp:rpc-request (warp-protocol-client-rpc-system client)
                       connection worker-id "master" cmd
-                      :expect-response expect-response)))
+                      :expect-response expect-response
+                      :origin-instance-id origin-instance-id)))
 
 ;;;###autoload
-(cl-defun warp:protocol-publish-provision
-    (rpc-system connection sender-id recipient-id version provision-obj
-     provision-type &key target-ids (expect-response nil))
+(cl-defun warp:protocol-publish-provision (rpc-system 
+                                           connection 
+                                           sender-id 
+                                           recipient-id 
+                                           version 
+                                           provision-obj
+                                           provision-type 
+                                           &key target-ids 
+                                                (expect-response nil)
+                                                origin-instance-id)
   "Send a `:provision-update` event from the master to workers.
+The master uses this to push configuration updates to workers.
 
 Arguments:
 - `RPC-SYSTEM` (warp-rpc-system): The RPC system managing the request.
 - `CONNECTION` (t): The `warp-transport` connection to the target node.
 - `SENDER-ID` (string): ID of the master sending the update.
 - `RECIPIENT-ID` (string): ID of the target worker (or \"cluster\").
+  If \"cluster\", the underlying IPC/transport handles fanout.
 - `VERSION` (string): The new version identifier of the provision.
 - `PROVISION-OBJ` (any): The new provision object.
 - `PROVISION-TYPE` (keyword): The type of provision being updated.
-- `:target-ids` (list): Optional list of specific worker IDs to target.
-- `:expect-response` (boolean): Whether a response is expected."
+- `:target-ids` (list, optional): Optional list of specific worker IDs to
+  target within a broadcast.
+- `:expect-response` (boolean, optional): Whether a response is expected.
+  Defaults to `nil`.
+- `:origin-instance-id` (string, optional): The ID of the component system
+  instance originating this request. **Crucial for remote promise resolution.**
+
+Returns:
+- (loom-promise or nil): A promise for the response if `expect-response`
+  is `t`, otherwise `nil`.
+
+Side Effects:
+- Calls `warp:rpc-request` to send the message."
   (let ((cmd (warp-protocol--make-command
               :provision-update #'make-warp-provision-update-payload
               :version version
@@ -388,7 +761,247 @@ Arguments:
               :provision-type provision-type
               :target-ids target-ids)))
     (warp:rpc-request rpc-system connection sender-id recipient-id cmd
-                      :expect-response expect-response)))
+                      :expect-response expect-response
+                      :origin-instance-id origin-instance-id)))
+
+;;;###autoload
+(cl-defun warp:protocol-send-distributed-event
+    (rpc-system connection sender-id recipient-id event &key origin-instance-id)
+  "Sends a distributed event to a target event broker worker.
+This is used by event systems to propagate events with `:cluster` or
+`:global` scope.
+
+Arguments:
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system.
+- `CONNECTION` (t): The `warp-transport` connection to the broker.
+- `SENDER-ID` (string): The ID of the event's original emitter.
+- `RECIPIENT-ID` (string): The ID of the event broker (target).
+- `EVENT` (warp-event): The `warp-event` object to propagate.
+- `:origin-instance-id` (string, optional): The ID of the component system
+  instance originating this RPC. Crucial for remote promise resolution.
+
+Returns:
+- (loom-promise): A promise that resolves when the event is sent to the broker."
+  (let ((cmd (warp-protocol--make-command
+              :propagate-event #'make-warp-propagate-event-payload
+              :event event)))
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response nil ; Events are fire-and-forget for client
+                      :origin-instance-id origin-instance-id)))
+
+;;;###autoload
+(cl-defun warp:protocol-coordinator-request-vote (rpc-system 
+                                                  connection 
+                                                  sender-id 
+                                                  recipient-id 
+                                                  candidate-id 
+                                                  term 
+                                                  last-log-index 
+                                                  last-log-term 
+                                                  &key origin-instance-id)
+  "Sends a `RequestVote` RPC in Raft-like consensus.
+
+Arguments:
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system.
+- `CONNECTION` (t): The `warp-transport` connection to the peer.
+- `SENDER-ID` (string): The ID of the candidate sending the request.
+- `RECIPIENT-ID` (string): The ID of the peer to request vote from.
+- `CANDIDATE-ID` (string): The ID of the candidate requesting vote.
+- `TERM` (integer): Candidate's current term.
+- `LAST-LOG-INDEX` (integer): Index of candidate's last log entry.
+- `LAST-LOG-TERM` (integer): Term of candidate's last log entry.
+- `:origin-instance-id` (string, optional): The ID of the component system
+  instance originating this RPC. Crucial for remote promise resolution.
+
+Returns:
+- (loom-promise): A promise that resolves with the response payload."
+  (let ((cmd (warp-protocol--make-command
+              :coordinator-request-vote #'make-warp-coordinator-request-vote-payload
+              :term term :candidate-id candidate-id
+              :last-log-index last-log-index :last-log-term last-log-term)))
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response t
+                      :origin-instance-id origin-instance-id)))
+
+;;;###autoload
+(cl-defun warp:protocol-coordinator-append-entries (rpc-system 
+                                                    connection 
+                                                    sender-id 
+                                                    recipient-id 
+                                                    term 
+                                                    leader-id 
+                                                    prev-log-index 
+                                                    prev-log-term 
+                                                    entries 
+                                                    leader-commit 
+                                                    &key origin-instance-id)
+  "Sends an `AppendEntries` RPC (heartbeats and log replication) in Raft-like consensus.
+
+Arguments:
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system.
+- `CONNECTION` (t): The `warp-transport` connection to the peer.
+- `SENDER-ID` (string): The ID of the leader sending the request.
+- `RECIPIENT-ID` (string): The ID of the peer.
+- `TERM` (integer): Leader's current term.
+- `LEADER-ID` (string): Leader's ID.
+- `PREV-LOG-INDEX` (integer): Index of log entry immediately preceding new ones.
+- `PREV-LOG-TERM` (integer): Term of `prev-log-index` entry.
+- `ENTRIES` (list): Log entries to append (empty for heartbeats).
+- `LEADER-COMMIT` (integer): Leader's commit index.
+- `:origin-instance-id` (string, optional): The ID of the component system
+  instance originating this RPC. Crucial for remote promise resolution.
+
+Returns:
+- (loom-promise): A promise that resolves with the response payload."
+  (let ((cmd (warp-protocol--make-command
+              :coordinator-append-entries #'make-warp-coordinator-append-entries-payload
+              :term term :leader-id leader-id
+              :prev-log-index prev-log-index :prev-log-term prev-log-term
+              :entries entries :leader-commit leader-commit)))
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response t
+                      :origin-instance-id origin-instance-id)))
+
+;;;###autoload
+(cl-defun warp:protocol-coordinator-acquire-lock (rpc-system 
+                                                  connection 
+                                                  sender-id 
+                                                  recipient-id 
+                                                  lock-name 
+                                                  holder-id 
+                                                  expiry-time 
+                                                  &key origin-instance-id)
+  "Sends an `acquire-lock` RPC to a coordinator.
+
+Arguments:
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system.
+- `CONNECTION` (t): The `warp-transport` connection to the coordinator.
+- `SENDER-ID` (string): The ID of the client sending the request.
+- `RECIPIENT-ID` (string): The ID of the target coordinator.
+- `LOCK-NAME` (string): The name of the lock.
+- `HOLDER-ID` (string): The ID of the client trying to acquire.
+- `EXPIRY-TIME` (float): Desired expiry for acquisition.
+- `:origin-instance-id` (string, optional): The ID of the component system
+  instance originating this RPC. Crucial for remote promise resolution.
+
+Returns:
+- (loom-promise): A promise that resolves with the response payload."
+  (let ((cmd (warp-protocol--make-command
+              :coordinator-acquire-lock #'make-warp-coordinator-lock-request-payload
+              :lock-name lock-name :holder-id holder-id :expiry-time expiry-time)))
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response t
+                      :origin-instance-id origin-instance-id)))
+
+;;;###autoload
+(cl-defun warp:protocol-coordinator-release-lock (rpc-system 
+                                                  connection 
+                                                  sender-id 
+                                                  recipient-id 
+                                                  lock-name 
+                                                  holder-id 
+                                                  &key origin-instance-id)
+  "Sends a `release-lock` RPC to a coordinator.
+
+Arguments:
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system.
+- `CONNECTION` (t): The `warp-transport` connection to the coordinator.
+- `SENDER-ID` (string): The ID of the client sending the request.
+- `RECIPIENT-ID` (string): The ID of the target coordinator.
+- `LOCK-NAME` (string): The name of the lock.
+- `HOLDER-ID` (string): The ID of the client trying to release.
+- `:origin-instance-id` (string, optional): The ID of the component system
+  instance originating this RPC. Crucial for remote promise resolution.
+
+Returns:
+- (loom-promise): A promise that resolves with the response payload."
+  (let ((cmd (warp-protocol--make-command
+              :coordinator-release-lock #'make-warp-coordinator-lock-request-payload
+              :lock-name lock-name :holder-id holder-id)))
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response t
+                      :origin-instance-id origin-instance-id)))
+
+;;;###autoload
+(cl-defun warp:protocol-coordinator-barrier-increment (rpc-system 
+                                                       connection 
+                                                       sender-id 
+                                                       recipient-id 
+                                                       barrier-name 
+                                                       participant-id 
+                                                       total-participants 
+                                                       &key origin-instance-id)
+  "Sends a `barrier-increment` RPC to a coordinator.
+
+Arguments:
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system.
+- `CONNECTION` (t): The `warp-transport` connection to the coordinator.
+- `SENDER-ID` (string): The ID of the participant.
+- `RECIPIENT-ID` (string): The ID of the target coordinator.
+- `BARRIER-NAME` (string): The name of the barrier.
+- `PARTICIPANT-ID` (string): The ID of the participant.
+- `TOTAL-PARTICIPANTS` (integer): The target count for the barrier.
+- `:origin-instance-id` (string, optional): The ID of the component system
+  instance originating this RPC. Crucial for remote promise resolution.
+
+Returns:
+- (loom-promise): A promise that resolves with the response payload."
+  (let ((cmd (warp-protocol--make-command
+              :coordinator-barrier-increment #'make-warp-coordinator-barrier-increment-payload
+              :barrier-name barrier-name :participant-id participant-id
+              :total-participants total-participants)))
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response t
+                      :origin-instance-id origin-instance-id)))
+
+;;;###autoload
+(cl-defun warp:protocol-coordinator-propose-change
+    (rpc-system connection sender-id recipient-id key value &key origin-instance-id)
+  "Sends a `propose-change` RPC to a coordinator leader.
+
+Arguments:
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system.
+- `CONNECTION` (t): The `warp-transport` connection to the coordinator.
+- `SENDER-ID` (string): The ID of the client proposing the change.
+- `RECIPIENT-ID` (string): The ID of the target coordinator (leader).
+- `KEY` (list): The state path to change.
+- `VALUE` (t): The new value for the state path.
+- `:origin-instance-id` (string, optional): The ID of the component system
+  instance originating this RPC. Crucial for remote promise resolution.
+
+Returns:
+- (loom-promise): A promise that resolves with the response payload."
+  (let ((cmd (warp-protocol--make-command
+              :coordinator-propose-change #'make-warp-coordinator-propose-change-payload
+              :key key :value value)))
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response t
+                      :origin-instance-id origin-instance-id)))
+
+;;;###autoload
+(cl-defun warp:protocol-get-all-active-workers (rpc-system 
+                                                connection 
+                                                sender-id 
+                                                recipient-id 
+                                                &key origin-instance-id)
+  "Sends a `:get-all-active-workers` RPC to the master.
+
+Arguments:
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system managing the request.
+- `CONNECTION` (t): The `warp-transport` connection to the master.
+- `SENDER-ID` (string): The ID of the client sending the request.
+- `RECIPIENT-ID` (string): The ID of the master.
+- `:origin-instance-id` (string, optional): The ID of the component system
+  instance originating this RPC. Crucial for remote promise resolution.
+
+Returns:
+- (loom-promise): A promise that resolves with the response payload,
+  containing a list of active workers (plist with `:worker-id`, `:inbox-address`)."
+  (let ((cmd (warp-protocol--make-command
+              :get-all-active-workers #'make-warp-get-all-active-workers-args)))
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response t
+                      :origin-instance-id origin-instance-id)))
 
 (provide 'warp-protocol)
 ;;; warp-protocol.el ends here

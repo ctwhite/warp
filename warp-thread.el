@@ -403,18 +403,18 @@ Side Effects:
 ;;; Public API
 
 ;;;###autoload
-(cl-defun warp:thread-pool (&key name
-                              (pool-size (thread-pool-config-pool-size
-                                          (make-thread-pool-config)))
-                              (max-queue-size (thread-pool-config-max-queue-size
-                                               (make-thread-pool-config)))
-                              (overflow-policy (thread-pool-config-overflow-policy
-                                                (make-thread-pool-config)))
-                              (thread-health-check-interval (thread-pool-config-thread-health-check-interval
-                                                             (make-thread-pool-config)))
-                              (thread-idle-timeout (thread-pool-config-thread-idle-timeout
+(cl-defun warp:thread-pool-create (&key name
+                                        (pool-size (thread-pool-config-pool-size
                                                     (make-thread-pool-config)))
-                              &allow-other-keys)
+                                        (max-queue-size (thread-pool-config-max-queue-size
+                                                        (make-thread-pool-config)))
+                                        (overflow-policy (thread-pool-config-overflow-policy
+                                                          (make-thread-pool-config)))
+                                        (thread-health-check-interval (thread-pool-config-thread-health-check-interval
+                                                                      (make-thread-pool-config)))
+                                        (thread-idle-timeout (thread-pool-config-thread-idle-timeout
+                                                              (make-thread-pool-config)))
+                                        &allow-other-keys)
   "Initialize and start a new background thread pool instance.
 This function constructs a `warp-thread-pool` which wraps an instance
 of the generalized `warp-pool` to manage native Emacs threads.
@@ -621,7 +621,7 @@ Signals:
     (warp:pool-metrics (warp-thread-pool-pool-obj target-pool))))
 
 ;;;###autoload
-(cl-defun warp:thread-pool-default (&key name pool-size)
+(cl-defun warp:thread-pool-create-default (&key name pool-size)
   "Return the default `warp-thread-pool`, initializing it if needed.
 
 Arguments:
@@ -643,9 +643,9 @@ Side Effects:
                    nil))
     (warp:log! :info "Global" "Initializing default thread pool.")
     (setq warp--default-thread-pool-instance
-          (warp:thread-pool :name (or name "default-pool")
-                            :pool-size (or pool-size (thread-pool-config-pool-size
-                                                      (make-thread-pool-config))))))
+          (warp:thread-pool-create :name (or name "default-pool")
+                                    :pool-size (or pool-size (thread-pool-config-pool-size
+                                                              (make-thread-pool-config))))))
   warp--default-thread-pool-instance)
 
 ;;;###autoload

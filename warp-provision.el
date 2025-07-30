@@ -43,6 +43,7 @@
 (require 'warp-rpc)
 (require 'warp-protocol)
 (require 'warp-env)
+(require 'warp-component) 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -70,11 +71,14 @@ Fields:
 - `current-versions` (hash-table): Maps a `PROVISION-TYPE` to its
   currently active `VERSION` string.
 - `event-system` (warp-event-system): The event bus for publishing updates.
+- `rpc-system` (warp-rpc-system): The RPC system for direct RPCs (e.g. for
+  `warp:provision-publish`). (NEW FIELD)
 - `command-router` (warp-command-router): The router for handling RPCs."
   (name nil :type string :read-only t)
   (provision-store nil :type (or null t))
   (current-versions nil :type (or null hash-table))
   (event-system nil :type (or null t))
+  (rpc-system nil :type (or null warp-rpc-system)) ; New field for passing to protocol calls
   (command-router nil :type (or null t)))
 
 (cl-defstruct (warp-worker-provision-client
@@ -86,6 +90,8 @@ Fields:
 - `name` (string): A descriptive name for the client instance.
 - `worker-id` (string): The ID of the parent worker.
 - `master-id` (string): The ID of the master process.
+- `component-system-id` (string): The ID of the parent `warp-component-system`
+  (NEW FIELD), needed for `origin-instance-id` in RPCs.
 - `active-provisions` (hash-table): Maps a `PROVISION-TYPE` to the
   currently active provision object.
 - `active-versions` (hash-table): Maps a `PROVISION-TYPE` to the
@@ -98,6 +104,7 @@ Fields:
   (name nil :type string :read-only t)
   (worker-id nil :type string)
   (master-id nil :type (or null string))
+  (component-system-id nil :type string) ; New field
   (active-provisions nil :type (or null hash-table))
   (active-versions nil :type (or null hash-table))
   (apply-hooks nil :type (or null hash-table))
@@ -175,8 +182,8 @@ Side Effects:
     ;; prevents re-running hooks unnecessarily for idempotent updates.
     (unless (equal new-version old-version)
       (warp:log! :info (warp-worker-provision-client-name client)
-                 "Applying new provision for %S: version %s (old: %s)."
-                 provision-type new-version (or old-version "none"))
+                 (format "Applying new provision for %S: version %s (old: %s)."
+                         provision-type new-version (or old-version "none")))
       (puthash provision-type new-provision
                (warp-worker-provision-client-active-provisions client))
       (puthash provision-type new-version
@@ -188,11 +195,14 @@ Side Effects:
         (dolist (hook-fn hooks)
           (condition-case err (funcall hook-fn new-provision old-provision)
             (error (warp:log! :warn (warp-worker-provision-client-name client)
-                              "Error in provision apply hook for %S: %S"
-                              provision-type err))))))))
+                              (format "Error in provision apply hook for %S: %S"
+                                      provision-type err))))))))
 
 (defun warp--provision-handle-provision-update-event (client event)
   "Handle a `:provision-update` event on the worker side.
+This function processes incoming provision update events (pushed by the
+master). It extracts the new provision and version from the event and
+applies it if the event is relevant to this worker.
 
 Arguments:
 - `CLIENT` (warp-worker-provision-client): The worker's provision client.
@@ -213,29 +223,42 @@ Side Effects:
     ;; worker's ID is in the specific target list.
     (when (or (null targets) (member worker-id targets :test #'string=))
       (warp:log! :debug (warp-worker-provision-client-name client)
-                 "Received provision update for %S, version %s."
-                 prov-type new-ver)
+                 (format "Received provision update for %S, version %s."
+                         prov-type new-ver))
       (warp--provision-apply-provision client prov-type new-prov new-ver))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;###autoload
-(cl-defun warp:master-provision-manager-create (&key name 
+(cl-defun warp:master-provision-manager-create (&key name
                                                      event-system
+                                                     rpc-system ; Pass rpc-system
                                                      command-router)
   "Create a new master-side provisioning manager component.
+This component is responsible for storing, versioning, and publishing
+configuration 'provisions' to workers across the cluster. It also
+handles RPC requests from workers to fetch provisions.
 
 Arguments:
 - `:name` (string): A descriptive name for the manager.
 - `:event-system` (warp-event-system): Event bus for publishing updates.
-- `:command-router` (warp-command-router): Router for handling RPCs.
+- `:rpc-system` (warp-rpc-system): The master's RPC system, used for
+  publishing provisions (push updates). (NEW ARG)
+- `:command-router` (warp-command-router): Router for handling RPCs
+  from workers (pull requests like `:get-provision`).
 
 Returns:
-- (warp-master-provision-manager): A new manager instance."
+- (warp-master-provision-manager): A new manager instance.
+
+Side Effects:
+- Creates an internal `warp-registry` for storing provisions.
+- Initializes internal hash tables for tracking current versions.
+- Registers an RPC handler (`:get-provision`) with the `command-router`."
   (let ((manager (%%make-master-provision-manager
                   :name (or name "master-provision-mgr")
                   :event-system event-system
+                  :rpc-system rpc-system ; Store rpc-system
                   :command-router command-router)))
     (setf (warp-master-provision-manager-provision-store manager)
           (warp:registry-create
@@ -258,28 +281,41 @@ Returns:
     manager))
 
 ;;;###autoload
-(cl-defun warp:worker-provision-client-create (&key name 
-                                                    worker-id 
+(cl-defun warp:worker-provision-client-create (&key name
+                                                    worker-id
                                                     master-id
-                                                    event-system 
+                                                    component-system-id ; NEW
+                                                    event-system
                                                     rpc-system
                                                     connection-manager)
   "Create a new worker-side provisioning client component.
+This client runs on a worker process and is responsible for fetching
+its initial configuration from the master and applying dynamic updates
+as they are published.
 
 Arguments:
 - `:name` (string): A descriptive name for the client.
-- `:worker-id` (string): The ID of the parent worker.
+- `:worker-id` (string): The ID of the parent worker this client belongs to.
 - `:master-id` (string): The ID of the master process.
-- `:event-system` (warp-event-system): Event bus for receiving updates.
+- `:component-system-id` (string): The ID of the parent `warp-component-system`
+  instance on this worker. **Crucial for `origin-instance-id` in RPCs.** (NEW ARG)
+- `:event-system` (warp-event-system): Event bus for receiving updates
+  pushed from the master.
 - `:rpc-system` (warp-rpc-system): RPC system for fetching provisions.
-- `:connection-manager` (warp-connection-manager): For master connection.
+- `:connection-manager` (warp-connection-manager): For maintaining the
+  network connection to the master.
 
 Returns:
-- (warp-worker-provision-client): A new client instance."
+- (warp-worker-provision-client): A new client instance.
+
+Side Effects:
+- Initializes internal hash tables for active provisions, versions, and hooks.
+- Logs client creation."
   (let ((client (%%make-worker-provision-client
                  :name (or name "worker-provision-client")
                  :worker-id worker-id
                  :master-id (or master-id "master")
+                 :component-system-id component-system-id ; Store the ID
                  :event-system event-system
                  :rpc-system rpc-system
                  :connection-manager connection-manager)))
@@ -296,19 +332,27 @@ Returns:
 ;;;###autoload
 (defun warp:provision-start-manager (client)
   "Starts the worker provision client. (Component :start hook)
-This function subscribes to live updates and then fetches the initial
-state for all provision types that have registered apply hooks.
+This function subscribes to live updates from the master and then
+fetches the initial state for all provision types that have registered
+apply hooks. This ensures the worker is configured upon startup.
 
 Arguments:
 - `CLIENT` (warp-worker-provision-client): The client instance.
 
-Returns: (loom-promise): A promise that resolves when all initial
-  provisions have been fetched and applied."
+Returns:
+- (loom-promise): A promise that resolves when all initial
+  provisions have been fetched and applied.
+
+Side Effects:
+- Subscribes to `:provision-update` events on the event system.
+- Sends RPC requests to the master to fetch provisions.
+- Calls `warp--provision-apply-provision` to apply fetched provisions."
   (let ((es (warp-worker-provision-client-event-system client))
         (cm (warp-worker-provision-client-connection-manager client))
         (rpc-system (warp-worker-provision-client-rpc-system client))
         (worker-id (warp-worker-provision-client-worker-id client))
         (master-id (warp-worker-provision-client-master-id client))
+        (component-system-id (warp-worker-provision-client-component-system-id client)) ; Get ID
         (apply-hooks (warp-worker-provision-client-apply-hooks client))
         (initial-fetch-promises nil))
     ;; 1. Subscribe to live `provision-update` events from the master.
@@ -325,7 +369,8 @@ Returns: (loom-promise): A promise that resolves when all initial
         (braid! (warp:protocol-request-provision
                  (warp:protocol-client-create :rpc-system rpc-system)
                  (warp:connection-manager-get-connection cm)
-                 worker-id nil prov-type)
+                 worker-id nil prov-type
+                 :origin-instance-id component-system-id) ; Pass origin ID
           (:then (lambda (response)
                    (when response
                      (warp--provision-apply-provision
@@ -337,8 +382,9 @@ Returns: (loom-promise): A promise that resolves when all initial
           (:catch (lambda (err)
                     (warp:log! :error (warp-worker-provision-client-name
                                        client)
-                               "Failed to fetch initial provision for %S: %S"
-                               prov-type err))))
+                               (format "Failed to fetch initial provision for %S: %S"
+                                       prov-type err))))
+          ) ; End braid! push
         initial-fetch-promises))
      apply-hooks)
 
@@ -346,14 +392,15 @@ Returns: (loom-promise): A promise that resolves when all initial
     (loom:all-settled initial-fetch-promises)))
 
 ;;;###autoload
-(cl-defun warp:provision-publish (manager 
-                                  provision-type 
-                                  version 
+(cl-defun warp:provision-publish (manager
+                                  provision-type
+                                  version
                                   provision-obj
                                   &key target-ids)
   "Publish a new provision version (Master-side operation).
 This function stores a new version of a provision and pushes it out
-to workers via a `:provision-update` event.
+to workers via a `:provision-update` event. This allows for live,
+zero-downtime configuration updates.
 
 Arguments:
 - `MANAGER` (warp-master-provision-manager): The master's manager.
@@ -361,9 +408,18 @@ Arguments:
 - `VERSION` (string): A unique version string for this update.
 - `PROVISION-OBJ` (any): The serializable provision object.
 - `:target-ids` (list, optional): A list of worker IDs to target. If
-  `nil`, the update is broadcast to all workers.
+  `nil`, the update is broadcast to all workers (via event system).
 
-Returns: `t`."
+Returns:
+- (loom-promise): A promise that resolves to `t` when the provision has
+  been successfully stored and the push notification sent, or rejects
+  on failure.
+
+Side Effects:
+- Stores the new provision in `provision-store`.
+- Updates `current-versions` hash table.
+- Publishes a `:provision-update` event via the `event-system`
+  (which may then use RPC to distribute)."
   (unless (warp-master-provision-manager-p manager)
     (error "Cannot publish provision from a non-master manager."))
   ;; 1. Store the new provision object in the versioned registry.
@@ -374,45 +430,29 @@ Returns: `t`."
   (puthash provision-type version
            (warp-master-provision-manager-current-versions manager))
   (warp:log! :info (warp-master-provision-manager-name manager)
-             "Published new provision: type=%S, version=%S"
-             provision-type version)
+             (format "Published new provision: type=%S, version=%S"
+                     provision-type version))
 
   ;; 3. Publish an event to notify listening workers of the update.
-  (when-let ((es (warp-master-provision-manager-event-system manager)))
-    (warp:emit-event-with-options
-     es
-     :provision-update
-     (make-warp-protocol-provision-update-payload
-      :version version :provision provision-obj
-      :provision-type provision-type :target-ids target-ids)
-     :source-id (warp-master-provision-manager-name manager)
-     :distribution-scope (if target-ids :cluster :global)))
-  t)
-
-;;;###autoload
-(defun warp:provision-add-apply-hook (client provision-type hook-fn)
-  "Register a function to be called when a provision is updated.
-This is a worker-side function that allows different parts of a worker
-to react dynamically to provision changes pushed by the master.
-
-Arguments:
-- `CLIENT` (warp-worker-provision-client): The worker's provision client.
-- `PROVISION-TYPE` (keyword): The type of provision to hook into.
-- `HOOK-FN` (function): A function `(lambda (new-provision old-provision))`
-  that will be called upon an update.
-
-Returns: `nil`.
-
-Side Effects:
-- Modifies the client's internal `apply-hooks` hash table."
-  (unless (warp-worker-provision-client-p client)
-    (error "Cannot add apply hook on a non-master client."))
-  (let ((hooks (gethash provision-type
-                        (warp-worker-provision-client-apply-hooks client))))
-    (puthash provision-type (cons hook-fn hooks)
-             (warp-worker-provision-client-apply-hooks client)))
-  (warp:log! :debug (warp-worker-provision-client-name client)
-             "Added apply hook for provision type %S." provision-type))
+  (when-let* ((es (warp-master-provision-manager-event-system manager))
+              (rpc-sys (warp-master-provision-manager-rpc-system manager)) ; Get RPC system
+              (component-sys-id (warp-component-system-id ; Get its component system ID
+                                 (warp-rpc-system-component-system rpc-sys))))
+    (braid! (warp:emit-event-with-options
+             es
+             :provision-update
+             (make-warp-protocol-provision-update-payload
+              :version version :provision provision-obj
+              :provision-type provision-type :target-ids target-ids)
+             :source-id (warp-master-provision-manager-name manager)
+             :distribution-scope (if target-ids :cluster :global)
+             :rpc-system rpc-sys ; Pass rpc-system here
+             :origin-instance-id component-sys-id) ; Pass origin ID here
+      (:then (lambda (_) t)) ; Resolve to t on success
+      (:catch (lambda (err)
+                (warp:log! :error (warp-master-provision-manager-name manager)
+                           (format "Failed to emit provision update event: %S" err))
+                (loom:rejected! err))))))
 
 (provide 'warp-provision)
 ;;; warp-provision.el ends here

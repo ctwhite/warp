@@ -41,6 +41,7 @@
 (require 'warp-command-router)
 (require 'warp-service)
 (require 'warp-ipc)
+(require 'warp-component) 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definitions
@@ -111,6 +112,7 @@ Side Effects:
           (warp:log! :info cluster-id "Deregistering worker %s." worker-id)
 
           ;; Remove all service discovery endpoints provided by this worker.
+          ;; This involves iterating through services and updating their endpoint lists.
           (let ((services-map (warp:state-manager-get sm :services)))
             (when services-map
               (cl-loop for s-name being the hash-keys of services-map do
@@ -129,7 +131,7 @@ Side Effects:
           (warp:state-tx-delete tx `(:workers ,worker-id))
 
           ;; The actual connection closure happens outside the transaction
-          ;; as it's a non-stateful side effect.
+          ;; as it's a non-stateful side effect, but logically part of deregistration.
           (when-let ((conn (warp-managed-worker-connection m-worker)))
             (ignore-errors (warp:transport-close conn))))))
 
@@ -151,7 +153,8 @@ This is a reactive event handler, called in response to a
 Arguments:
 - `BRIDGE` (warp-bridge): The bridge instance.
 - `WORKER-ID` (string): The ID of the worker whose status has changed.
-- `NEW-STATUS` (symbol): The new health status (e.g., `:healthy`).
+- `NEW-STATUS` (symbol): The new health status (e.g., `:healthy`, `:degraded`,
+  or `:terminated`).
 
 Returns:
 - `nil`.
@@ -161,7 +164,7 @@ Side Effects:
 - If `NEW-STATUS` is `:terminated`, it initiates the full
   deregistration process."
   (let* ((sm (warp-bridge-state-manager bridge)))
-    (when-let ((m-worker (warp:state-manager-get sm `(:workers ,worker-id))))
+    (when-let ((m-worker (loom:await (warp:state-manager-get sm `(:workers ,worker-id))))) ; Await get
       ;; Directly mutate the field in the managed worker struct and update
       ;; the state manager to persist the change.
       (setf (warp-managed-worker-health-status m-worker) new-status)
@@ -197,6 +200,7 @@ Side Effects:
           (worker-id (warp-protocol-worker-ready-payload-worker-id args))
           (sm (warp-bridge-state-manager bridge)))
      ;; Verify the handshake to ensure the worker is authorized.
+     ;; This `condition-case` handles potential errors from `process-verify-launch-token`.
      (condition-case err
          (warp:process-verify-launch-token
           (warp-protocol-worker-ready-payload-launch-id args)
@@ -207,7 +211,8 @@ Side Effects:
        (error
         ;; If handshake fails, log and immediately close the connection.
         (warp:log! :error (warp-bridge-id bridge)
-                   "Handshake failed for %s. Closing." worker-id)
+                   (format "Handshake failed for %s. Closing: %S"
+                           worker-id err))
         (ignore-errors (warp:transport-close connection))
         (loom:rejected! err))))
 
@@ -223,6 +228,7 @@ Side Effects:
              (ipc (warp-bridge-ipc-system bridge)))
 
         ;; Register the worker's IPC address for remote promise resolution.
+        ;; This allows the master to send RPCs directly to this worker.
         (when (and ipc inbox-addr)
           (warp:ipc-system-register-remote-address ipc worker-id inbox-addr))
 
@@ -242,7 +248,7 @@ Side Effects:
            (warp:emit-event-with-options
             (warp-bridge-event-system bridge)
             :worker-ready-signal-received
-            `(:worker-id ,worker-id :rank ,rank :address ,inbox-addr)))))))))
+            `(:worker-id ,worker-id :rank ,rank :address ,inbox-addr))))))))
 
 (defun warp-bridge--handle-get-init-payload (bridge command)
   "Handle the `:get-init-payload` RPC from a starting worker.
@@ -259,16 +265,21 @@ Returns:
          (rank (warp-protocol-get-init-payload-args-rank
                 (warp-rpc-command-args command))))
     ;; Retrieve the payload directly from the state manager.
-    (or (warp:state-manager-get sm `(:init-payloads ,rank))
+    (or (loom:await (warp:state-manager-get sm `(:init-payloads ,rank))) ; Await get
         (warp:log! :warn (warp-bridge-id bridge)
-                   "No init payload found for rank %s" rank))))
+                   (format "No init payload found for rank %s" rank)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;###autoload
-(cl-defun warp:bridge-create (&key id config event-system command-router
-                                  state-manager rpc-system ipc-system)
+(cl-defun warp:bridge-create (&key id
+                                   config
+                                   event-system
+                                   command-router
+                                   state-manager
+                                   rpc-system
+                                   ipc-system)
   "Create a new `warp-bridge` instance and wire it into the cluster.
 This constructor sets up the bridge and subscribes it to relevant
 cluster events, allowing it to react to changes in worker health and
@@ -300,8 +311,9 @@ Side Effects:
      event-system :worker-status-changed
      (lambda (event)
        (let ((data (warp-event-data event)))
-         (warp-bridge--update-worker-health
-          bridge (plist-get data :worker-id) (plist-get data :new-status)))))
+         (loom:await (warp-bridge--update-worker-health
+                      bridge (plist-get data :worker-id)
+                      (plist-get data :new-status))))))
 
     ;; Subscribe to service registration events to build the global
     ;; service discovery map in the state manager.
@@ -311,12 +323,14 @@ Side Effects:
        (let* ((sm (warp-bridge-state-manager bridge))
               (data (warp-event-data event))
               (s-name (plist-get data :service-name))
-              (endpoints (or (warp:state-manager-get sm `(:services ,s-name))
+              (endpoints (or (loom:await (warp:state-manager-get sm `(:services ,s-name))) ; Await get
                              '()))
               (new-endpoint (make-warp-service-endpoint
-                             :worker-id (plist-get data :worker-id))))
-         (warp:state-manager-update sm `(:services ,s-name)
-                                    (cons new-endpoint endpoints)))))
+                             :worker-id (plist-get data :worker-id)
+                             :service-name s-name ; Ensure service-name is also set on endpoint
+                             :address (plist-get data :address)))) ; Assuming address comes from event
+         (loom:await (warp:state-manager-update sm `(:services ,s-name)
+                                                (cons new-endpoint endpoints))))))
     bridge))
 
 ;;;###autoload
@@ -345,31 +359,34 @@ Signals:
          (rpc-system (warp-bridge-rpc-system bridge)))
 
     ;; Register the RPC handler for workers requesting their init payload.
-    (warp:command-router-add-route
-     router :get-init-payload
-     :handler-fn (lambda (cmd _)
-                   (warp-bridge--handle-get-init-payload bridge cmd)))
+    ;; Use `warp:defrpc-handlers` for consistency.
+    (warp:defrpc-handlers router
+      (:get-init-payload
+       . (lambda (command context)
+           (warp-bridge--handle-get-init-payload bridge command))))
 
     ;; Start the transport listener. The `:on-data-fn` is the critical
-    ;; entry point for all communication from workers.
+    ;; entry point for all communication from workers. It receives marshalled
+    ;; RPC messages, unmarshals them, and then dispatches them.
     (braid! (warp:transport-open
              addr :mode :listen
              :on-data-fn
-             (lambda (msg conn)
-               (let* ((cmd (warp-rpc-message-payload msg))
-                      (cmd-name (warp-rpc-command-name cmd))
-                      (context `(:connection ,conn)))
+             (lambda (msg-string conn) ; Raw message string from transport
+               (let* ((rpc-msg (warp:marshal-from-string msg-string)) ; Unmarshal to warp-rpc-message
+                      (cmd-payload (warp-rpc-message-payload rpc-msg)) ; Get command payload
+                      (cmd-name (warp-rpc-command-name cmd-payload)) ; Get command name
+                      (context `(:connection ,conn :rpc-message ,rpc-msg))) ; Build context
                  ;; The `:worker-ready` command is a special case handled
                  ;; directly by the bridge for the security handshake.
                  (if (eq cmd-name :worker-ready)
-                     (warp-bridge--handle-worker-ready bridge msg conn)
+                     (warp-bridge--handle-worker-ready bridge rpc-msg conn)
                    ;; All other commands are dispatched via the main router.
-                   (warp:command-router-dispatch router cmd context)))))
+                   (warp:rpc-handle-request rpc-system rpc-msg conn))))) ; Let rpc-system handle dispatch and response
       (:then (lambda (server)
                (setf (warp-bridge-transport-server bridge) server)
                (warp:log! :info (warp-bridge-cluster-id bridge)
-                          "Bridge transport listening on %s"
-                          (warp-transport-connection-address server))
+                          (format "Bridge transport listening on %s"
+                                  (warp-transport-connection-address server)))
                bridge)))))
 
 ;;;###autoload
