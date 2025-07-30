@@ -1,5 +1,4 @@
-;;; warp-request-pipeline.el --- Generic Request Processing Pipeline -*-
-;;; lexical-binding: t; -*-
+;;; warp-request-pipeline.el --- Generic Request Processing Pipeline -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
@@ -10,18 +9,18 @@
 ;; This version has been refactored for simplicity and clarity. It now
 ;; favors direct composition of pipeline steps over a complex
 ;; configuration object. The pipeline is defined by an explicit list of
-;; functions (steps) that are executed in sequence.
+;; named stages.
 ;;
 ;; ## Key Features:
 ;;
 ;; - **Declarative Assembly**: Pipelines are created by providing a simple
-;;   list of processing functions.
+;;   list of named processing stages using the `warp:request-pipeline-stage` macro.
 ;; - **Phased Processing**: Requests flow through ordered steps like
 ;;   validation, backpressure, and execution.
 ;; - **Centralized Error Handling**: Errors at any stage are caught
 ;;   and handled uniformly by the caller.
 ;; - **Contextual Data**: A request-specific context object flows
-;;   through the pipeline, accumulating state.
+;;   through the pipeline, accumulating state and tracking the current stage.
 ;; - **Asynchronous Steps**: Steps are non-blocking and return promises.
 
 ;;; Code:
@@ -83,18 +82,27 @@ Fields:
   (result nil :type t)
   (current-span nil :type (or null t)))
 
+(cl-defstruct (warp-pipeline-stage
+               (:constructor make-warp-pipeline-stage)
+               (:copier nil))
+  "Represents a single, named step in a request pipeline.
+
+Fields:
+- `name` (keyword): The symbolic name of the stage (e.g., `:validate`).
+- `handler-fn` (function): The function that implements the stage's logic."
+  (name (cl-assert nil) :type keyword)
+  (handler-fn (cl-assert nil) :type function))
+
 (cl-defstruct (warp-request-pipeline
                (:constructor %%make-request-pipeline)
                (:copier nil))
   "Manages the flow and execution of request processing steps.
-This struct defines a request pipeline as an ordered series of functions
-(steps) that are executed sequentially.
+This struct defines a request pipeline as an ordered series of named
+stages that are executed sequentially.
 
 Fields:
 - `name` (string): A descriptive name for the pipeline instance.
-- `steps` (list): An ordered list of functions, where each function
-  represents a step in the pipeline and accepts the context as its
-  sole argument."
+- `steps` (list): An ordered list of `warp-pipeline-stage` structs."
   (name nil :type string)
   (steps nil :type list))
 
@@ -113,12 +121,11 @@ Returns:
 - (loom-promise): A promise that resolves to `t` on success.
 
 Side Effects:
-- Sets the context stage to `:validate`.
+- None.
 
 Signals:
 - (as promise rejection) `warp-invalid-request`: If the payload is
   malformed."
-  (setf (warp-request-pipeline-context-stage context) :validate)
   (let* ((command (warp-request-pipeline-context-command context))
          (worker (warp-request-pipeline-context-worker context)))
     (unless (warp-rpc-command-p command)
@@ -140,9 +147,7 @@ Returns:
   rejects if dispatch fails.
 
 Side Effects:
-- Sets the context stage to `:execute`.
 - Calls the appropriate command handler registered with the router."
-  (setf (warp-request-pipeline-context-stage context) :execute)
   (let* ((worker (warp-request-pipeline-context-worker context))
          (command (warp-request-pipeline-context-command context))
          (router (warp:component-system-get
@@ -153,31 +158,43 @@ Side Effects:
 ;;; Public API
 
 ;;;###autoload
+(defmacro warp:request-pipeline-stage (name handler-fn)
+  "A convenience macro for creating a `warp-pipeline-stage` struct.
+
+Arguments:
+- `NAME` (keyword): The symbolic name for this stage.
+- `HANDLER-FN` (function): The function that implements the stage's logic.
+  It must accept a single argument: the pipeline context.
+
+Returns:
+- A form that creates a `make-warp-pipeline-stage` instance."
+  `(make-warp-pipeline-stage :name ,name :handler-fn ,handler-fn))
+
+;;;###autoload
 (cl-defun warp:request-pipeline-create (&key name steps)
   "Create a new request processing pipeline instance.
 This constructor assembles a request pipeline from an explicit list of
-processing steps (functions).
+named processing stages.
 
 Arguments:
 - `:name` (string, optional): A descriptive name for the pipeline.
-- `:steps` (list): An ordered list of functions that will be executed
-  sequentially. Each function must accept a single argument: the
-  `warp-request-pipeline-context`.
+- `:steps` (list): An ordered list of `warp-pipeline-stage` structs that
+  will be executed sequentially.
 
 Returns:
 - (warp-request-pipeline): A new pipeline instance."
   (%%make-request-pipeline
    :name (or name "default-request-pipeline")
    :steps (or steps
-              ;; Provide a default set of production-ready steps.
-              '(warp-request-pipeline--step-validate
-                warp-request-pipeline--step-execute-command))))
+              ;; Provide a default set of production-ready stages.
+              (list (warp:request-pipeline-stage :validate #'warp-request-pipeline--step-validate)
+                    (warp:request-pipeline-stage :execute #'warp-request-pipeline--step-execute-command)))))
 
 ;;;###autoload
 (defun warp:request-pipeline-run (pipeline message connection)
   "Process an incoming RPC request through the pipeline.
 This is the main entry point for the pipeline. It creates the initial
-request context and then executes each step in the defined sequence.
+request context and then executes each stage in the defined sequence.
 
 Arguments:
 - `PIPELINE` (warp-request-pipeline): The pipeline instance to execute.
@@ -186,7 +203,7 @@ Arguments:
 
 Returns:
 - (loom-promise): A promise that resolves with the final result of the
-  processing, or rejects if any step fails."
+  processing, or rejects if any stage fails."
   (let* ((worker (warp:component-system-get-context :worker))
          (command (warp-rpc-message-payload message))
          (context (make-warp-request-pipeline-context
@@ -199,18 +216,15 @@ Returns:
                                   (format "RPC-%S"
                                           (warp-rpc-command-name command))))))
     (braid!
-     ;; This `cl-reduce` is the core of the pipeline. It elegantly chains
-     ;; the asynchronous steps together. It starts with a resolved promise
-     ;; and, for each step, attaches a new `:then` clause to the chain.
-     ;; The result is a single promise that represents the entire sequence.
-     (cl-reduce (lambda (promise-chain step-fn)
+     (cl-reduce (lambda (promise-chain stage)
                   (braid! promise-chain
-                    (:then (lambda (_) (funcall step-fn context)))))
+                    (:then (lambda (_)
+                             (setf (warp-request-pipeline-context-stage context)
+                                   (warp-pipeline-stage-name stage))
+                             (funcall (warp-pipeline-stage-handler-fn stage) context)))))
                 (warp-request-pipeline-steps pipeline)
                 :initial-value (loom:resolved! t))
 
-     ;; The final `:then` and `:catch` blocks are for cross-cutting
-     ;; concerns, like ensuring the trace span is always closed.
      (:then (lambda (result)
               (setf (warp-request-pipeline-context-result context) result)
               (warp:trace-end-span

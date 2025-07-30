@@ -47,7 +47,7 @@
 (require 'warp-trace)
 (require 'warp-executor-pool)
 (require 'warp-rate-limiter)
-(require 'warp-pipeline)
+(require 'warp-request-pipeline)
 (require 'warp-command-router)
 (require 'warp-connection-manager)
 (require 'warp-provision)
@@ -459,7 +459,7 @@ Side Effects:
      :deps (:command-router :auth-middleware :rate-limiter-middleware)
      :factory (lambda (router auth-mw limiter-mw)
                 (let ((stages
-                       `(,(warp:pipeline-stage
+                       `(,(warp:request-pipeline-stage
                            'unpack-command
                            ;; Unpacks the RPC command from the message.
                            (lambda (rpc-message context)
@@ -469,16 +469,16 @@ Side Effects:
                                                       :message
                                                       rpc-message)))))
                          ,@(when auth-mw ; Optional auth middleware
-                             `((warp:pipeline-stage 'authenticate ,auth-mw)))
+                             `((warp:request-pipeline-stage 'authenticate ,auth-mw)))
                          ,@(when limiter-mw ; Optional rate limiting middleware
-                             `((warp:pipeline-stage 'rate-limit ,limiter-mw)))
-                         ,(warp:pipeline-stage
+                             `((warp:request-pipeline-stage 'rate-limit ,limiter-mw)))
+                         ,(warp:request-pipeline-stage
                            'dispatch
                            ;; Dispatches the command to the router for handler lookup.
                            (lambda (command context)
                              (warp:command-router-dispatch
                               router command context))))))
-                  (warp:pipeline-create
+                  (warp:request-pipeline-create
                    :stages stages
                    :name ,(format "%s-pipeline"
                                   (warp-worker-worker-id worker))))))

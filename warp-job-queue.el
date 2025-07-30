@@ -249,8 +249,8 @@ Returns:
      :deps (:command-router :rate-limiter-middleware) 
      :factory (lambda (router limiter-mw)
                 (warp:request-pipeline-create
-                 :steps `(,(warp:pipeline-stage 'rate-limit ,limiter-mw) ; First, apply rate limit
-                           ,(warp:pipeline-stage 'dispatch ; Then, dispatch to the command handler
+                 :steps `(,(warp:request-pipeline-stage 'rate-limit ,limiter-mw) ; First, apply rate limit
+                           ,(warp:request-pipeline-stage 'dispatch ; Then, dispatch to the command handler
                                                  (lambda (cmd ctx)
                                                    (warp:command-router-dispatch router cmd ctx)))))))
 
