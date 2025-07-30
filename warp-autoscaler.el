@@ -289,7 +289,7 @@ Side Effects:
 - Updates `last-scale-up-time` or `last-scale-down-time` in `monitor`.
 - Increments `total-scale-ups` or `total-scale-downs` in `monitor`.
 - Records success/failure with the circuit breaker."
-  (let* ((pool-obj (warp-autoscaler-monitor-pool-obj monitor)) ; Changed from cluster
+  (let* ((pool-obj (warp-autoscaler-monitor-pool-obj monitor))  from cluster
          (strategy (warp-autoscaler-monitor-strategy monitor))
          (cb (warp-autoscaler-monitor-circuit-breaker monitor))
          (min (warp-autoscaler-strategy-min-resources strategy)) ; Renamed
@@ -301,14 +301,14 @@ Side Effects:
     (cond
      ((and cb (not (warp:circuit-breaker-can-execute-p cb)))
       (let ((msg (format "Scaling for pool '%s' blocked by open circuit breaker."
-                         (warp-pool-name pool-obj)))) ; Changed from cluster-name
+                         (warp-pool-name pool-obj))))  from cluster-name
         (warp:log! :warn "autoscaler" msg)
         (loom:rejected! (warp:error! :type :warp-circuit-breaker-open-error
                                      :message msg))))
      ((= final-size current-size)
       ;; No actual size change needed
       (let ((msg (format "No scaling for pool '%s': target %d = current %d. %s"
-                         (warp-pool-name pool-obj) final-size ; Changed
+                         (warp-pool-name pool-obj) final-size 
                          current-size reason)))
         (warp:log! :debug "autoscaler" msg)
         (loom:resolved! `(:action :no-action :size ,current-size
@@ -317,12 +317,12 @@ Side Effects:
       ;; Perform the scaling action by calling the pool's resize function
       (warp:log! :info "autoscaler" "Scaling %s for pool '%s': %d -> %d. %s"
                  (if (> final-size current-size) "up" "down")
-                 (warp-pool-name pool-obj) current-size final-size ; Changed
+                 (warp-pool-name pool-obj) current-size final-size 
                  (format "Reason: %s" reason))
       (braid! (warp:pool-resize pool-obj final-size) ; Use pool-obj
         (:then (lambda (result)
                  (warp:log! :info "autoscaler" "Scaled pool '%s' to %d resources."
-                            (warp-pool-name pool-obj) final-size) ; Changed
+                            (warp-pool-name pool-obj) final-size) 
                  (if (> final-size current-size)
                      (progn
                        (cl-incf (warp-autoscaler-monitor-total-scale-ups
@@ -340,7 +340,7 @@ Side Effects:
                  result))
         (:catch (lambda (err)
                   (warp:log! :error "autoscaler" "Failed to scale pool '%s' %s: %S"
-                             (warp-pool-name pool-obj) ; Changed
+                             (warp-pool-name pool-obj) 
                              (format "to %d" final-size) err)
                   (cl-incf (warp-autoscaler-monitor-total-errors monitor))
                   (when cb (warp:circuit-breaker-record-failure cb))
@@ -647,18 +647,18 @@ Side Effects:
 - Calls `warp--autoscaler-add-metrics-to-history`.
 - Dispatches to specific strategy evaluation functions."
   (cl-block warp--autoscaler-evaluate-strategy
-    (let* ((pool-obj (warp-autoscaler-monitor-pool-obj monitor)) ; Changed
+    (let* ((pool-obj (warp-autoscaler-monitor-pool-obj monitor)) 
            (metrics-provider (warp-autoscaler-monitor-metrics-provider-fn
-                              monitor)) ; Changed
+                              monitor)) 
            (strategy (warp-autoscaler-monitor-strategy monitor))
            (now (float-time)))
       (unless (and pool-obj (eq (warp-pool-status pool-obj) :active)) ; Check pool status
         (warp:log! :warn "autoscaler" "Pool '%s' not active; stopping monitor."
-                   (warp-pool-name pool-obj)) ; Changed
+                   (warp-pool-name pool-obj)) 
         (warp:autoscaler-stop (warp-autoscaler-monitor-id monitor))
         (cl-return-from warp--autoscaler-evaluate-strategy
           (loom:rejected! (warp:error! :type :warp-autoscaler-error
-                                       :message "Target pool not active")))) ; Changed
+                                       :message "Target pool not active")))) 
       (let* ((up-cd (warp-autoscaler-strategy-scale-up-cooldown strategy))
              (down-cd (warp-autoscaler-strategy-scale-down-cooldown strategy))
              (last-up (warp-autoscaler-monitor-last-scale-up-time monitor))
@@ -667,7 +667,7 @@ Side Effects:
         (when (or (and last-up (< (- now last-up) up-cd))
                   (and last-down (< (- now last-down) down-cd)))
           (warp:log! :debug "autoscaler" "Scaling for pool '%s' in cooldown."
-                     (warp-pool-name pool-obj)) ; Changed
+                     (warp-pool-name pool-obj)) 
           (cl-return-from warp--autoscaler-evaluate-strategy
             (loom:resolved! `(:action :no-action :reason "Cooldown active")))))
       (braid! (funcall metrics-provider) ; Call the generic metrics provider
@@ -739,7 +739,7 @@ Signals:
          (cb-config (warp-autoscaler-strategy-circuit-breaker-config
                      strategy))
          (monitor (%%make-autoscaler-monitor
-                   :id monitor-id :pool-obj pool-obj ; Changed
+                   :id monitor-id :pool-obj pool-obj 
                    :metrics-provider-fn metrics-provider-fn ; NEW
                    :strategy strategy
                    :status :active :created-at (float-time)
@@ -749,7 +749,7 @@ Signals:
                    :circuit-breaker
                    (when cb-config
                      (apply #'warp:circuit-breaker-get
-                            (format "autoscaler-%s" (warp-pool-name pool-obj)) ; Changed
+                            (format "autoscaler-%s" (warp-pool-name pool-obj)) 
                             cb-config)))))
     (let ((poll (loom:poll
                  :name (format "autoscaler-poll-%s" monitor-id)
@@ -769,7 +769,7 @@ Signals:
       (loom:poll-start poll)
       (puthash monitor-id monitor warp--active-autoscaler-monitors)
       (warp:log! :info "autoscaler" "Started monitor '%s' for pool '%s'."
-                 monitor-id (warp-pool-name pool-obj)) ; Changed
+                 monitor-id (warp-pool-name pool-obj)) 
       monitor-id)))
 
 ;;;###autoload
@@ -790,8 +790,8 @@ Side Effects:
 - Removes the monitor from `warp--active-autoscaler-monitors`."
   (when-let ((monitor (gethash monitor-id warp--active-autoscaler-monitors)))
     (warp:log! :info "autoscaler" "Stopping monitor '%s' for pool '%s'."
-               monitor-id (warp-pool-name ; Changed
-                           (warp-autoscaler-monitor-pool-obj monitor))) ; Changed
+               monitor-id (warp-pool-name 
+                           (warp-autoscaler-monitor-pool-obj monitor))) 
     (loom:poll-shutdown (warp-autoscaler-monitor-poll-instance monitor))
     (setf (warp-autoscaler-monitor-status monitor) :stopped)
     (remhash monitor-id warp--active-autoscaler-monitors)
@@ -806,13 +806,13 @@ Arguments:
 
 Returns:
 - (list): A list of plists, each describing an active monitor with its
-  `:id`, `:pool-name`, `:strategy-type`, and `:status`." ; Changed
+  `:id`, `:pool-name`, `:strategy-type`, and `:status`." 
   (let (result)
     (maphash
      (lambda (id monitor)
        (push `(:id ,id
-               :pool-name ,(warp-pool-name ; Changed
-                             (warp-autoscaler-monitor-pool-obj monitor)) ; Changed
+               :pool-name ,(warp-pool-name 
+                             (warp-autoscaler-monitor-pool-obj monitor)) 
                :strategy-type ,(warp-autoscaler-strategy-type
                                 (warp-autoscaler-monitor-strategy monitor))
                :status ,(warp-autoscaler-monitor-status monitor))
@@ -837,8 +837,8 @@ Returns:
            (cb-status (and cb (warp:circuit-breaker-status
                                (warp-circuit-breaker-service-id cb)))))
       `(:id ,monitor-id
-        :pool-name ,(warp-pool-name ; Changed
-                       (warp-autoscaler-monitor-pool-obj monitor)) ; Changed
+        :pool-name ,(warp-pool-name 
+                       (warp-autoscaler-monitor-pool-obj monitor)) 
         :status ,(warp-autoscaler-monitor-status monitor)
         :strategy-type ,(warp-autoscaler-strategy-type strategy)
         :min-resources ,(warp-autoscaler-strategy-min-resources strategy) ; Renamed
