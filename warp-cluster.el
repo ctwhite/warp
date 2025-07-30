@@ -11,9 +11,7 @@
 ;; This version uses the unified `warp-component.el` system for
 ;; dependency injection and lifecycle management. All of its complex
 ;; subsystems—the IPC system, log server, allocator, health orchestrator,
-;; etc.—are now defined as declarative components. This architecture greatly
-;; simplifies the cluster's internal wiring, reduces boilerplate, and makes
-;; its logic more robust and easier to understand.
+;; and autoscaler—are now defined as declarative components.
 ;;
 ;; ## Key Features:
 ;;
@@ -26,19 +24,18 @@
 ;;   configured based on the cluster's strategy, allowing for intelligent
 ;;   worker selection via algorithms like round-robin or least-response-time.
 ;;
-;; - **Dynamic Resource Allocation**: The `allocator` component is fully
-;;   integrated with the `autoscaler-strategy` provided by the provisioning
-;;   system, enabling the cluster to automatically scale the number of
-;;   workers up or down based on real-time demand.
+;; - **Dynamic Resource Allocation**: The `allocator` and `autoscaler` components
+;;   enable the cluster to automatically scale the number of workers up or down
+;;   based on real-time demand.
 ;;
 ;; - **Comprehensive Health Monitoring**: Managed by a dedicated
 ;;   `health-orchestrator` component, which performs active "ping" checks
 ;;   on workers and marks them as degraded or unhealthy, influencing load
 ;;   balancing decisions.
 ;;
-;; - **Dedicated Event Broker**: Can launch and manage a specialized event
-;;   broker worker to centralize and optimize distributed event propagation,
-..   offloading this work from the master process for better scalability.
+;; - **Specialized Service Workers**: Can launch and manage dedicated workers for
+;;   services like event brokering (`use-event-broker`) and job queuing
+;;   (`use-job-queue`), offloading work from the master.
 
 ;;; Code:
 
@@ -68,6 +65,7 @@
 (require 'warp-bootstrap)
 (require 'warp-connection-manager)
 (require 'warp-event-broker)
+(require 'warp-job-queue)
 (require 'warp-ipc)
 (require 'warp-transport)
 
@@ -96,26 +94,33 @@ Fields:
 - `initial-workers` (integer): Number of workers to launch on start.
 - `max-workers` (integer): The upper bound for the autoscaler.
 - `min-workers` (integer): The lower bound for the autoscaler.
+- `worker-type` (keyword): The type of application worker to launch
+  (`:lisp` or `:docker`).
+- `docker-image` (string): The Docker image to use for `:docker` workers.
+- `docker-run-args` (list): Extra arguments for the `docker run` command.
 - `load-balance-strategy` (symbol): Algorithm for selecting a worker, e.g.,
   `:round-robin`, `:least-response-time`.
-- `autoscaler-strategy` (warp-autoscaler-strategy): The policy object that
-  defines *how* scaling decisions are made (e.g., based on CPU or queue length).
+- `autoscaling-enabled-p` (boolean): If `t`, enables the autoscaler monitor.
+- `autoscaler-strategy` (warp-autoscaler-strategy): The auto-scaling
+  strategy object for the worker pool. If `nil`, autoscaling is disabled.
 - `health-check-enabled` (boolean): If `t`, enables active health checks.
 - `health-check-interval` (integer): Frequency of health checks in seconds.
 - `health-check-timeout` (number): Timeout for a worker to respond to a ping.
 - `listen-address` (string): For network protocols, the IP address the
   master listens on (e.g., \"127.0.0.1\" or \"0.0.0.0\").
 - `degraded-load-penalty` (integer): Artificial load penalty added to
-  degraded workers to make them less likely to be chosen for new tasks,
-  allowing them to recover.
-- `worker-initial-weight` (float): Base capacity weight for a new worker,
-  used by some load balancing strategies.
+  degraded workers to make them less likely to be chosen for new tasks.
+- `worker-initial-weight` (float): Base capacity weight for a new worker.
 - `environment` (list): An alist of `(KEY . VALUE)` strings to set as
   environment variables for worker processes.
 - `use-event-broker` (boolean): If `t`, a dedicated event broker worker will
   be launched to handle cluster-wide events.
 - `event-broker-config` (event-broker-config): Configuration for the
   event broker worker, if used.
+- `use-job-queue` (boolean): If `t`, a dedicated job queue worker will be
+  launched to manage persistent jobs.
+- `job-queue-redis-config-options` (plist): Configuration for the Redis
+  instance used by the job queue worker (e.g., `:host`, `:port`).
 - `worker-transport-options` (plist): Options passed to the worker to
   configure its client-side connection *back* to the master."
   (name nil :type string)
@@ -126,9 +131,13 @@ Fields:
   (min-workers
    1 :type integer
    :validate (and (>= $ 0) (<= $ (cluster-config-max-workers _it-self))))
+  (worker-type :lisp :type keyword :validate (memq $ '(:lisp :docker)))
+  (docker-image nil :type (or null string))
+  (docker-run-args nil :type (or null (list-of string)))
   (load-balance-strategy
    :least-response-time :type symbol
    :validate (memq $ '(:least-response-time :round-robin :consistent-hash)))
+  (autoscaling-enabled-p nil :type boolean)
   (autoscaler-strategy nil :type (or null t))
   (health-check-enabled t :type boolean)
   (health-check-interval 15 :type integer :validate (> $ 0))
@@ -139,6 +148,8 @@ Fields:
   (environment nil :type list)
   (use-event-broker nil :type boolean)
   (event-broker-config nil :type (or null t))
+  (use-job-queue nil :type boolean)
+  (job-queue-redis-config-options nil :type (or null plist))
   (worker-transport-options nil :type (or null plist)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -194,7 +205,6 @@ Returns:
                  (when workers-map
                    (maphash
                     (lambda (worker-id m-worker)
-                      ;; Only include workers that have an active connection.
                       (when-let (conn (warp-managed-worker-connection m-worker))
                         (push `(:worker-id ,worker-id
                                 :inbox-address
@@ -233,8 +243,6 @@ Returns:
   (append
    (list
     ;; -- Core Infrastructure Components --
-
-    ;; Manages all inter-process/thread messaging for the master.
     `(:name :ipc-system
       :factory (lambda ()
                  (warp:ipc-system-create
@@ -243,8 +251,6 @@ Returns:
                   :main-channel-address (cluster-config-listen-address config)))
       :start (lambda (ipc _) (warp:ipc-system-start ipc))
       :stop (lambda (ipc _) (warp:ipc-system-stop ipc)))
-
-    ;; Centralized server that receives and processes logs from workers.
     `(:name :log-server
       :factory (lambda ()
                  (warp:log-server-create
@@ -255,8 +261,6 @@ Returns:
                             :host (cluster-config-listen-address config))))
       :start (lambda (log-server _) (loom:await (warp:log-server-start log-server)))
       :stop (lambda (log-server _) (warp:log-server-stop log-server)))
-
-    ;; Central bus for internal system events. Can be backed by a broker.
     `(:name :event-system
       :deps (:ipc-system :rpc-system)
       :factory (lambda (ipc rpc)
@@ -266,14 +270,11 @@ Returns:
                   ,(when (cluster-config-use-event-broker config)
                      (format "event-broker-%s" (warp-cluster-id cluster)))
                   :connection-manager-provider
-                  ;; Provide a function to get the bridge component on demand.
                   ,(lambda ()
                      (warp:component-system-get
                       (warp-cluster-component-system cluster) :bridge))
                   :rpc-system rpc))
       :stop (lambda (es _) (loom:await (warp:event-system-stop es))))
-
-    ;; Manages the cluster's distributed state (e.g., worker registry).
     `(:name :state-manager
       :deps (:event-system)
       :factory (lambda (es)
@@ -282,14 +283,10 @@ Returns:
                   :node-id ,(warp-cluster-id cluster)
                   :event-system es))
       :stop (lambda (sm _) (loom:await (warp:state-manager-destroy sm))))
-
-    ;; Maps incoming RPC command names from workers to handler functions.
     `(:name :command-router
       :factory (lambda ()
                  (warp:command-router-create
                   :name ,(format "%s-router" (warp-cluster-id cluster)))))
-
-    ;; Manages the lifecycle of outgoing RPCs sent from master to workers.
     `(:name :rpc-system
       :deps (:command-router)
       :factory (lambda (router)
@@ -297,8 +294,6 @@ Returns:
                   :name ,(format "%s-rpc" (warp-cluster-id cluster))
                   :component-system (warp-cluster-component-system cluster)
                   :command-router router)))
-
-    ;; The central communication hub that listens for worker connections.
     `(:name :bridge
       :deps (:config :event-system :command-router :state-manager
              :rpc-system :ipc-system)
@@ -310,8 +305,6 @@ Returns:
                   :ipc-system ipc))
       :start (lambda (bridge _) (loom:await (warp:bridge-start bridge)))
       :stop (lambda (bridge _) (loom:await (warp:bridge-stop bridge))))
-
-    ;; Manages dynamic configuration updates ("provisions") for workers.
     `(:name :master-provision-manager
       :deps (:event-system :command-router :rpc-system)
       :factory (lambda (es router rpc)
@@ -325,23 +318,18 @@ Returns:
                       (lambda (cmd ctx)
                         (warp--provision-handle-get-provision-command mgr cmd ctx))))
                    mgr)))
-
-    ;; Master RPC handlers for internal cluster commands.
     `(:name :master-rpc-handlers
       :deps (:command-router)
-      :priority 10 ; Start early to register core RPCs.
+      :priority 10
       :start (lambda (_ system)
                (let ((router (warp:component-system-get system :command-router)))
                  (warp:defrpc-handlers router
-                   ;; RPC for Event Broker initial sync.
                    (:get-all-active-workers .
                     (lambda (cmd ctx)
                       (warp-cluster--handle-get-all-active-workers
                        cluster cmd ctx)))))))
 
     ;; -- Worker Pool & Resource Management Components --
-
-    ;; Manages the lifecycle of worker sub-processes.
     `(:name :worker-pool
       :deps (:bridge)
       :factory (lambda (_)
@@ -349,24 +337,31 @@ Returns:
                   :pool `(:name ,(format "%s-worker-pool" (warp-cluster-id cluster))
                           :resource-factory-fn
                           ,(lambda (res pool)
-                             ;; This lambda defines HOW to create a new worker.
                              (let* ((worker-id (warp-pool-resource-id res))
                                     (rank (1- (warp:pool-resource-count pool)))
                                     (env (warp-cluster--build-worker-environment
-                                          cluster worker-id rank)))
-                               (warp:process-launch
-                                `(:name ,(format "warp-worker-%s" worker-id)
-                                  :process-type :lisp
-                                  :eval-string "(warp:worker-main)"
-                                  :env ,env))))
+                                          cluster worker-id rank))
+                                    (launch-options
+                                     (pcase (cluster-config-worker-type config)
+                                       (:lisp
+                                        `(:name ,(format "warp-worker-%s" worker-id)
+                                          :process-type :lisp
+                                          :eval-string "(warp:worker-main)"
+                                          :env ,env))
+                                       (:docker
+                                        (unless (cluster-config-docker-image config)
+                                          (error "Cluster config :worker-type is :docker but :docker-image is not set"))
+                                        `(:name ,(format "warp-worker-%s" worker-id)
+                                          :process-type :docker
+                                          :docker-image ,(cluster-config-docker-image config)
+                                          :docker-run-args ,(cluster-config-docker-run-args config)
+                                          :env ,env)))))
+                               (warp:process-launch launch-options)))
                           :resource-destructor-fn
                           ,(lambda (res _)
-                             ;; This lambda defines HOW to destroy a worker.
                              (warp:process-terminate
                               (warp-pool-resource-handle res))))))
       :stop (lambda (pool _) (loom:await (warp:pool-shutdown pool t))))
-
-    ;; Manages autoscaling and resource allocation for the worker pool.
     `(:name :allocator
       :deps (:event-system :worker-pool)
       :factory (lambda (es pool)
@@ -382,37 +377,29 @@ Returns:
       :stop (lambda (alloc _) (loom:await (warp:allocator-stop alloc))))
 
     ;; -- High-level Service Components --
-
-    ;; Provides strategies for selecting the best worker for a task.
     `(:name :load-balancer
       :deps (:state-manager)
       :factory (lambda (sm)
                  (warp:balancer-strategy-create
                   :type (cluster-config-load-balance-strategy config)
                   :config `(:node-key-fn
-                            ,(lambda (w) (warp-managed-worker-worker-id w))
+                            ,(lambda (w) (warp-managed-worker-worker-id w)))
                             :get-all-workers-fn
-                            ;; Lambda to fetch all current workers from state.
                             ,(lambda ()
                                (let ((m (warp:state-manager-get sm '(:workers))))
                                  (when m (cl-loop for w being the hash-values of m
                                                   collect w))))
                             :connection-load-fn
-                            ;; Lambda to get a worker's load, with penalties.
                             ,(lambda (w)
                                (warp-cluster--get-penalized-connection-load
                                 cluster w))
                             :dynamic-effective-weight-fn
-                            ;; Lambda to get a worker's dynamic capacity.
                             ,(lambda (w)
                                (warp-cluster--calculate-dynamic-worker-weight
                                 cluster w)))
                   :health-check-fn
-                  ;; Lambda to check if a worker is considered healthy.
                   ,(lambda (w) (eq (warp-managed-worker-health-status w)
                                    :healthy)))))
-
-    ;; Monitors the health of all workers in the cluster.
     `(:name :health-orchestrator
       :deps (:event-system :state-manager :bridge :rpc-system)
       :factory (lambda (es sm bridge rpc)
@@ -423,32 +410,49 @@ Returns:
                    orch))
       :start (lambda (orch _) (loom:await (warp:health-orchestrator-start orch)))
       :stop (lambda (orch _) (loom:await (warp:health-orchestrator-stop orch))))
-
-    ;; A 'run-once' service to launch the initial set of workers.
     `(:name :initial-spawn-service
       :deps (:allocator :worker-pool)
-      :priority 100 ; Run late in the startup sequence.
+      :priority 100
       :start (lambda (_ system)
                (let ((alloc (warp:component-system-get system :allocator))
                      (pool (warp:component-system-get system :worker-pool)))
                  (warp-cluster--initial-worker-spawn cluster alloc pool config))))
     )
-   ;; Optionally add a dedicated event broker worker to the component graph.
+   ;; -- Optional Specialized Workers & Services --
    (when (cluster-config-use-event-broker config)
      (list
       `(:name :event-broker-worker
-        :deps (:event-system :rpc-system)
-        :factory (lambda (es rpc)
-                   (let* ((broker-id (format "event-broker-%s" (warp-cluster-id cluster)))
-                          (broker-worker
-                           (warp:event-broker-create
-                            :worker-id broker-id
-                            :config (cluster-config-event-broker-config config)
-                            :event-system es
-                            :rpc-system rpc)))
-                     broker-worker))
+        :factory (lambda ()
+                   (warp:event-broker-create
+                    :config (cluster-config-event-broker-config config)))
         :start (lambda (bw _) (loom:await (warp:worker-start bw)))
-        :stop (lambda (bw _) (loom:await (warp:worker-stop bw))))))))
+        :stop (lambda (bw _) (loom:await (warp:worker-stop bw))))))
+   (when (cluster-config-use-job-queue config)
+     (list
+      `(:name :job-queue-worker
+        :factory (lambda ()
+                   (warp:job-queue-worker-create
+                    :redis-config-options
+                    (cluster-config-job-queue-redis-config-options config)))
+        :start (lambda (jqw _) (loom:await (warp:worker-start jqw)))
+        :stop (lambda (jqw _) (loom:await (warp:worker-stop jqw))))))
+   (when (cluster-config-autoscaling-enabled-p config)
+     (list
+      `(:name :autoscaler-monitor
+        :deps (:worker-pool)
+        :factory (lambda (_) (make-hash-table)) ; Holder for monitor ID
+        :start (lambda (holder system)
+                 (let* ((pool (warp:component-system-get system :worker-pool))
+                        (strategy (cluster-config-autoscaler-strategy config))
+                        (metrics-fn (lambda () (warp:cluster-metrics cluster))))
+                   (unless strategy
+                     (error "Autoscaling enabled but no :autoscaler-strategy provided."))
+                   (let ((monitor-id (warp:autoscaler pool metrics-fn strategy)))
+                     (puthash :id monitor-id holder))))
+        :stop (lambda (holder _)
+                (when-let (monitor-id (gethash :id holder))
+                  (warp:autoscaler-stop monitor-id))))))
+   ))
 
 ;;----------------------------------------------------------------------
 ;;; Component Helpers & Utilities
@@ -474,7 +478,6 @@ Returns:
          (master-contact (warp:bridge-get-contact-address bridge))
          (log-addr (log-server-config-address
                     (warp-log-server-config log-server)))
-         ;; Generate a one-time token to secure the initial connection.
          (token-info (warp:process-generate-launch-token)))
     (append
      `((,(warp:env 'worker-id) . ,worker-id)
@@ -543,7 +546,6 @@ Side Effects:
   (let ((cluster-id (warp:component-context-get :cluster))
         (cs-id (warp:component-system-id
                 (warp:component-context-get :component-system))))
-    ;; When a new worker becomes ready, register a new health check for it.
     (warp:subscribe
      event-system :worker-ready-signal-received
      (lambda (event)
@@ -554,7 +556,6 @@ Side Effects:
                   :name (format "worker-%s-ping" worker-id)
                   :target-id worker-id
                   :check-fn
-                  ;; This lambda defines the actual health check action.
                   (lambda (id)
                     (if-let (mw (loom:await (warp:state-manager-get
                                              sm `(:workers ,id))))
@@ -568,7 +569,6 @@ Side Effects:
                   :interval (cluster-config-health-check-interval config)
                   :timeout (cluster-config-health-check-timeout config))))
            (loom:await (warp:health-orchestrator-register-check orch spec))))))
-    ;; When a worker is deregistered, remove its health check.
     (warp:subscribe
      event-system :worker-deregistered
      (lambda (event)
@@ -634,7 +634,6 @@ Returns:
     (pcase health
       (:unhealthy 0.0)
       (:degraded (* weight 0.25))
-      ;; Healthy workers are penalized based on high CPU or request count.
       (_ (let ((cpu-penalty (cond ((> cpu 80.0) 0.1)
                                  ((> cpu 50.0) 0.5)
                                  (t 1.0)))
@@ -674,6 +673,35 @@ Side Effects:
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
+
+;;;###autoload
+(defun warp:cluster-metrics (cluster)
+  "Aggregates and returns current metrics for all workers in a cluster.
+
+Arguments:
+- `CLUSTER` (warp-cluster): The cluster instance to inspect.
+
+Returns:
+- (loom-promise): A promise that resolves with a plist of aggregated metrics."
+  (let* ((cs (warp-cluster-component-system cluster))
+         (sm (warp:component-system-get cs :state-manager)))
+    (braid! (warp:state-manager-get sm '(:workers))
+      (:then (lambda (workers-map)
+               (let ((total-cpu 0.0)
+                     (total-mem 0.0)
+                     (total-rps 0)
+                     (worker-count 0))
+                 (maphash (lambda (_ worker)
+                            (when-let (metrics (warp-managed-worker-last-reported-metrics worker))
+                              (cl-incf worker-count)
+                              (when-let (proc-metrics (warp-worker-metrics-process-metrics metrics))
+                                (cl-incf total-cpu (warp-process-metrics-cpu-utilization proc-metrics))
+                                (cl-incf total-mem (warp-process-metrics-memory-utilization-mb proc-metrics)))
+                              (cl-incf total-rps (warp-worker-metrics-active-request-count metrics))))
+                          workers-map)
+                 `(:avg-cluster-cpu-utilization ,(if (> worker-count 0) (/ total-cpu worker-count) 0.0)
+                   :avg-cluster-memory-utilization ,(if (> worker-count 0) (/ total-mem worker-count) 0.0)
+                   :total-cluster-requests-per-sec ,total-rps)))))))
 
 ;;;###autoload
 (defun warp:cluster-create (&rest args)
