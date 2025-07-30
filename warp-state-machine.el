@@ -156,7 +156,8 @@ Returns:
 Signals:
 - `warp-state-machine-invalid-transition`: (As a promise rejection) if
   the event is not a valid trigger from the current state."
-  (loom:promise!
+  (loom:promise
+   :executor
    (lambda (resolve reject)
      ;; Use a mutex to ensure the read-validate-write cycle is atomic.
      (loom:with-mutex! (warp-state-machine-lock sm)
