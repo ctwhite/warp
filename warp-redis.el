@@ -44,8 +44,7 @@
   "A generic error related to the Redis service." 
   'warp-error)
 
-(define-error 
-  'warp-redis-cli-error 
+(define-error 'warp-redis-cli-error 
   "An error occurred while executing redis-cli." 
   'warp-redis-error)
 
@@ -113,7 +112,7 @@ Signals:
     (unwind-protect
         (progn
           (setq exit-code (apply #'call-process cli-path nil proc-buffer nil full-args))
-          (when (not (zerop exit-code))
+          (unless (zerop exit-code)
             (signal 'warp-redis-cli-error
                     (list :message (with-current-buffer proc-buffer (buffer-string)))))
           (with-current-buffer proc-buffer
@@ -151,11 +150,9 @@ Returns:
 - (loom-promise): A promise that resolves with the service instance on success."
   (braid!
    (condition-case nil (warp:redis-ping service)
-     ;; If ping succeeds, a server is already running.
      (success (warp:log! :info (warp-redis-service-name service)
                          "Connected to existing Redis server.")
               (loom:resolved! service))
-     ;; If ping fails, we need to launch our own server.
      (error
       (warp:log! :info (warp-redis-service-name service)
                  "No running Redis server detected. Launching a new instance...")
@@ -165,14 +162,15 @@ Returns:
              (launch-args (append (list server-path)
                                   (when conf-file (list conf-file))
                                   (list "--port" (number-to-string
-                                                  (redis-service-config-port config)))))
-             (handle (warp:process-launch
-                      `(:name ,(format "managed-%s" (warp-redis-service-name service))
-                        :process-type :shell
-                        :command-args ,launch-args))))
-        (setf (warp-redis-service-process-handle service) handle)
-        ;; Give the server a moment to start up before pinging again.
+                                                  (redis-service-config-port config))))))
+        (setf (warp-redis-service-process-handle service)
+              (warp:process-launch
+               `(:name ,(format "managed-%s" (warp-redis-service-name service))
+                 :process-type :shell
+                 :command-args ,launch-args)))
+        ;; Give Redis a moment to start up.
         (sleep-for 0.5)
+        ;; Ping repeatedly until it's ready or a timeout occurs (handled by braid!).
         (braid! (warp:redis-ping service)
           (:then (lambda (_)
                    (warp:log! :info (warp-redis-service-name service)
@@ -204,7 +202,6 @@ Returns:
 ;;;###autoload
 (defun warp:redis-ping (service)
   "Sends a PING command to the Redis server.
-Useful for checking if the server is alive and responsive.
 
 Arguments:
 - `SERVICE` (warp-redis-service): The Redis service instance.
@@ -214,9 +211,20 @@ Returns:
   (warp-redis--execute-cli service "PING"))
 
 ;;;###autoload
+(defun warp:redis-del (service key)
+  "Deletes a key.
+
+Arguments:
+- `SERVICE` (warp-redis-service): The Redis service instance.
+- `KEY` (string): The key to delete.
+
+Returns:
+- (integer): The number of keys that were removed."
+  (string-to-number (warp-redis--execute-cli service "DEL" key)))
+
+;;;###autoload
 (defun warp:redis-rpush (service key value)
   "Appends a `VALUE` to the list stored at `KEY`. (Right Push)
-This is the primary command for enqueuing a job.
 
 Arguments:
 - `SERVICE` (warp-redis-service): The Redis service instance.
@@ -228,38 +236,61 @@ Returns:
   (string-to-number (warp-redis--execute-cli service "RPUSH" key value)))
 
 ;;;###autoload
-(defun warp:redis-blpop (service key &optional (timeout 0))
-  "Removes and returns the first element of the list stored at `KEY`. (Blocking Left Pop)
-This is the primary command for a worker to dequeue a job. It will block
-until an element is available or the `TIMEOUT` is reached.
+(defun warp:redis-blpop (service &rest keys-and-timeout)
+  "Removes and returns the first element of the lists stored at `KEYS`.
+This is a blocking operation. The command returns the popped element and
+the name of the list it was popped from.
 
 Arguments:
 - `SERVICE` (warp-redis-service): The Redis service instance.
-- `KEY` (string): The key of the list (e.g., \"warp:jobs:pending\").
-- `TIMEOUT` (integer, optional): The blocking timeout in seconds. A timeout of
-  0 means it will block indefinitely.
+- `KEYS-AND-TIMEOUT` (list): A list of key strings followed by a final
+  integer timeout in seconds. Example: `(\"list1\" \"list2\" 10)`.
 
 Returns:
-- (string or nil): The value of the popped element, or `nil` if a timeout occurred."
-  (let ((output (warp-redis--execute-cli service "BLPOP" key (number-to-string timeout))))
-    ;; BLPOP returns a two-element multi-bulk reply: the key and the value.
-    ;; `redis-cli` formats this as two lines. We only want the second line (the value).
+- (list of string or nil): A two-element list `(list-name element)` of
+  the popped element, or `nil` if a timeout occurred. The `element` will
+  be a string."
+  (let ((output (apply #'warp-redis--execute-cli service "BLPOP"
+                       (mapcar #'s-lex-format keys-and-timeout))))
     (when output
-      (cadr (s-split "\n" output)))))
+      ;; BLPOP output format is usually "key\nvalue" for a single result.
+      ;; If multiple keys are given, it's the first key where an element
+      ;; was found, followed by the element itself.
+      (s-split "\n" output)))) ; Return (list-name value)
+
+;;;###autoload
+(defun warp:redis-lrange (service key start stop)
+  "Returns the specified elements of the list stored at `KEY`.
+
+Arguments:
+- `SERVICE` (warp-redis-service): The Redis service instance.
+- `KEY` (string): The key of the list.
+- `START` (integer): The starting index (0-based).
+- `STOP` (integer): The ending index (inclusive, -1 for last element).
+
+Returns:
+- (list of strings): A list of elements in the specified range.
+  Returns an empty list if the key does not exist or the range is empty."
+  (let ((output (warp-redis--execute-cli service "LRANGE" key
+                                         (number-to-string start)
+                                         (number-to-string stop))))
+    (if (s-empty? output)
+        nil ; Return nil for empty output, consistent with no elements
+      (s-split "\n" output))))
 
 ;;;###autoload
 (defun warp:redis-hset (service key field value)
   "Sets the `FIELD` in the hash stored at `KEY` to `VALUE`.
-Useful for storing job metadata, like status or results.
 
 Arguments:
 - `SERVICE` (warp-redis-service): The Redis service instance.
-- `KEY` (string): The key of the hash (e.g., \"warp:job:<job-id>\").
-- `FIELD` (string): The field in the hash (e.g., \"status\", \"result\").
+- `KEY` (string): The key of the hash.
+- `FIELD` (string): The field in the hash.
 - `VALUE` (string): The value to set for the field.
 
 Returns:
-- (integer): 1 if `FIELD` is a new field in the hash, 0 if it was updated."
+- (integer): 1 if `FIELD` is a new field and `VALUE` was set, 0 if `FIELD`
+  already existed and the value was updated."
   (string-to-number (warp-redis--execute-cli service "HSET" key field value)))
 
 ;;;###autoload
@@ -272,23 +303,82 @@ Arguments:
 - `FIELD` (string): The field in the hash.
 
 Returns:
-- (string or nil): The value of the field, or `nil` if it doesn't exist."
-  (warp-redis--execute-cli service "HGET" key field))
+- (string or nil): The value of the field, or `nil` if the key or field doesn't exist."
+  (let ((output (warp-redis--execute-cli service "HGET" key field)))
+    (if (s-empty? output)
+        nil
+      output)))
 
 ;;;###autoload
 (defun warp:redis-lrem (service key count value)
   "Removes the first `COUNT` occurrences of `VALUE` from the list at `KEY`.
+The `COUNT` argument controls the removal behavior:
+- `COUNT > 0`: Removes elements equal to `VALUE` moving from head to tail.
+- `COUNT < 0`: Removes elements equal to `VALUE` moving from tail to head.
+- `COUNT = 0`: Removes all occurrences of `VALUE`.
 
 Arguments:
 - `SERVICE` (warp-redis-service): The Redis service instance.
 - `KEY` (string): The key of the list.
-- `COUNT` (integer): The number of occurrences to remove.
+- `COUNT` (integer): The number of occurrences to remove (or 0 for all).
 - `VALUE` (string): The value to remove.
 
 Returns:
 - (integer): The number of removed elements."
   (string-to-number
    (warp-redis--execute-cli service "LREM" key (number-to-string count) value)))
+
+;;;###autoload
+(defun warp:redis-zadd (service key score member)
+  "Adds a `MEMBER` with the specified `SCORE` to the sorted set at `KEY`.
+If `MEMBER` already exists, its score is updated.
+
+Arguments:
+- `SERVICE` (warp-redis-service): The Redis service instance.
+- `KEY` (string): The key of the sorted set.
+- `SCORE` (number): The score for the member (used for ordering).
+- `MEMBER` (string): The member to add.
+
+Returns:
+- (integer): 1 if the member was added (new element), 0 if the member
+  already existed and the score was updated."
+  (string-to-number
+   (warp-redis--execute-cli service "ZADD" key (number-to-string score) member)))
+
+;;;###autoload
+(defun warp:redis-zrangebyscore (service key min max)
+  "Returns all the elements in the sorted set at `KEY` with a score
+between `MIN` and `MAX` (inclusive). Elements are ordered by their score.
+
+Arguments:
+- `SERVICE` (warp-redis-service): The Redis service instance.
+- `KEY` (string): The key of the sorted set.
+- `MIN` (number): The minimum score (e.g., `\"-inf\"` for negative infinity).
+- `MAX` (number): The maximum score (e.g., `\"+inf\"` for positive infinity).
+
+Returns:
+- (list of strings): A list of members in the specified score range.
+  Returns an empty list if no elements match the criteria or the key does not exist."
+  (let ((output (warp-redis--execute-cli service "ZRANGEBYSCORE" key
+                                         (number-to-string min)
+                                         (number-to-string max))))
+    (if (s-empty? output)
+        nil ; Return nil for empty output, consistent with no elements
+      (s-split "\n" output))))
+
+;;;###autoload
+(defun warp:redis-zrem (service key member)
+  "Removes a `MEMBER` from the sorted set stored at `KEY`.
+
+Arguments:
+- `SERVICE` (warp-redis-service): The Redis service instance.
+- `KEY` (string): The key of the sorted set.
+- `MEMBER` (string): The member to remove.
+
+Returns:
+- (integer): 1 if the member was removed (existed), 0 if the member
+  did not exist."
+  (string-to-number (warp-redis--execute-cli service "ZREM" key member)))
 
 (provide 'warp-redis)
 ;;; warp-redis.el ends here
