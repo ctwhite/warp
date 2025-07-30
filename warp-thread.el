@@ -42,15 +42,15 @@
 
 (require 'cl-lib)
 (require 'thread)
-(require 'time-date) 
+(require 'time-date)
 (require 'loom)
 (require 'braid)
 
 (require 'warp-log)
 (require 'warp-error)
 (require 'warp-stream)
-(require 'warp-pool)
-(require 'warp-config) 
+(require 'warp-pool) ; Ensure warp-pool is loaded for warp:pool-builder
+(require 'warp-config)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -366,7 +366,7 @@ Side Effects:
                           (not (warp-pool-shutdown-p pool)))
                 (condition-wait (make-condition-variable pool-lock) pool-lock))
               (unless (warp-pool-shutdown-p pool)
-                (setq task (loom:pqueue-dequeue task-queue)))))
+                (setq task (loom:pqueue-dequeue task-queue))))
             ;; For warp-stream, read asynchronously (non-blocking)
             (unless (loom:pqueue-p task-queue)
               (setq task (loom:await (warp:stream-read task-queue :timeout 0.1)))))
@@ -451,33 +451,30 @@ Signals:
                               :thread-health-check-interval thread-health-check-interval
                               :thread-idle-timeout thread-idle-timeout))
          (underlying-pool-obj
-          (warp:pool
-           :name (format "%s-underlying-pool" pool-name)
-           :resource-factory-fn #'warp--thread-resource-factory-fn
-           :resource-validator-fn #'warp--thread-resource-validator-fn
-           :resource-destructor-fn #'warp--thread-resource-destructor-fn
-           :task-executor-fn #'warp--thread-task-executor-fn
-           :task-cancel-fn (lambda (resource task pool) ; Custom cancel: signal thread
-                             (let* ((thread-handle (warp-pool-resource-handle resource))
-                                    (task-id (warp-task-id task)))
-                               (warp:log! :info (warp-pool-name pool)
-                                          "Attempting to cancel task %s on thread %s via signal."
-                                          task-id (thread-name thread-handle))
-                               ;; Emacs threads need external signaling for cancellation
-                               (when (thread-live-p thread-handle)
-                                 (thread-signal thread-handle 'quit))))
-
-           ;; Warp-pool configuration options
-           :task-queue-type :priority ; Ensure priority queue for tasks
-           :max-queue-size (thread-pool-config-max-queue-size thread-pool-config)
-           :overflow-policy (thread-pool-config-overflow-policy thread-pool-config)
-           :internal-config-options 
-            `(:management-interval ,(thread-pool-config-thread-health-check-interval 
-                                      thread-pool-config)
-              :max-resource-restarts 3) ; Default restarts for threads
-           :metrics-config-options `() ; No specific overrides here, warp-pool has defaults
-           :circuit-breaker-config-options `() ; No specific circuit breaker for thread pool
-           :batch-config-options `()))) ; No batching for thread pool
+          ;; Use warp:pool-builder here
+          (warp:pool-builder
+           :pool `(:name ,(format "%s-underlying-pool" pool-name)
+                   :resource-factory-fn ,#'warp--thread-resource-factory-fn
+                   :resource-validator-fn ,#'warp--thread-resource-validator-fn
+                   :resource-destructor-fn ,#'warp--thread-resource-destructor-fn
+                   :task-executor-fn ,#'warp--thread-task-executor-fn
+                   :task-cancel-fn ,(lambda (resource task pool)
+                                      (let* ((thread-handle (warp-pool-resource-handle resource))
+                                             (task-id (warp-task-id task)))
+                                        (warp:log! :info (warp-pool-name pool)
+                                                   "Attempting to cancel task %s on thread %s via signal."
+                                                   task-id (thread-name thread-handle))
+                                        (when (and thread-handle (thread-live-p thread-handle))
+                                          (thread-signal thread-handle 'quit))))
+                   :task-queue-type :priority
+                   :max-queue-size ,(thread-pool-config-max-queue-size thread-pool-config)
+                   :overflow-policy ,(thread-pool-config-overflow-policy thread-pool-config))
+           :internal-config `(:management-interval ,(thread-pool-config-thread-health-check-interval
+                                                      thread-pool-config)
+                               :max-resource-restarts 3)
+           :metrics `() ; Default metrics config
+           :circuit-breaker `() ; No specific circuit breaker for thread pool
+           :batching `()))) ; No batching for thread pool
 
       ;; Create the public warp-thread-pool wrapper instance
       (let ((pool (%%make-warp-thread-pool
@@ -535,7 +532,7 @@ Signals:
                              :priority priority
                              :timeout (warp-thread-pool-config-thread-idle-timeout
                                       ;; Use thread idle timeout for task timeout
-                                       (warp-thread-pool-config pool)) 
+                                       (warp-thread-pool-config pool))
                              :cancel-token cancel-token)
       (:then (lambda (_) promise)) ; Return the original promise
       (:catch (lambda (err)
@@ -684,7 +681,7 @@ Returns: (loom-promise): A promise that will be resolved with the return
      :name task-name
      :priority priority
      ;; Create a cancellable token for this specific task
-     :cancel-token (loom:cancel-token)) 
+     :cancel-token (loom:cancel-token))
     promise))
 
 (add-hook 'kill-emacs-hook #'warp--thread-pool-shutdown-hook)
