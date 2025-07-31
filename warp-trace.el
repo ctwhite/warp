@@ -203,7 +203,7 @@
                     :parent-span-id new-parent-span-id
                     :operation-name operation-name
                     :start-time (float-time)
-                    :tags (copy-list tags) ; Ensure tags are a fresh list
+                    :tags (copy-sequence tags) 
                     :status :active)))
     (warp:log! :trace "warp-trace"
                "Started span %s (trace: %s, parent: %s, op: %s)"

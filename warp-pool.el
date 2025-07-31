@@ -536,7 +536,7 @@ Side Effects:
                      (warp-pool-internal-config-max-resource-restarts
                       (warp-pool-internal-config pool)))
           (loom:await (warp--pool-start-resource resource pool))))))
-  (loom:await (warp--pool-dispatch-next-task pool)) ; Await dispatch
+  (loom:await (warp--pool-dispatch-next-task pool)) 
   (loom:resolved! t))
 
 (defun warp--pool-start-resource (resource pool)
@@ -1012,7 +1012,7 @@ Side Effects:
                       :max-queue-size max-queue-size
                       :name name
                       :internal-config resolved-internal-config
-                      :metrics metrics-obj ; Assign the created metrics object
+                      :metrics metrics-obj 
                       args))
          (batch-cfg (when batch-config-options
                       (apply #'make-warp-pool-batch-config

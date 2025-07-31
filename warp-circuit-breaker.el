@@ -282,7 +282,7 @@ Side Effects:
 
 ;;;###autoload
 (cl-defun warp:circuit-breaker-get
-    (service-id &key policy-name config-options event-system) ;; Added event-system key
+    (service-id &key policy-name config-options event-system) 
   "Retrieve an existing, or create a new, circuit breaker instance.
 This function acts as a thread-safe factory and registry, ensuring that
 only one circuit breaker instance exists for any given service identifier.

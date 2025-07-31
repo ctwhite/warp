@@ -78,7 +78,7 @@ Fields:
   (provision-store nil :type (or null t))
   (current-versions nil :type (or null hash-table))
   (event-system nil :type (or null t))
-  (rpc-system nil :type (or null warp-rpc-system)) ; New field for passing to protocol calls
+  (rpc-system nil :type (or null warp-rpc-system)) 
   (command-router nil :type (or null t)))
 
 (cl-defstruct (warp-worker-provision-client
@@ -233,7 +233,7 @@ Side Effects:
 ;;;###autoload
 (cl-defun warp:master-provision-manager-create (&key name
                                                      event-system
-                                                     rpc-system ; Pass rpc-system
+                                                     rpc-system 
                                                      command-router)
   "Create a new master-side provisioning manager component.
 This component is responsible for storing, versioning, and publishing
@@ -258,7 +258,7 @@ Side Effects:
   (let ((manager (%%make-master-provision-manager
                   :name (or name "master-provision-mgr")
                   :event-system event-system
-                  :rpc-system rpc-system ; Store rpc-system
+                  :rpc-system rpc-system 
                   :command-router command-router)))
     (setf (warp-master-provision-manager-provision-store manager)
           (warp:registry-create
@@ -315,7 +315,7 @@ Side Effects:
                  :name (or name "worker-provision-client")
                  :worker-id worker-id
                  :master-id (or master-id "master")
-                 :component-system-id component-system-id ; Store the ID
+                 :component-system-id component-system-id 
                  :event-system event-system
                  :rpc-system rpc-system
                  :connection-manager connection-manager)))
@@ -352,7 +352,7 @@ Side Effects:
         (rpc-system (warp-worker-provision-client-rpc-system client))
         (worker-id (warp-worker-provision-client-worker-id client))
         (master-id (warp-worker-provision-client-master-id client))
-        (component-system-id (warp-worker-provision-client-component-system-id client)) ; Get ID
+        (component-system-id (warp-worker-provision-client-component-system-id client)) 
         (apply-hooks (warp-worker-provision-client-apply-hooks client))
         (initial-fetch-promises nil))
     ;; 1. Subscribe to live `provision-update` events from the master.
@@ -435,8 +435,8 @@ Side Effects:
 
   ;; 3. Publish an event to notify listening workers of the update.
   (when-let* ((es (warp-master-provision-manager-event-system manager))
-              (rpc-sys (warp-master-provision-manager-rpc-system manager)) ; Get RPC system
-              (component-sys-id (warp-component-system-id ; Get its component system ID
+              (rpc-sys (warp-master-provision-manager-rpc-system manager)) 
+              (component-sys-id (warp-component-system-id 
                                  (warp-rpc-system-component-system rpc-sys))))
     (braid! (warp:emit-event-with-options
              es
@@ -446,9 +446,9 @@ Side Effects:
               :provision-type provision-type :target-ids target-ids)
              :source-id (warp-master-provision-manager-name manager)
              :distribution-scope (if target-ids :cluster :global)
-             :rpc-system rpc-sys ; Pass rpc-system here
-             :origin-instance-id component-sys-id) ; Pass origin ID here
-      (:then (lambda (_) t)) ; Resolve to t on success
+             :rpc-system rpc-sys 
+             :origin-instance-id component-sys-id) 
+      (:then (lambda (_) t)) 
       (:catch (lambda (err)
                 (warp:log! :error (warp-master-provision-manager-name manager)
                            (format "Failed to emit provision update event: %S" err))

@@ -441,7 +441,7 @@ Side Effects:
                  (warp:log! :trace (warp-rpc-system-name rpc-system)
                             (format "RPC message '%s' sent successfully."
                                     correlation-id))
-                 request-promise)) ; Return the promise (if any)
+                 request-promise)) 
         (:catch (lambda (err)
                   ;; If sending fails, we must clean up the pending request.
                   (when expect-response
@@ -454,7 +454,7 @@ Side Effects:
                         (remhash correlation-id
                                  (warp-rpc-system-pending-requests
                                   rpc-system))))
-                    (loom:promise-reject request-promise err)) ; Reject original promise
+                    (loom:promise-reject request-promise err))
                   (warp:log! :error (warp-rpc-system-name rpc-system)
                              (format "Failed to send RPC '%s' (ID: %s): %S"
                                      (warp-rpc-command-name command)

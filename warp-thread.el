@@ -49,7 +49,7 @@
 (require 'warp-log)
 (require 'warp-error)
 (require 'warp-stream)
-(require 'warp-pool) ; Ensure warp-pool is loaded for warp:pool-builder
+(require 'warp-pool) 
 (require 'warp-config)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

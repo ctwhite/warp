@@ -1,5 +1,4 @@
-;;; warp-rate-limiter.el --- Per-Client Request Rate Limiting Middleware
-;;; -*- lexical-binding: t; -*-
+;;; warp-rate-limiter.el --- Per-Client Request Rate Limiting Middleware -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;

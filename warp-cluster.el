@@ -20,6 +20,10 @@
 ;;   manages their creation, startup, and shutdown automatically in the
 ;;   correct order, preventing common setup and teardown errors.
 ;;
+;; - **Heterogeneous Worker Pools**: The cluster can manage multiple, distinct
+;;   pools of workers (e.g., a CPU pool and a GPU pool), each with its own
+;;   size, type, and autoscaling rules.
+;;
 ;; - **Advanced Load Balancing**: The `load-balancer` component is dynamically
 ;;   configured based on the cluster's strategy, allowing for intelligent
 ;;   worker selection via algorithms like round-robin or least-response-time.
@@ -88,57 +92,36 @@ This config defines static parameters governing the cluster, such as
 worker provisioning, communication protocols, and scaling settings.
 
 Fields:
-- `name` (string): User-defined name for the cluster (e.g., \"image-processing\").
-- `protocol` (keyword): Communication protocol. `:pipe` is for local-only,
-  while `:tcp` or `:websocket` are for network-aware clusters.
-- `initial-workers` (integer): Number of workers to launch on start.
-- `max-workers` (integer): The upper bound for the autoscaler.
-- `min-workers` (integer): The lower bound for the autoscaler.
-- `worker-type` (keyword): The type of application worker to launch
-  (`:lisp` or `:docker`).
-- `docker-image` (string): The Docker image to use for `:docker` workers.
-- `docker-run-args` (list): Extra arguments for the `docker run` command.
-- `load-balance-strategy` (symbol): Algorithm for selecting a worker, e.g.,
-  `:round-robin`, `:least-response-time`.
-- `autoscaling-enabled-p` (boolean): If `t`, enables the autoscaler monitor.
-- `autoscaler-strategy` (warp-autoscaler-strategy): The auto-scaling
-  strategy object for the worker pool. If `nil`, autoscaling is disabled.
+- `name` (string): User-defined name for the cluster.
+- `protocol` (keyword): Communication protocol for the master.
+- `worker-pools` (list): A list of plists, each defining a distinct pool of workers.
+  Each pool config can have:
+  - `:name` (string): A unique name for the pool (e.g., \"cpu-pool\").
+  - `:initial-workers`, `:min-workers`, `:max-workers` (integer).
+  - `:worker-type` (keyword): `:lisp` or `:docker`.
+  - `:docker-image` (string): The Docker image for this pool.
+  - `:docker-run-args` (list): Extra arguments for `docker run`.
+  - `:autoscaler-strategy` (warp-autoscaler-strategy): A strategy object for this pool.
+- `load-balance-strategy` (symbol): Global algorithm for selecting a worker.
 - `health-check-enabled` (boolean): If `t`, enables active health checks.
 - `health-check-interval` (integer): Frequency of health checks in seconds.
 - `health-check-timeout` (number): Timeout for a worker to respond to a ping.
-- `listen-address` (string): For network protocols, the IP address the
-  master listens on (e.g., \"127.0.0.1\" or \"0.0.0.0\").
-- `degraded-load-penalty` (integer): Artificial load penalty added to
-  degraded workers to make them less likely to be chosen for new tasks.
+- `listen-address` (string): The IP address the master listens on.
+- `degraded-load-penalty` (integer): Penalty added to degraded workers.
 - `worker-initial-weight` (float): Base capacity weight for a new worker.
-- `environment` (list): An alist of `(KEY . VALUE)` strings to set as
-  environment variables for worker processes.
-- `use-event-broker` (boolean): If `t`, a dedicated event broker worker will
-  be launched to handle cluster-wide events.
-- `event-broker-config` (event-broker-config): Configuration for the
-  event broker worker, if used.
-- `use-job-queue` (boolean): If `t`, a dedicated job queue worker will be
-  launched to manage persistent jobs.
-- `job-queue-redis-config-options` (plist): Configuration for the Redis
-  instance used by the job queue worker (e.g., `:host`, `:port`).
-- `worker-transport-options` (plist): Options passed to the worker to
-  configure its client-side connection *back* to the master."
+- `environment` (list): Global environment variables for all workers.
+- `use-event-broker` (boolean): If `t`, launch a dedicated event broker worker.
+- `event-broker-config` (event-broker-config): Configuration for the event broker.
+- `use-job-queue` (boolean): If `t`, launch a dedicated job queue worker.
+- `job-queue-redis-config-options` (plist): Config for the job queue's Redis.
+- `worker-transport-options` (plist): Global transport options for workers."
   (name nil :type string)
   (protocol :pipe :type keyword
             :validate (memq $ '(:pipe :tcp :websocket)))
-  (initial-workers 1 :type integer :validate (>= $ 0))
-  (max-workers 4 :type integer :validate (>= $ 1))
-  (min-workers
-   1 :type integer
-   :validate (and (>= $ 0) (<= $ (cluster-config-max-workers _it-self))))
-  (worker-type :lisp :type keyword :validate (memq $ '(:lisp :docker)))
-  (docker-image nil :type (or null string))
-  (docker-run-args nil :type (or null (list-of string)))
+  (worker-pools nil :type list)
   (load-balance-strategy
    :least-response-time :type symbol
    :validate (memq $ '(:least-response-time :round-robin :consistent-hash)))
-  (autoscaling-enabled-p nil :type boolean)
-  (autoscaler-strategy nil :type (or null t))
   (health-check-enabled t :type boolean)
   (health-check-interval 15 :type integer :validate (> $ 0))
   (health-check-timeout 5.0 :type number :validate (> $ 0.0))
@@ -330,50 +313,19 @@ Returns:
                        cluster cmd ctx)))))))
 
     ;; -- Worker Pool & Resource Management Components --
-    `(:name :worker-pool
+    `(:name :worker-pools
       :deps (:bridge)
-      :factory (lambda (_)
-                 (warp:pool-builder
-                  :pool `(:name ,(format "%s-worker-pool" (warp-cluster-id cluster))
-                          :resource-factory-fn
-                          ,(lambda (res pool)
-                             (let* ((worker-id (warp-pool-resource-id res))
-                                    (rank (1- (warp:pool-resource-count pool)))
-                                    (env (warp-cluster--build-worker-environment
-                                          cluster worker-id rank))
-                                    (launch-options
-                                     (pcase (cluster-config-worker-type config)
-                                       (:lisp
-                                        `(:name ,(format "warp-worker-%s" worker-id)
-                                          :process-type :lisp
-                                          :eval-string "(warp:worker-main)"
-                                          :env ,env))
-                                       (:docker
-                                        (unless (cluster-config-docker-image config)
-                                          (error "Cluster config :worker-type is :docker but :docker-image is not set"))
-                                        `(:name ,(format "warp-worker-%s" worker-id)
-                                          :process-type :docker
-                                          :docker-image ,(cluster-config-docker-image config)
-                                          :docker-run-args ,(cluster-config-docker-run-args config)
-                                          :env ,env)))))
-                               (warp:process-launch launch-options)))
-                          :resource-destructor-fn
-                          ,(lambda (res _)
-                             (warp:process-terminate
-                              (warp-pool-resource-handle res))))))
-      :stop (lambda (pool _) (loom:await (warp:pool-shutdown pool t))))
+      :factory (lambda (_) (make-hash-table :test 'equal)))
     `(:name :allocator
-      :deps (:event-system :worker-pool)
-      :factory (lambda (es pool)
+      :deps (:event-system :worker-pools)
+      :factory (lambda (es pools)
                  (let ((alloc (warp:allocator-create
                                :id ,(format "%s-allocator" (warp-cluster-id cluster))
                                :event-system es)))
-                   (warp-cluster--register-pool-with-allocator alloc pool config)
+                   (dolist (pool-config (cluster-config-worker-pools config))
+                     (warp-cluster--register-pool-with-allocator alloc pool-config pools cluster))
                    alloc))
-      :start (lambda (alloc _)
-               (when-let (strategy (cluster-config-autoscaler-strategy config))
-                 (warp:allocator-add-strategy alloc strategy))
-               (loom:await (warp:allocator-start alloc)))
+      :start (lambda (alloc _) (loom:await (warp:allocator-start alloc)))
       :stop (lambda (alloc _) (loom:await (warp:allocator-stop alloc))))
 
     ;; -- High-level Service Components --
@@ -385,10 +337,14 @@ Returns:
                   :config `(:node-key-fn
                             ,(lambda (w) (warp-managed-worker-worker-id w)))
                             :get-all-workers-fn
-                            ,(lambda ()
-                               (let ((m (warp:state-manager-get sm '(:workers))))
-                                 (when m (cl-loop for w being the hash-values of m
-                                                  collect w))))
+                            ,(lambda (&key pool-name)
+                               (let ((all-workers (hash-table-values
+                                                   (warp:state-manager-get sm '(:workers)))))
+                                 (if pool-name
+                                     (cl-remove-if-not (lambda (w)
+                                                         (string= (warp-managed-worker-pool-name w) pool-name))
+                                                       all-workers)
+                                   all-workers)))
                             :connection-load-fn
                             ,(lambda (w)
                                (warp-cluster--get-penalized-connection-load
@@ -411,12 +367,12 @@ Returns:
       :start (lambda (orch _) (loom:await (warp:health-orchestrator-start orch)))
       :stop (lambda (orch _) (loom:await (warp:health-orchestrator-stop orch))))
     `(:name :initial-spawn-service
-      :deps (:allocator :worker-pool)
+      :deps (:allocator :worker-pools)
       :priority 100
       :start (lambda (_ system)
                (let ((alloc (warp:component-system-get system :allocator))
-                     (pool (warp:component-system-get system :worker-pool)))
-                 (warp-cluster--initial-worker-spawn cluster alloc pool config))))
+                     (pools (warp:component-system-get system :worker-pools)))
+                 (warp-cluster--initial-worker-spawn cluster alloc pools config))))
     )
    ;; -- Optional Specialized Workers & Services --
    (when (cluster-config-use-event-broker config)
@@ -439,35 +395,33 @@ Returns:
    (when (cluster-config-autoscaling-enabled-p config)
      (list
       `(:name :autoscaler-monitor
-        :deps (:worker-pool)
-        :factory (lambda (_) (make-hash-table)) ; Holder for monitor ID
+        :deps (:worker-pools)
+        :factory (lambda (_) (make-hash-table)) ; Holder for monitor IDs
         :start (lambda (holder system)
-                 (let* ((pool (warp:component-system-get system :worker-pool))
-                        (strategy (cluster-config-autoscaler-strategy config))
-                        (metrics-fn (lambda () (warp:cluster-metrics cluster))))
-                   (unless strategy
-                     (error "Autoscaling enabled but no :autoscaler-strategy provided."))
-                   (let ((monitor-id (warp:autoscaler pool metrics-fn strategy)))
-                     (puthash :id monitor-id holder))))
+                 (let ((pools (warp:component-system-get system :worker-pools)))
+                   (dolist (pool-config (cluster-config-worker-pools config))
+                     (when-let (strategy (plist-get pool-config :autoscaler-strategy))
+                       (let* ((pool-name (plist-get pool-config :name))
+                              (pool (gethash pool-name pools))
+                              (metrics-fn (lambda () (warp:cluster-metrics cluster :pool-name pool-name))))
+                         (let ((monitor-id (warp:autoscaler pool metrics-fn strategy)))
+                           (puthash pool-name monitor-id holder)))))))
         :stop (lambda (holder _)
-                (when-let (monitor-id (gethash :id holder))
-                  (warp:autoscaler-stop monitor-id))))))
-   ))
+                (maphash (lambda (_ monitor-id) (warp:autoscaler-stop monitor-id))
+                         holder))))))
 
 ;;----------------------------------------------------------------------
 ;;; Component Helpers & Utilities
 ;;----------------------------------------------------------------------
 
-(defun warp-cluster--build-worker-environment (cluster worker-id rank)
+(defun warp-cluster--build-worker-environment (cluster worker-id rank pool-name)
   "Build the complete environment variable list for a new worker.
-This function encapsulates the logic of assembling the necessary
-environment for a worker to bootstrap itself, including its identity,
-master's contact address, and a one-time security token.
 
 Arguments:
 - `CLUSTER` (warp-cluster): The parent cluster instance.
 - `WORKER-ID` (string): The unique ID generated for this specific worker.
 - `RANK` (integer): The numerical rank of this worker.
+- `POOL-NAME` (string): The name of the pool this worker belongs to.
 
 Returns:
 - (list): An alist of `(KEY . VALUE)` strings for the worker process."
@@ -482,6 +436,7 @@ Returns:
     (append
      `((,(warp:env 'worker-id) . ,worker-id)
        (,(warp:env 'worker-rank) . ,(number-to-string rank))
+       (,(warp:env 'worker-pool-name) . ,pool-name)
        (,(warp:env 'ipc-id) . ,worker-id)
        (,(warp:env 'master-contact) . ,master-contact)
        (,(warp:env 'log-channel) . ,log-addr)
@@ -490,47 +445,65 @@ Returns:
        (,(warp:env 'launch-token) . ,(plist-get token-info :token)))
      (cluster-config-environment config))))
 
-(defun warp-cluster--register-pool-with-allocator
-    (allocator pool config)
-  "Configure and register the worker pool with the allocator.
-This function defines the 'contract' between the `allocator` and the
-`worker-pool`, telling the allocator how to request, terminate, and
-query the number of workers.
+(defun warp-cluster--register-pool-with-allocator (allocator pool-config pools cluster)
+  "Configure and register a single worker pool with the allocator.
 
 Arguments:
 - `ALLOCATOR` (warp-allocator): The allocator component instance.
-- `POOL` (warp-pool): The worker pool component instance to register.
-- `CONFIG` (cluster-config): The main cluster configuration.
-
-Side Effects:
-- Registers the pool's specification with the allocator instance."
-  (let ((spec (make-warp-resource-spec
-               :name (warp-pool-name pool)
-               :min-capacity (cluster-config-min-workers config)
-               :max-capacity (cluster-config-max-workers config)
-               :allocation-fn
-               (lambda (count)
-                 (let ((ids (cl-loop for i from 1 to count
-                                     collect (format "%s-app-worker-%06x"
-                                                     (warp-pool-name pool)
-                                                     (random (expt 2 32))))))
-                   (loom:await (warp:pool-add-resources pool ids))))
-               :deallocation-fn
-               (lambda (resources)
-                 (loom:await (warp:pool-remove-resources pool resources)))
-               :get-current-capacity-fn
-               (lambda () (plist-get
-                           (plist-get (warp:pool-status pool) :resources)
-                           :total)))))
-    (loom:await (warp:allocator-register-pool allocator (warp-pool-name pool)
-                                              spec))))
+- `POOL-CONFIG` (plist): The configuration for the pool to register.
+- `POOLS` (hash-table): The hash table of all pool objects.
+- `CLUSTER` (warp-cluster): The parent cluster instance."
+  (let* ((pool-name (plist-get pool-config :name))
+         (config (warp-cluster-config cluster))
+         (pool (warp:pool-builder
+                :pool `(:name ,pool-name
+                        :resource-factory-fn
+                        ,(lambda (res pool)
+                           (let* ((worker-id (warp-pool-resource-id res))
+                                  (rank (1- (warp:pool-resource-count pool)))
+                                  (env (warp-cluster--build-worker-environment
+                                        cluster worker-id rank pool-name))
+                                  (launch-options
+                                   (pcase (plist-get pool-config :worker-type)
+                                     (:lisp
+                                      `(:name ,(format "warp-worker-%s" worker-id)
+                                        :process-type :lisp
+                                        :eval-string "(warp:worker-main)"
+                                        :env ,env))
+                                     (:docker
+                                      `(:name ,(format "warp-worker-%s" worker-id)
+                                        :process-type :docker
+                                        :docker-image ,(plist-get pool-config :docker-image)
+                                        :docker-run-args ,(plist-get pool-config :docker-run-args)
+                                        :env ,env)))))
+                             (warp:process-launch launch-options)))
+                        :resource-destructor-fn
+                        ,(lambda (res _)
+                           (warp:process-terminate
+                            (warp-pool-resource-handle res)))))))
+    (puthash pool-name pool pools)
+    (let ((spec (make-warp-resource-spec
+                 :name pool-name
+                 :min-capacity (plist-get pool-config :min-workers)
+                 :max-capacity (plist-get pool-config :max-workers)
+                 :allocation-fn
+                 (lambda (count)
+                   (let ((ids (cl-loop for i from 1 to count
+                                       collect (format "%s-worker-%06x"
+                                                       pool-name (random (expt 2 32))))))
+                     (loom:await (warp:pool-add-resources pool ids))))
+                 :deallocation-fn
+                 (lambda (resources)
+                   (loom:await (warp:pool-remove-resources pool resources)))
+                 :get-current-capacity-fn
+                 (lambda () (plist-get
+                             (plist-get (warp:pool-status pool) :resources)
+                             :total)))))
+      (loom:await (warp:allocator-register-pool allocator pool-name spec)))))
 
 (defun warp-cluster--subscribe-to-worker-health-events
     (orchestrator event-system sm bridge rpc-system config)
   "Subscribe the health orchestrator to worker lifecycle events.
-This function wires the `health-orchestrator` to the event bus, allowing
-it to dynamically add or remove health checks as workers join and leave
-the cluster.
 
 Arguments:
 - `ORCHESTRATOR` (warp-health-orchestrator): The health orchestrator.
@@ -576,26 +549,22 @@ Side Effects:
          (loom:await (warp:health-orchestrator-deregister-check
                       orchestrator worker-id)))))))
 
-(defun warp-cluster--initial-worker-spawn (cluster allocator pool config)
-  "Launch the initial set of application workers as defined in the config.
+(defun warp-cluster--initial-worker-spawn (cluster allocator pools config)
+  "Launch the initial set of application workers for each pool.
 
 Arguments:
 - `CLUSTER` (warp-cluster): The cluster instance.
 - `ALLOCATOR` (warp-allocator): The allocator component.
-- `POOL` (warp-pool): The worker pool component.
-- `CONFIG` (cluster-config): The cluster configuration.
-
-Returns:
-- (loom-promise): A promise that resolves when the scaling request
-  has been issued to the allocator."
-  (let ((initial-workers (cluster-config-initial-workers config)))
-    (loom:await (warp:allocator-scale-pool allocator (warp-pool-name pool)
-                                           :target-count initial-workers))))
+- `POOLS` (hash-table): The hash table of worker pools.
+- `CONFIG` (cluster-config): The cluster configuration."
+  (dolist (pool-config (cluster-config-worker-pools config))
+    (let ((pool-name (plist-get pool-config :name))
+          (initial-workers (plist-get pool-config :initial-workers)))
+      (loom:await (warp:allocator-scale-pool allocator pool-name
+                                             :target-count initial-workers)))))
 
 (defun warp-cluster--get-penalized-connection-load (cluster m-worker)
   "Return the effective load, with penalties for degraded workers.
-This is used by the load balancer to make struggling workers a less
-attractive target for new tasks, giving them an opportunity to recover.
 
 Arguments:
 - `CLUSTER` (warp-cluster): The cluster instance.
@@ -614,8 +583,6 @@ Returns:
 
 (defun warp-cluster--calculate-dynamic-worker-weight (cluster m-worker)
   "Calculate a dynamic weight for a worker based on its health and load.
-This is used by weight-based load balancing strategies. The weight
-reflects a worker's real-time capacity.
 
 Arguments:
 - `CLUSTER` (warp-cluster): The cluster instance.
@@ -655,9 +622,6 @@ Returns:
 
 (defun warp-cluster--cleanup-all ()
   "Clean up all active clusters when Emacs is about to exit.
-This function is registered as a `kill-emacs-hook` to perform last-resort
-cleanup, preventing orphaned worker processes if the user exits Emacs
-without manually shutting down active clusters.
 
 Side Effects:
 - Calls `warp:cluster-shutdown` on all active clusters."
@@ -675,11 +639,12 @@ Side Effects:
 ;;; Public API
 
 ;;;###autoload
-(defun warp:cluster-metrics (cluster)
+(defun warp:cluster-metrics (cluster &key pool-name)
   "Aggregates and returns current metrics for all workers in a cluster.
 
 Arguments:
 - `CLUSTER` (warp-cluster): The cluster instance to inspect.
+- `:POOL-NAME` (string, optional): If provided, filters metrics for a specific pool.
 
 Returns:
 - (loom-promise): A promise that resolves with a plist of aggregated metrics."
@@ -690,15 +655,18 @@ Returns:
                (let ((total-cpu 0.0)
                      (total-mem 0.0)
                      (total-rps 0)
-                     (worker-count 0))
-                 (maphash (lambda (_ worker)
-                            (when-let (metrics (warp-managed-worker-last-reported-metrics worker))
-                              (cl-incf worker-count)
-                              (when-let (proc-metrics (warp-worker-metrics-process-metrics metrics))
-                                (cl-incf total-cpu (warp-process-metrics-cpu-utilization proc-metrics))
-                                (cl-incf total-mem (warp-process-metrics-memory-utilization-mb proc-metrics)))
-                              (cl-incf total-rps (warp-worker-metrics-active-request-count metrics))))
-                          workers-map)
+                     (worker-count 0)
+                     (workers (if pool-name
+                                  (cl-remove-if-not (lambda (w) (string= (warp-managed-worker-pool-name w) pool-name))
+                                                    (hash-table-values workers-map))
+                                (hash-table-values workers-map))))
+                 (dolist (worker workers)
+                   (when-let (metrics (warp-managed-worker-last-reported-metrics worker))
+                     (cl-incf worker-count)
+                     (when-let (proc-metrics (warp-worker-metrics-process-metrics metrics))
+                       (cl-incf total-cpu (warp-process-metrics-cpu-utilization proc-metrics))
+                       (cl-incf total-mem (warp-process-metrics-memory-utilization-mb proc-metrics)))
+                     (cl-incf total-rps (warp-worker-metrics-active-request-count metrics))))
                  `(:avg-cluster-cpu-utilization ,(if (> worker-count 0) (/ total-cpu worker-count) 0.0)
                    :avg-cluster-memory-utilization ,(if (> worker-count 0) (/ total-mem worker-count) 0.0)
                    :total-cluster-requests-per-sec ,total-rps)))))))
@@ -706,24 +674,12 @@ Returns:
 ;;;###autoload
 (defun warp:cluster-create (&rest args)
   "Create and configure a new, un-started Warp cluster instance.
-This is the main constructor for creating a cluster. It parses the
-user-provided configuration, generates a unique cluster ID, and
-uses the bootstrap system to declaratively build and wire all of
-its internal subsystems. The cluster does not start any processes
-until `warp:cluster-start` is called.
 
 Arguments:
 - `&rest ARGS` (plist): A property list conforming to `cluster-config`.
 
 Returns:
-- (warp-cluster): A new, fully configured but not yet started cluster.
-
-Side Effects:
-- Adds the cluster to the global `warp-cluster--active-clusters` list for
-  cleanup on Emacs exit.
-
-Signals:
-- `warp-config-validation-error`: If configuration fails validation."
+- (warp-cluster): A new, fully configured but not yet started cluster."
   (let* ((config (apply #'make-cluster-config args))
          (cluster-id (warp-cluster--generate-id))
          (cluster (%%make-cluster
@@ -743,22 +699,12 @@ Signals:
 ;;;###autoload
 (defun warp:cluster-start (cluster)
   "Start a cluster and its underlying component system.
-This function initiates the entire startup sequence for the cluster,
-starting all defined components in the correct dependency order. This
-is when network listeners are activated and worker processes are launched.
 
 Arguments:
 - `CLUSTER` (warp-cluster): The cluster instance to start.
 
 Returns:
-- `CLUSTER`.
-
-Side Effects:
-- Starts all internal services (networking, health checks, etc.).
-- Launches initial worker sub-processes.
-
-Signals:
-- `(error)`: If any component fails to start."
+- `CLUSTER`."
   (let ((system (warp-cluster-component-system cluster)))
     (warp:log! :info (warp-cluster-id cluster) "Starting cluster...")
     (loom:await (warp:component-system-start system))
@@ -768,8 +714,6 @@ Signals:
 ;;;###autoload
 (defun warp:cluster-shutdown (cluster &optional force)
   "Shut down the cluster and stop its component system.
-This initiates a graceful shutdown of the cluster, stopping all
-components in the reverse of their startup order.
 
 Arguments:
 - `CLUSTER` (warp-cluster): The cluster instance to shut down.
@@ -777,11 +721,7 @@ Arguments:
   they should shut down immediately without waiting for graceful cleanup.
 
 Returns:
-- (loom-promise): A promise that resolves when the shutdown is complete.
-
-Side Effects:
-- Terminates all worker sub-processes managed by this cluster.
-- Removes the cluster from the global active cluster list."
+- (loom-promise): A promise that resolves when the shutdown is complete."
   (let ((system (warp-cluster-component-system cluster)))
     (warp:log! :info (warp-cluster-id cluster) "Shutting down cluster...")
     (setq warp-cluster--active-clusters
@@ -790,17 +730,13 @@ Side Effects:
     (warp:log! :info (warp-cluster-id cluster) "Cluster shutdown complete.")))
 
 ;;;###autoload
-(defun warp:cluster-select-worker (cluster &key session-id)
+(defun warp:cluster-select-worker (cluster &key session-id pool-name)
   "Select a single worker using the cluster's configured load balancer.
-This is the primary method for application code to get a worker to
-execute a task on. The selection is based on the `load-balance-strategy`
-defined in the cluster's configuration.
 
 Arguments:
 - `CLUSTER` (warp-cluster): The cluster instance.
-- `:session-id` (string, optional): A session key, required for
-  strategies like `:consistent-hash` to ensure a client is always routed
-  to the same worker.
+- `:session-id` (string, optional): A session key for consistent hashing.
+- `:pool-name` (string, optional): The name of the worker pool to select from.
 
 Returns:
 - (warp-managed-worker): The selected managed worker instance.
@@ -809,14 +745,11 @@ Signals:
 - `(warp-no-available-workers)`: If no healthy workers are available."
   (let* ((system (warp-cluster-component-system cluster))
          (balancer (warp:component-system-get system :load-balancer)))
-    (warp:balance balancer :session-id session-id)))
+    (warp:balance balancer :session-id session-id :pool-name pool-name)))
 
 ;;;###autoload
 (defun warp:cluster-set-init-payload (cluster rank payload)
   "Set the initialization payload for a specific worker rank.
-This allows a user to define custom Lisp code or data that will be
-sent to a worker of a particular `RANK` during its startup handshake.
-This is useful for per-worker customization.
 
 Arguments:
 - `CLUSTER` (warp-cluster): The cluster instance.
@@ -824,11 +757,7 @@ Arguments:
 - `PAYLOAD` (any): The serializable Lisp object to be sent as the payload.
 
 Returns:
-- (loom-promise): A promise that resolves with the `payload`.
-
-Side Effects:
-- Stores the payload within the `:bridge` component, waiting for the
-  worker of the specified rank to connect."
+- (loom-promise): A promise that resolves with the `payload`."
   (let ((bridge (warp:component-system-get
                  (warp-cluster-component-system cluster) :bridge)))
     (loom:await (warp:bridge-set-init-payload bridge rank payload))))

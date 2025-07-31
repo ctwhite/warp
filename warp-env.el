@@ -35,6 +35,7 @@
   - `ipc-id` (string): The key for the unique identifier for this process.
   - `worker-id` (string): The key for the worker's unique identifier.
   - `worker-rank` (string): The key for a worker's assigned rank.
+  - `worker-pool-name` (string): The key for the name of the worker's pool.
   - `master-contact` (string): The key for the master's network address.
   - `log-channel` (string): The key for the centralized log server address.
   - `cluster-id` (string): The key for the ID of the worker's cluster.
@@ -47,6 +48,7 @@
   (ipc-id "WARP_IPC_ID" :type string :read-only t)
   (worker-id "WARP_WORKER_ID" :type string :read-only t)
   (worker-rank "WARP_WORKER_RANK" :type string :read-only t)
+  (worker-pool-name "WARP_WORKER_POOL_NAME" :type string :read-only t)
   (master-contact "WARP_MASTER_CONTACT" :type string :read-only t)
   (log-channel "WARP_LOG_CHANNEL" :type string :read-only t)
   (cluster-id "WARP_CLUSTER_ID" :type string :read-only t)

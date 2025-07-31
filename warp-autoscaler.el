@@ -383,7 +383,7 @@ Signals:
              "scale-step-size must be a positive integer"))
     (pcase type
       ((or :cpu-utilization :request-rate :response-time
-           :healthy-resources :active-resources) ; Now types, not metrics. Renamed from workers
+           :healthy-resources :active-resources) 
        (unless (warp-autoscaler-strategy-metric-value-extractor-fn strategy)
          (error 'warp-autoscaler-invalid-strategy
                 "Metric-based strategies require a :metric-value-extractor-fn."))
@@ -858,10 +858,6 @@ Returns:
 ;;----------------------------------------------------------------------
 ;;; Standard Auto-Scaling Strategy Definitions
 ;;----------------------------------------------------------------------
-
-;; Note: The metric-value-extractor-fn for these strategies now expects
-;; a generic metrics plist from a metrics provider (e.g., from
-;; warp:cluster-metrics), not directly from a cluster object.
 
 (warp:defautoscaler-strategy warp-autoscaler-cpu-utilization-strategy
   "Auto-scaling strategy based on average CPU utilization across resources.

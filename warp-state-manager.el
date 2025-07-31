@@ -1334,7 +1334,7 @@ Returns:
      (lambda ()
        (condition-case err
            (progn
-             (make-directory persist-dir t) ; Ensure directory exists
+             (make-directory persist-dir t) 
              (with-temp-file snapshot-file
                (let ((print-level nil) (print-length nil)) ; Prevent truncation
                  (insert (format ";;; Warp State Manager Snapshot: %s\n"

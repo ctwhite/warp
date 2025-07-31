@@ -20,12 +20,14 @@
 ;; - **Configuration from Environment**: The worker's configuration is
 ;;   loaded automatically from environment variables set by the master
 ;;   process, using the enhanced `warp:defconfig` system.
+;; - **Optional Job Processing**: Workers can be configured to actively
+;;   pull and process jobs from the `warp-job-queue` by enabling the
+;;   `:job-processor-service` component.
 ;; - **Observable by Default**: The architecture integrates components
 ;;   for metrics, structured logging, and health monitoring, providing
 ;;   deep operational insights out of the box.
 ;; - **Security-First**: The design includes components for
-;;   cryptographic key management, sandboxed code execution via
-;;   security policies, and JWT-based request authentication.
+;;   cryptographic key management and sandboxed code execution.
 
 ;;; Code:
 
@@ -92,8 +94,7 @@ errors during the initial secure handshake with the master."
   "The singleton `warp-worker` instance for this Emacs process.
 A worker process hosts only one worker instance, and this variable
 provides a global handle to it for convenience, especially in callback
-functions and shutdown hooks. It's set by `warp:worker-create`."
-  )
+functions and shutdown hooks. It's set by `warp:worker-create`.")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Configuration
@@ -695,7 +696,7 @@ Side Effects:
                     (let ((holder (warp:component-system-get system :job-processor-service)))
                       (when (timerp (gethash :timer holder)) ; Check if not shutting down
                         (puthash :timer (run-at-time 1 nil #'warp-worker--job-processing-loop worker system)
-                                 holder))))))))
+                                 holder)))))))))
 
 ;;----------------------------------------------------------------------
 ;;; Core Logic & Utilities
@@ -706,6 +707,7 @@ Side Effects:
 This function is called once at startup by the `ready-signal-service`.
 It announces the worker's presence and performs the initial secure
 handshake by signing a token provided by the master, proving its identity.
+It also includes the worker's assigned pool name, if available.
 
 Arguments:
 - `worker` (warp-worker): The worker instance.
@@ -731,6 +733,7 @@ Signals:
          (worker-id (warp-worker-worker-id worker))
          (launch-id (getenv (warp:env 'launch-id)))
          (master-token (getenv (warp:env 'launch-token)))
+         (pool-name (getenv (warp:env 'worker-pool-name)))
          ;; Sign the master's token to prove this worker's identity.
          ;; This is a critical security step.
          (data-to-sign (format "%s:%s" worker-id master-token))
@@ -750,6 +753,7 @@ Signals:
       rpc-system conn worker-id (warp-worker-rank worker)
       :starting launch-id master-token worker-sig pub-key
       :inbox-address inbox-address
+      :pool-name pool-name 
       :origin-instance-id cs-id))))
 
 (defun warp-worker--send-heartbeat (worker system)
@@ -775,7 +779,7 @@ Side Effects:
   (let* ((cm (warp:component-system-get system :connection-manager))
          (rpc-system (warp:component-system-get system :rpc-system))
          (conn (when cm (warp:connection-manager-get-connection cm)))
-         (cs-id (warp-component-system-id system))) ; Get origin ID
+         (cs-id (warp-component-system-id system)))
 
     (when conn
       ;; Gather metrics from all relevant components.
@@ -791,8 +795,7 @@ Side Effects:
                                 '(:overall-status :unknown)))
              (active-reqs
               (loom:with-mutex! (warp-rpc-system-lock rpc-system)
-                (gethash :active-request-count
-                         (warp:rpc-system-metrics rpc-system) 0)))
+                (gethash :active-request-count (warp:rpc-system-metrics rpc-system) 0)))
              ;; Assemble the final metrics payload.
              (metrics
               (make-warp-worker-metrics
@@ -838,8 +841,7 @@ Side Effects:
          (key-mgr (warp:component-system-get system :key-manager)))
     (unless key-mgr (error "Key manager component not available for signing."))
     (let ((priv-key-path (warp:key-manager-get-private-key-path key-mgr)))
-      (unless priv-key-path
-        (error "Worker private key not loaded for signing. Check key manager."))
+      (unless priv-key-path (error "Worker private key not loaded for signing."))
       (warp:log! :trace (warp-worker-worker-id worker)
                  "Signing data with private key from: %s" priv-key-path)
       (warp:crypto-base64url-encode
@@ -868,10 +870,8 @@ Side Effects:
          (worker-id (warp-worker-worker-id worker))
          (system (warp-worker-component-system worker))
          (heartbeat-svc (warp:component-system-get system :heartbeat-service)))
-    ;; Atomically update the worker's main config object.
     (setf (warp-worker-config worker) new-provision)
 
-    ;; If the heartbeat interval has changed, cancel the old timer and start a new one.
     (unless (eq (worker-config-heartbeat-interval new-provision)
                 (worker-config-heartbeat-interval old-provision))
       (when-let (timer (gethash :timer heartbeat-svc)) (cancel-timer timer))
@@ -883,13 +883,11 @@ Side Effects:
       (warp:log! :info worker-id "Heartbeat interval updated to: %.1fs"
                  (worker-config-heartbeat-interval new-provision)))
 
-    ;; If the log level has changed, update the global logger.
     (unless (eq (worker-config-log-level new-provision)
                 (worker-config-log-level old-provision))
       (warp:log-set-level (worker-config-log-level new-provision))
       (warp:log! :info worker-id "Log level updated to: %S"
-                 (worker-config-log-level new-provision))))
-  nil)
+                 (worker-config-log-level new-provision)))))
 
 (defun warp-worker--generate-worker-id ()
   "Generates a cryptographically strong and descriptive worker ID.
@@ -907,8 +905,7 @@ Returns:
           (emacs-pid)
           (substring (secure-hash 'sha256 (random t)) 0 8)))
 
-(defun warp-worker--register-internal-health-checks
-    (orchestrator monitor event-system config)
+(defun warp-worker--register-internal-health-checks (orch monitor es config)
   "Registers all internal health checks with the health orchestrator.
 This function defines the worker's self-diagnosis capabilities by
 registering periodic checks for critical internal subsystems: process
@@ -931,11 +928,11 @@ Side Effects:
 - Registers multiple health checks with the `orchestrator` using
   `warp:health-orchestrator-register-check`. These checks will run
   periodically based on `health-check-interval`."
-  (let ((worker-id (warp-health-orchestrator-name orchestrator)))
+  (let ((worker-id (warp-health-orchestrator-name orch)))
     ;; Health check for memory usage. Fails if usage exceeds threshold.
     (loom:await
      (warp:health-orchestrator-register-check
-      orchestrator
+      orch
       `(:name "worker-memory-check"
         :target-id ,worker-id
         :check-fn
@@ -954,7 +951,7 @@ Side Effects:
     ;; Health check for CPU utilization. Fails if usage exceeds threshold.
     (loom:await
      (warp:health-orchestrator-register-check
-      orchestrator
+      orch
       `(:name "worker-cpu-check"
         :target-id ,worker-id
         :check-fn
@@ -975,7 +972,7 @@ Side Effects:
     ;; is close to full, indicating backpressure or a blocked event loop.
     (loom:await
      (warp:health-orchestrator-register-check
-      orchestrator
+      orch
       `(:name "worker-event-queue-check"
         :target-id ,worker-id
         :check-fn
@@ -997,19 +994,17 @@ Side Effects:
 ;;; RPC Handlers (Core Worker Commands)
 ;;----------------------------------------------------------------------
 
-(defun warp-handler-ping (command context)
-  "Handles the `:ping` RPC from the master.
+(defun warp-handler-ping (_cmd _ctx)
+  "Handles the `:ping` RPC from the master for liveness checks.
 This serves as a basic liveness check for the worker.
 
 Arguments:
-- `command` (warp-rpc-command): The incoming command object (its arguments
+- `_cmd` (warp-rpc-command): The incoming command object (its arguments
   are typically empty for a ping).
-- `context` (plist): The RPC request context (unused by this handler).
+- `_ctx` (plist): The RPC request context (unused by this handler).
 
 Returns:
 - (loom-promise): A promise that resolves with the string \"pong\"."
-  (warp:log! :debug (warp-rpc-system-name (plist-get context :rpc-system))
-             "Received ping from %s." (plist-get context :sender-id))
   (loom:resolved! "pong"))
 
 (defun warp-handler-register-dynamic-command (command context)
@@ -1036,32 +1031,27 @@ Side Effects:
 - If part of a service, registers the service with the `service-registry`."
   (let* ((worker (plist-get context :worker))
          (system (warp-worker-component-system worker))
-         (security-policy (warp:component-system-get system :security-policy))
+         (policy (warp:component-system-get system :security-policy))
          (router (warp:component-system-get system :command-router))
          (args (warp-rpc-command-args command))
-         (s-name (warp-protocol-register-dynamic-command-payload-service-name
-                  args))
-         (cmd-name (warp-protocol-register-dynamic-command-payload-command-name
-                    args))
-         (handler-form (warp-protocol-register-dynamic-command-payload-handler-form
-                        args)))
-    (braid! (warp:security-policy-execute-form security-policy handler-form)
+         (s-name (warp-protocol-register-dynamic-command-payload-service-name args))
+         (cmd-name (warp-protocol-register-dynamic-command-payload-command-name args))
+         (form (warp-protocol-register-dynamic-command-payload-handler-form args)))
+    (braid! (warp:security-policy-execute-form policy form)
       (:then (lambda (handler-fn)
                (unless (functionp handler-fn)
                  (loom:rejected!
                   (warp:error! :type 'warp-errors-security-violation
-                               :message (format "Dynamic command form for '%s' did not evaluate to a function."
-                                                cmd-name))))
-               (loom:await (warp:command-router-add-route
-                            router cmd-name :handler-fn handler-fn))
+                               :message "Form did not evaluate to a function.")))
+               (loom:await (warp:command-router-add-route router cmd-name
+                                                           :handler-fn handler-fn))
                (warp:log! :info (warp-worker-worker-id worker)
                           "Dynamically registered command '%S' for service '%s'."
                           cmd-name s-name)
                t))
       (:catch (lambda (err)
                 (warp:log! :error (warp-worker-worker-id worker)
-                           "Failed to dynamically register command: %S"
-                           err)
+                           "Failed to register dynamic command: %S" err)
                 (loom:rejected! err))))))
 
 (defun warp-handler-evaluate-map-chunk (command context)
@@ -1088,18 +1078,17 @@ Side Effects:
 - Executes the provided function on the data chunk."
   (let* ((worker (plist-get context :worker))
          (system (warp-worker-component-system worker))
-         (security-policy (warp:component-system-get system :security-policy))
+         (policy (warp:component-system-get system :security-policy))
          (args (warp-rpc-command-args command))
          (form (warp-protocol-cluster-map-payload-function-form args))
          (data (warp-protocol-cluster-map-payload-chunk-data args)))
-    (braid! (warp:security-policy-execute-form security-policy form)
+    (braid! (warp:security-policy-execute-form policy form)
       (:then (lambda (fn)
                (unless (functionp fn)
                  (loom:rejected!
                   (warp:error! :type 'warp-errors-security-violation
-                               :message "Form did not evaluate to a function for map chunk evaluation.")))
-               (make-warp-protocol-cluster-map-result
-                :results (mapcar fn data))))
+                               :message "Form did not evaluate to a function.")))
+               (make-warp-protocol-cluster-map-result :results (mapcar fn data))))
       (:catch (lambda (err)
                 (warp:log! :error (warp-worker-worker-id worker)
                            "Failed to evaluate map chunk: %S" err)
@@ -1112,7 +1101,7 @@ sequence. The worker will attempt to gracefully stop its components and
 drain active requests.
 
 Arguments:
-- `command` (warp-rpc-command): The incoming command object (arguments typically empty).
+- `_cmd` (warp-rpc-command): The incoming command object (arguments typically empty).
 - `context` (plist): The RPC request context, containing a reference to
   the `worker` instance.
 
@@ -1155,11 +1144,11 @@ Side Effects:
 - Logs the key update event."
   (let* ((worker (plist-get context :worker))
          (system (warp-worker-component-system worker))
-         (security-policy (warp:component-system-get system :security-policy))
+         (policy (warp:component-system-get system :security-policy))
          (new-keys (warp-protocol-provision-jwt-keys-payload-trusted-keys
                     (warp-rpc-command-args command))))
     (warp:log! :info (warp-worker-worker-id worker) "Updating JWT keys...")
-    (loom:await (warp:security-policy-update-trusted-keys security-policy new-keys))
+    (loom:await (warp:security-policy-update-trusted-keys policy new-keys))
     (warp:log! :info (warp-worker-worker-id worker) "JWT keys updated.")
     (loom:resolved! t)))
 
@@ -1378,6 +1367,42 @@ Side Effects:
      (warp:log! :fatal "warp:worker-main"
                 "Critical initialization error: %S. Exiting." err)
      (kill-emacs 1)))) ; Exit Emacs with non-zero status for error
+
+;;----------------------------------------------------------------------
+;;; Worker Profiles
+;;----------------------------------------------------------------------
+
+;;;###autoload
+(defmacro warp:defworker-profile (name &rest profile-options)
+  "Defines a reusable, named worker profile.
+A profile is a template of configuration options that can be referenced
+when creating a worker, reducing boilerplate.
+
+Arguments:
+- `NAME` (symbol): The unique name for this profile (e.g., 'etl-worker).
+- `PROFILE-OPTIONS` (plist): A property list of default configuration
+  options for this worker type (e.g., `:worker-type`, `:docker-image`).
+
+Returns:
+- The `NAME` of the profile.
+
+Side Effects:
+- Stores the profile definition in a global registry."
+  `(progn
+     (puthash ',name (list ,@profile-options) warp--worker-profiles)
+     ',name))
+
+;;;###autoload
+(defun warp:worker-get-profile (profile-name)
+  "Retrieves a worker profile by its name.
+
+Arguments:
+- `PROFILE-NAME` (symbol): The name of the profile to retrieve.
+
+Returns:
+- (plist or nil): The property list of configuration options for the
+  profile, or nil if not found."
+  (gethash profile-name warp--worker-profiles))
 
 (provide 'warp-worker)
 ;;; warp-worker.el ends here

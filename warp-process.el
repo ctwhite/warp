@@ -1,5 +1,4 @@
-;;; warp-process.el --- Enhanced Low-Level Process Primitives -*-
-;;; lexical-binding: t; -*-
+;;; warp-process.el --- Enhanced Low-Level Process Primitives -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
