@@ -27,8 +27,8 @@
 ;; - **Constraint System**: Configurable constraints for scaling decisions.
 ;; - **Circuit Breaker**: Integrates with an external circuit breaker
 ;;   service to prevent cascading failures during allocation operations.
-;; - **Cost Awareness**: Provides a hook to integrate resource cost into
-;;   scaling decisions.
+;; - **Cost Awareness**: Provides a hook to integrate resource cost and
+;;   periodic budget limits into scaling decisions.
 
 ;;; Code:
 
@@ -134,6 +134,17 @@ Fields:
   (start-time nil :type float)
   (promise nil :type t))
 
+(cl-defstruct (warp-budget-constraint
+               (:constructor make-warp-budget-constraint)
+               (:copier nil))
+  "Defines a budget constraint for a resource pool.
+
+Fields:
+- `limit` (number): The maximum cost allowed within the period.
+- `period` (keyword): The budget period, e.g., `:hourly`, `:daily`, `:monthly`."
+  (limit 0.0 :type number)
+  (period :daily :type keyword))
+
 (cl-defstruct (warp-resource-spec
                (:constructor make-warp-resource-spec)
                (:copier nil))
@@ -160,7 +171,11 @@ Fields:
   Signature: `(lambda (resource))` returning a status keyword (e.g.,
   `:healthy`, `:unhealthy`).
 - `cost-fn`: An optional function to calculate the cost of a scaling
-  operation. Signature: `(lambda (count type))` returning a numeric cost.
+  operation. Signature: `(lambda (count change-type))` where
+  `change-type` is `:scale-up` or `:scale-down`. Returns a numeric
+  cost (positive for additions, can be negative for removals).
+- `budget-constraint`: An optional `warp-budget-constraint` struct to
+  enforce spending limits.
 - `constraints`: A list of pool-specific predicate functions to gate
   scaling. Signature: `(lambda (pool change-type change-amount))`
   returning `t` for allowed, `nil` for blocked.
@@ -178,6 +193,7 @@ Fields:
   (deallocation-fn (cl-assert nil) :type function)
   (health-check-fn nil :type (or null function))
   (cost-fn nil :type (or null function))
+  (budget-constraint nil :type (or null warp-budget-constraint))
   (constraints nil :type list)
   (resource-selection-fn nil :type (or null function))
   (metadata nil :type plist))
@@ -250,6 +266,8 @@ Fields:
 - `name`: A unique name for this allocator manager instance.
 - `config`: The allocator's `allocator-config` object.
 - `pools`: A hash table mapping pool names to `warp-resource-pool` objects.
+- `budget-tracker`: A hash table mapping pool names to their budget
+  usage data (`:current-spend`, `:period-start`).
 - `strategies`: A priority-sorted list of all registered
   `warp-allocation-strategy`s.
 - `constraints`: A list of global constraint functions.
@@ -263,6 +281,7 @@ Fields:
   (name nil :type string)
   (config (cl-assert nil) :type allocator-config)
   (pools (make-hash-table :test 'equal) :type hash-table)
+  (budget-tracker (make-hash-table :test 'equal) :type hash-table)
   (strategies nil :type list)
   (constraints nil :type list)
   (lock (loom:lock "allocator-lock") :type t)
@@ -277,6 +296,26 @@ Fields:
 ;;----------------------------------------------------------------------
 ;;; Validation & Constraints
 ;;----------------------------------------------------------------------
+
+(defun warp-allocator--get-seconds-in-period (period-keyword)
+  "Converts a budget period keyword to its duration in seconds.
+An approximation is used for `:monthly`.
+
+Arguments:
+- `period-keyword` (keyword): One of `:hourly`, `:daily`, or `:monthly`.
+
+Returns:
+- (integer): The number of seconds in the period.
+
+Signals:
+- `warp-allocator-error`: If the period keyword is unrecognized."
+  (pcase period-keyword
+    (:hourly 3600)
+    (:daily 86400)
+    (:monthly (* 86400 30)) ; Approximation: 30 days
+    (_ (warp:error! :type 'warp-allocator-error
+                    :message (format "Invalid budget period: %S" period-keyword))
+     0)))
 
 (defun warp-allocator--validate-pool-spec (spec)
   "Performs comprehensive validation of a `warp-resource-spec` struct.
@@ -295,34 +334,36 @@ Signals:
 - `warp-allocator-error`: If any part of the specification is invalid."
   (unless (and (stringp (warp-resource-spec-name spec))
                (> (length (warp-resource-spec-name spec)) 0))
-    (signal 'warp-allocator-error
-            '("Resource spec name must be a non-empty string")))
+    (warp:error! :type 'warp-allocator-error
+                 :message "Resource spec name must be a non-empty string"))
   (unless (keywordp (warp-resource-spec-resource-type spec))
-    (signal 'warp-allocator-error '("Resource type must be a keyword")))
+    (warp:error! :type 'warp-allocator-error
+                 :message "Resource type must be a keyword"))
   (unless (and (integerp (warp-resource-spec-min-capacity spec))
                (>= (warp-resource-spec-min-capacity spec) 0))
-    (signal 'warp-allocator-error
-            '("Min capacity must be a non-negative integer")))
+    (warp:error! :type 'warp-allocator-error
+                 :message "Min capacity must be a non-negative integer"))
   (unless (and (integerp (warp-resource-spec-max-capacity spec))
                (> (warp-resource-spec-max-capacity spec) 0)
                (>= (warp-resource-spec-max-capacity spec)
                    (warp-resource-spec-min-capacity spec)))
-    (signal 'warp-allocator-error
-            '("Max capacity must be positive and >= min capacity")))
+    (warp:error! :type 'warp-allocator-error
+                 :message "Max capacity must be positive and >= min capacity"))
   (unless (functionp (warp-resource-spec-allocation-fn spec))
-    (signal 'warp-allocator-error
-            '("An `allocation-fn` function must be provided")))
+    (warp:error! :type 'warp-allocator-error
+                 :message "An `allocation-fn` function must be provided"))
   (unless (functionp (warp-resource-spec-deallocation-fn spec))
-    (signal 'warp-allocator-error
-            '("A `deallocation-fn` function must be provided")))
+    (warp:error! :type 'warp-allocator-error
+                 :message "A `deallocation-fn` function must be provided"))
   t)
 
 (defun warp-allocator--check-constraints (manager pool-name pool
                                           change-type change-amount)
   "Checks all applicable constraints before allowing a scaling operation.
-This function aggregates and executes all global and pool-specific
-constraint predicates. If any constraint returns `nil`, the operation
-is blocked by signaling a `warp-constraint-violation` error.
+This function aggregates and executes all global, pool-specific, and
+budgetary constraint predicates. If any constraint returns `nil` or is
+violated, the operation is blocked by signaling a
+`warp-constraint-violation` error.
 
 Arguments:
 - `manager` (warp-allocator): The allocator manager.
@@ -340,25 +381,39 @@ Signals:
     ;; Check pool-specific constraints first.
     (dolist (constraint-fn (warp-resource-spec-constraints spec))
       (unless (funcall constraint-fn pool change-type change-amount)
-        (signal 'warp-constraint-violation
-                (list (format "Resource constraint failed for pool '%s'"
-                              pool-name)))))
+        (warp:error! :type 'warp-constraint-violation
+                     :message (format "Resource constraint failed for pool '%s'" pool-name))))
     ;; Then, check global constraints.
     (dolist (constraint-fn (warp-allocator-constraints manager))
       (unless (funcall constraint-fn manager pool-name pool
                          change-type change-amount)
-        (signal 'warp-constraint-violation
-                (list (format "Global constraint failed for pool '%s'"
-                              pool-name)))))
-    ;; Finally, check cost constraints if a cost function is provided.
-    (when-let ((cost-fn (warp-resource-spec-cost-fn spec)))
-      (let ((cost (funcall cost-fn change-amount
-                           (warp-resource-spec-resource-type spec))))
-        ;; NOTE: This is a placeholder for real budget checking logic.
-        (when (> cost 1000.0) ; Example threshold for demonstration
-          (signal 'warp-constraint-violation
-                  (list (format "Cost constraint exceeded for pool '%s': %f"
-                                pool-name cost))))))
+        (warp:error! :type 'warp-constraint-violation
+                     :message (format "Global constraint failed for pool '%s'" pool-name))))
+    ;; Finally, check budget constraints if configured.
+    (when-let* ((cost-fn (warp-resource-spec-cost-fn spec))
+                (budget (warp-resource-spec-budget-constraint spec))
+                (tracker (gethash pool-name (warp-allocator-budget-tracker manager))))
+      (let* ((now (float-time))
+             (period-start (plist-get tracker :period-start))
+             (current-spend (plist-get tracker :current-spend))
+             (period-seconds (warp-allocator--get-seconds-in-period
+                              (warp-budget-constraint-period budget)))
+             (projected-cost (funcall cost-fn change-amount change-type)))
+        ;; Check if the budget period has reset.
+        (when (> (- now period-start) period-seconds)
+          (setq current-spend 0.0)
+          (setf (plist-get tracker :period-start) now
+                (plist-get tracker :current-spend) 0.0)
+          (puthash pool-name tracker (warp-allocator-budget-tracker manager)))
+        ;; Check if the new projected cost would exceed the budget limit.
+        (when (> (+ current-spend projected-cost) (warp-budget-constraint-limit budget))
+          (warp:error! 
+            :type 'warp-constraint-violation
+            :message (format "Budget constraint exceeded for pool '%s'. Projected cost %f 
+                              would exceed limit %f for the current period."
+                            pool-name
+                            (+ current-spend projected-cost)
+                            (warp-budget-constraint-limit budget))))))
     t))
 
 ;;----------------------------------------------------------------------
@@ -505,7 +560,7 @@ Side Effects:
              (error (warp:log! :error (warp-allocator-name manager)
                                (format "Health check sweep failed for
                                         pool '%s': %S"
-                                       pool-name err)))))
+                                       pool-name err))))))
        (warp-allocator-pools manager)))))
 
 ;;----------------------------------------------------------------------
@@ -592,10 +647,10 @@ Side Effects:
                              strategy-target-capacity target))
                       ((pred keywordp)
                        (setq strategy-decision result))))
-                (error (signal 'warp-allocation-strategy-error
-                               (list (format "Strategy '%s' failed"
-                                             (warp-allocation-strategy-name strategy))
-                                     err)))))))
+                (error (warp:error! :type 'warp-allocation-strategy-error
+                                    :message (format "Strategy '%s' failed"
+                                                     (warp-allocation-strategy-name strategy))
+                                    :cause err)))))))
 
         ;; 4. Execution: Act on the final scaling decision.
         (when strategy-decision
@@ -676,6 +731,7 @@ Side Effects:
 - Creates a `warp-scaling-operation` and adds it to the pool's
   `pending-operations`.
 - Updates `warp-resource-pool-last-scale-time`.
+- Records spending in the budget tracker upon success.
 - Emits `:resource-scale-up-initiated`, `:resource-scale-up-completed`,
   or `:resource-allocation-failed` events."
   (let* ((spec (warp-resource-pool-spec pool))
@@ -724,8 +780,7 @@ Side Effects:
                    (warp-resource-spec-allocation-fn spec)
                    allocation-count)
             (:then (new-resources)
-              ;; On success, update the pool's active resources and remove
-              ;; the pending operation.
+              ;; On success, update state, record costs, and emit event.
               (loom:with-mutex! (warp-allocator-lock manager)
                 (setf (warp-resource-pool-active-resources pool)
                       (append (warp-resource-pool-active-resources pool)
@@ -733,7 +788,14 @@ Side Effects:
                 (setf (warp-resource-pool-pending-operations pool)
                       (cl-remove operation
                                  (warp-resource-pool-pending-operations pool)
-                                 :key #'warp-scaling-operation-id)))
+                                 :key #'warp-scaling-operation-id))
+                ;; Record the cost of the successful allocation.
+                (when-let* ((cost-fn (warp-resource-spec-cost-fn spec))
+                            (tracker (gethash pool-name (warp-allocator-budget-tracker manager))))
+                  (let ((cost (funcall cost-fn (length new-resources) :scale-up)))
+                    (cl-incf (plist-get tracker :current-spend) cost)
+                    (puthash pool-name tracker (warp-allocator-budget-tracker manager)))))
+
               (when-let (es (warp-allocator-event-system manager))
                 (warp:emit-event-with-options
                  es :resource-scale-up-completed
@@ -773,7 +835,7 @@ Side Effects:
                                                                up pool %S"
                                                               pool-name)
                                              :cause err))))))
-        (warp-scaling-operation-promise operation))))
+        (warp-scaling-operation-promise operation)))))
 
 (cl-defun warp-allocator--scale-down (manager pool-name pool &key target-count resources)
   "Performs a scale-down operation on a pool.
@@ -802,6 +864,7 @@ Side Effects:
 - Creates and tracks a `warp-scaling-operation`.
 - Updates `warp-resource-pool-last-scale-time` and
   `warp-resource-pool-active-resources`.
+- Records cost changes in the budget tracker upon success.
 - Emits `:resource-scale-down-initiated`, `:resource-scale-down-completed`,
   or `:resource-deallocation-failed` events."
   (let* ((spec (warp-resource-pool-spec pool))
@@ -852,14 +915,10 @@ Side Effects:
              :source-id (warp-allocator-name manager)))
 
           ;; Execute the user-provided deallocation function asynchronously.
-          ;; Deallocation is typically less failure-prone than allocation,
-          ;; so it's not wrapped in a circuit breaker by default here,
-          ;; but could be if specific error handling is required.
           (braid! (funcall (warp-resource-spec-deallocation-fn spec)
                            resources-to-deallocate)
             (:then (_)
-              ;; On success, remove the deallocated resources from the
-              ;; active list and remove the pending operation.
+              ;; On success, update state, record costs, and emit event.
               (loom:with-mutex! (warp-allocator-lock manager)
                 (setf (warp-resource-pool-active-resources pool)
                       (cl-set-difference
@@ -868,7 +927,14 @@ Side Effects:
                 (setf (warp-resource-pool-pending-operations pool)
                       (cl-remove operation
                                  (warp-resource-pool-pending-operations pool)
-                                 :key #'warp-scaling-operation-id)))
+                                 :key #'warp-scaling-operation-id))
+                ;; Record the cost change of the successful deallocation.
+                (when-let* ((cost-fn (warp-resource-spec-cost-fn spec))
+                            (tracker (gethash pool-name (warp-allocator-budget-tracker manager))))
+                  (let ((cost-change (funcall cost-fn deallocation-count :scale-down)))
+                    (cl-incf (plist-get tracker :current-spend) cost-change)
+                    (puthash pool-name tracker (warp-allocator-budget-tracker manager)))))
+
               (when-let (es (warp-allocator-event-system manager))
                 (warp:emit-event-with-options
                  es :resource-scale-down-completed
@@ -905,7 +971,7 @@ Side Effects:
 ;;----------------------------------------------------------------------
 
 ;;;###autoload
-(cl-defun warp:allocator-create (&rest options)
+(defun warp:allocator-create (&rest options)
   "Creates a new resource allocator manager instance.
 
 Arguments:
@@ -933,6 +999,7 @@ Side Effects:
      :name allocator-name
      :config config
      :event-system event-system
+     :budget-tracker (make-hash-table :test 'equal)
      :poll-instance (loom:poll :name (format "%s-eval-poller"
                                              allocator-name))
      :health-check-poll (loom:poll :name (format "%s-health-poller"
@@ -1028,7 +1095,7 @@ Side Effects:
 - Stops the allocator's periodic evaluation and health check loops.
 - If `cleanup-resources-p` is `t`, attempts to deallocate all resources
   and unregisters their associated circuit breaker instances.
-- Clears all registered pools from the manager.
+- Clears all registered pools and budget tracking data from the manager.
 - Emits `:allocator-shutdown` event."
   (braid! (warp:allocator-stop manager)
     (:then (_)
@@ -1056,7 +1123,8 @@ Side Effects:
           ;; Wait for all individual cleanup promises to complete.
           (braid! (apply #'braid:all cleanup-promises))))
       (loom:with-mutex! (warp-allocator-lock manager)
-        (clrhash (warp-allocator-pools manager))) ; Clear pools after cleanup
+        (clrhash (warp-allocator-pools manager))
+        (clrhash (warp-allocator-budget-tracker manager)))
       (when-let (es (warp-allocator-event-system manager))
         (warp:emit-event-with-options
          es :allocator-shutdown
@@ -1071,7 +1139,8 @@ Side Effects:
 ;;;###autoload
 (defun warp:allocator-register-pool (manager pool-name spec)
   "Registers a new resource pool with the allocator manager.
-This also initializes an associated circuit breaker for the pool.
+This also initializes an associated circuit breaker and budget tracker
+for the pool.
 
 Arguments:
 - `manager` (warp-allocator): The allocator manager instance.
@@ -1088,18 +1157,17 @@ Signals:
 
 Side Effects:
 - Adds the pool to the manager's internal `pools` hash table.
-- Creates or retrieves a `warp-circuit-breaker` instance for the pool
-  via `warp:circuit-breaker-get`.
-- Emits a `:resource-pool-registered` event if an event system is
-  configured."
+- Creates or retrieves a `warp-circuit-breaker` instance for the pool.
+- Initializes the pool's budget tracking data if a budget is defined.
+- Emits a `:resource-pool-registered` event."
   (warp-allocator--validate-pool-spec spec)
 
   (loom:with-mutex! (warp-allocator-lock manager)
     ;; Ensure the pool name is unique within this allocator instance.
     (when (gethash pool-name (warp-allocator-pools manager))
-      (signal 'warp-allocator-error
-              (list (format "Pool '%s' already exists in allocator '%s'"
-                            pool-name (warp-allocator-name manager)))))
+      (warp:error! :type 'warp-allocator-error
+                   :message (format "Pool '%s' already exists in allocator '%s'"
+                                    pool-name (warp-allocator-name manager))))
     (let* ((cb-service-id (format "allocator-%s-pool-%s"
                                   (warp-allocator-name manager) pool-name))
            (cb-config-options `(:failure-threshold
@@ -1108,9 +1176,6 @@ Side Effects:
                                 :recovery-timeout
                                 ,(allocator-config-circuit-breaker-recovery-timeout
                                   (warp-allocator-config manager))))
-           ;; Ensure the circuit breaker is registered with the central
-           ;; `warp-circuit-breaker` module, passing the allocator's event
-           ;; system so CB events can be observed.
            (_cb (warp:circuit-breaker-get
                  cb-service-id
                  :config-options cb-config-options
@@ -1118,8 +1183,16 @@ Side Effects:
            (pool (make-warp-resource-pool
                   :spec spec
                   :circuit-breaker-service-id cb-service-id
-                  :last-health-check (float-time)))) ; Initialize last health check
+                  :last-health-check (float-time))))
       (puthash pool-name pool (warp-allocator-pools manager))
+      ;; Initialize the budget tracker for this pool if needed.
+      (when (and (warp-resource-spec-cost-fn spec)
+                 (warp-resource-spec-budget-constraint spec))
+        (puthash pool-name
+                 `(:current-spend 0.0
+                   :period-start ,(float-time))
+                 (warp-allocator-budget-tracker manager)))
+
       (when-let (es (warp-allocator-event-system manager))
         (warp:emit-event-with-options
          es :resource-pool-registered
@@ -1206,9 +1279,9 @@ Signals:
                 :last-scale-time (warp-resource-pool-last-scale-time pool)
                 :circuit-breaker-state (plist-get cb-status :state)
                 :metrics (warp-resource-pool-metrics pool)))
-      (signal 'warp-resource-pool-not-found
-              (list (format "Pool '%s' not found in allocator '%s'"
-                            pool-name (warp-allocator-name manager)))))))
+      (warp:error! :type 'warp-resource-pool-not-found
+                   :message (format "Pool '%s' not found in allocator '%s'"
+                                    pool-name (warp-allocator-name manager))))))
 
 (provide 'warp-allocator)
 ;;; warp-allocator.el ends here
