@@ -1,5 +1,4 @@
-;;; warp-service.el --- Distributed Service Registry and Discovery -*-
-;;; lexical-binding: t; -*-
+;;; warp-service.el --- Distributed Service Registry and Discovery -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
