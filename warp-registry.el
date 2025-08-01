@@ -1,5 +1,4 @@
-;;; warp-registry.el --- Generic Thread-Safe, Event-Emitting Registry
-;;; -*- lexical-binding: t; -*-
+;;; warp-registry.el --- Generic Thread-Safe, Event-Emitting Registry -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;

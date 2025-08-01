@@ -3,34 +3,26 @@
 ;;; Commentary:
 ;;
 ;; This module provides a robust, thread-safe implementation of the
-;; Circuit Breaker pattern, a fundamental resilience mechanism in
-;; distributed systems. It prevents cascading failures by monitoring
+;; Circuit Breaker pattern. It prevents cascading failures by monitoring
 ;; service health and temporarily "tripping" (opening the circuit) when
 ;; failures exceed a predefined threshold.
+;;
+;; This version has been refactored to use `warp-registry` for managing
+;; its collections of circuit breaker instances and policies, simplifying
+;; its internal state management and leveraging standardized, event-driven
+;; behavior.
 ;;
 ;; ## Core Concepts:
 ;;
 ;; - **States:** A circuit breaker operates in three distinct states,
 ;;   now managed by a `warp-state-machine` for robust transitions:
 ;;   - **:closed:** The normal operating state. Requests pass through.
-;;     Failures are counted, and exceeding a threshold transitions to
-;;     `:open`.
-;;   - **:open:** Requests are immediately rejected. After a `timeout`
-;;     (with jitter), the circuit transitions to `:half-open`.
-;;   - **:half-open:** A limited number of semaphore-gated test requests
-;;     are allowed. Successes transition back to `:closed`; a failure
-;;     immediately transitions back to `:open`.
+;;   - **:open:** Requests are immediately rejected.
+;;   - **:half-open:** A limited number of test requests are allowed.
 ;;
-;; - **Centralized Management:** This module acts as a global registry
-;;   for all circuit breaker instances. It supports:
-;;   - **Policy-based configuration:** Define reusable policies for
-;;     different types of services.
-;;   - **Instance management:** Get, create, reset, or force-open
-;;     individual circuit breakers.
-;;   - **Aggregated Metrics:** Retrieve overall health statistics across
-;;   all managed circuit breakers.
-;;   - **Event Emission:** Integrate with `warp-event-system` to
-;;     broadcast lifecycle and metrics updates.
+;; - **Centralized Management:** This module acts as a global facade. It uses
+;;   dedicated `warp-registry` instances for storing all circuit breaker
+;;   instances and reusable policies.
 
 ;;; Code:
 
@@ -43,6 +35,7 @@
 (require 'warp-state-machine)
 (require 'warp-event)
 (require 'warp-config)
+(require 'warp-registry)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -135,7 +128,8 @@ Fields:
 - `total-requests` (integer): Lifetime cumulative count of all requests.
 - `total-failures` (integer): Lifetime cumulative count of all failures.
 - `policy-name` (string or nil): Name of the policy used, if any.
-- `event-system` (warp-event-system or nil): The event system instance to emit events to."
+- `event-system` (warp-event-system or nil): The event system instance
+  to emit events to."
   (service-id (cl-assert nil) :type string)
   (config (cl-assert nil) :type circuit-breaker-config)
   (lock (loom:lock "warp-circuit-breaker") :type loom-lock)
@@ -147,22 +141,30 @@ Fields:
   (total-requests 0 :type integer)
   (total-failures 0 :type integer)
   (policy-name nil :type (or null string))
-  (event-system nil :type (or null warp-event-system))) 
+  (event-system nil :type (or null warp-event-system)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Global State
+;;; Module Registries
 
-(defvar warp-circuit-breaker--registry (make-hash-table :test 'equal)
-  "A global registry mapping a `service-id` string to its
-`warp-circuit-breaker` instance.")
+(defvar-local warp-circuit-breaker--policy-registry nil
+  "A `warp-registry` instance to manage circuit breaker policies.")
 
-(defvar warp-circuit-breaker--policies (make-hash-table :test 'equal)
-  "A global registry mapping policy names to
-`warp-circuit-breaker-policy-config` instances.")
+(defvar-local warp-circuit-breaker--instance-registry nil
+  "A `warp-registry` instance to manage circuit breaker instances.")
 
-(defvar warp-circuit-breaker--registry-lock (loom:lock "cb-registry-lock")
-  "A mutex that provides thread-safe access to the global registry
-of circuit breakers and policies.")
+(defun warp-circuit-breaker--get-policy-registry ()
+  "Lazily initialize and return the policy registry."
+  (or warp-circuit-breaker--policy-registry
+      (setq warp-circuit-breaker--policy-registry
+            (warp:registry-create :name "circuit-breaker-policies"
+                                  :event-system (warp:event-system-default)))))
+
+(defun warp-circuit-breaker--get-instance-registry ()
+  "Lazily initialize and return the instance registry."
+  (or warp-circuit-breaker--instance-registry
+      (setq warp-circuit-breaker--instance-registry
+            (warp:registry-create :name "circuit-breaker-instances"
+                                  :event-system (warp:event-system-default)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Private Functions
@@ -213,7 +215,7 @@ Returns: (loom-promise): A promise that resolves to `t`."
          (config (warp-circuit-breaker-config breaker))
          (on-state-change-fn
           (warp-circuit-breaker-config-on-state-change config))
-         (event-system (warp-circuit-breaker-event-system breaker))) 
+         (event-system (warp-circuit-breaker-event-system breaker)))
 
     (warp:log! :info (warp--circuit-breaker-log-target service-id)
                "State changed: %S -> %S" old-state new-state)
@@ -234,9 +236,10 @@ Returns: (loom-promise): A promise that resolves to `t`."
 ;;; Public API
 
 ;;;###autoload
-(cl-defun warp:circuit-breaker-register-policy (policy-name config-options
-                                                          &key description)
-  "Register a circuit breaker policy template globally.
+(cl-defun warp:circuit-breaker-register-policy (policy-name 
+                                                config-options
+                                                &key description)
+  "Register a circuit breaker policy template using the registry module.
 This allows for reusable configurations when creating new circuit
 breaker instances.
 
@@ -250,39 +253,38 @@ Arguments:
 Returns: (warp-circuit-breaker-policy-config): The registered policy.
 
 Side Effects:
-- Adds the policy to the global `warp-circuit-breaker--policies`
-  registry.
-- Acquires `warp-circuit-breaker--registry-lock` for thread safety."
-  (loom:with-mutex! warp-circuit-breaker--registry-lock
-    (let ((policy-config (apply #'make-circuit-breaker-config
-                                config-options)))
-      (let ((policy (make-warp-circuit-breaker-policy-config
-                     :name policy-name
-                     :config policy-config
-                     :description description)))
-        (puthash policy-name policy warp-circuit-breaker--policies)
-        policy))))
+- Adds the policy to the policy registry, overwriting any existing
+  policy with the same name.
+- Emits an `:item-added` or `:item-updated` event from the registry."
+  (let* ((registry (warp-circuit-breaker--get-policy-registry))
+         (policy-config (apply #'make-circuit-breaker-config config-options))
+         (policy (make-warp-circuit-breaker-policy-config
+                  :name policy-name
+                  :config policy-config
+                  :description description)))
+    (warp:registry-add registry policy-name policy :overwrite-p t)
+    policy))
 
 ;;;###autoload
 (defun warp:circuit-breaker-unregister-policy (policy-name)
-  "Unregister a circuit breaker policy template globally.
+  "Unregister a circuit breaker policy template from the registry.
 
 Arguments:
 - `POLICY-NAME` (string): The name of the policy to unregister.
 
 Returns:
-- `t` if the policy was found and removed, `nil` otherwise.
+- The policy that was removed, or `nil` if not found.
 
 Side Effects:
-- Removes the policy from the global `warp-circuit-breaker--policies`
-  registry.
-- Acquires `warp-circuit-breaker--registry-lock` for thread safety."
-  (loom:with-mutex! warp-circuit-breaker--registry-lock
-    (remhash policy-name warp-circuit-breaker--policies)))
+- Removes the policy from the global policy registry.
+- Emits an `:item-removed` event from the registry."
+  (let ((registry (warp-circuit-breaker--get-policy-registry)))
+    (warp:registry-remove registry policy-name)))
 
 ;;;###autoload
-(cl-defun warp:circuit-breaker-get
-    (service-id &key policy-name config-options event-system) 
+(cl-defun warp:circuit-breaker-get (service-id &key policy-name 
+                                                    config-options 
+                                                    event-system)
   "Retrieve an existing, or create a new, circuit breaker instance.
 This function acts as a thread-safe factory and registry, ensuring that
 only one circuit breaker instance exists for any given service identifier.
@@ -309,66 +311,62 @@ Signals:
 
 Side Effects:
 - May create and register a new `warp-circuit-breaker` instance in
-  `warp-circuit-breaker--registry`.
-- May emit a `:circuit-breaker-created` event if
-  `event-system` is configured."
-  (or (gethash service-id warp-circuit-breaker--registry)
-      (loom:with-mutex! warp-circuit-breaker--registry-lock
-        (or (gethash service-id warp-circuit-breaker--registry)
-            (let* ((base-config (if policy-name
-                                    (let ((policy (gethash policy-name
-                                                           warp-circuit-breaker--policies)))
-                                      (unless policy
-                                        (signal (warp:error!
-                                                 :type 'warp-circuit-breaker-policy-not-found-error
-                                                 :message (format "Policy '%s' not found."
-                                                                  policy-name))))
-                                      (warp-circuit-breaker-policy-config-config
-                                       policy))
-                                  (make-circuit-breaker-config))) 
-                   (final-config (apply #'make-circuit-breaker-config
-                                        (append config-options
-                                                (circuit-breaker-config-to-plist
-                                                 base-config))))
-                   (sem-name (format "cb-half-open-%s" service-id))
-                   (breaker
-                    (%%make-circuit-breaker
-                     :service-id service-id
-                     :config final-config
-                     :half-open-semaphore
-                     (loom:semaphore
-                      (warp-circuit-breaker-config-half-open-max-calls
-                       final-config)
-                      sem-name)
-                     :policy-name policy-name
-                     :event-system event-system))) 
-              ;; The internal state machine governs the breaker's lifecycle.
-              (setf (warp-circuit-breaker-state-machine breaker)
-                    (warp:state-machine-create
-                     :name (warp--circuit-breaker-log-target service-id)
-                     :initial-state :closed
-                     :context (list :breaker breaker)
-                     :on-transition (lambda (ctx old-s new-s event-data)
-                                      (warp--circuit-breaker-state-machine-on-state-change-hook
-                                       ctx old-s new-s event-data))
-                     :states-list
-                     `(;; `:closed` is the healthy state.
-                       (:closed ((:open . :open))) ; Explicit transition to :open
-                       ;; `:open` rejects all requests.
-                       (:open ((:half-open . :half-open))) ; Explicit transition
-                       ;; `:half-open` allows limited test requests.
-                       (:half-open ((:closed . :closed) ; On success
-                                    (:open . :open)))))) ; On failure
-              (puthash service-id breaker warp-circuit-breaker--registry)
-              (when (warp-circuit-breaker-event-system breaker) 
-                (warp:emit-event-with-options
-                 (warp-circuit-breaker-event-system breaker)
-                 :circuit-breaker-created
-                 `(:resource-id ,service-id :policy ,policy-name
-                   :config ,(circuit-breaker-config-to-plist final-config))
-                 :source-id (warp--circuit-breaker-log-target service-id)
-                 :distribution-scope :local))
-              breaker)))))
+  the instance registry.
+- Emits an `:item-added` event from the registry upon creation."
+  (let ((registry (warp-circuit-breaker--get-instance-registry)))
+    (or (warp:registry-get registry service-id)
+        (let* ((policy-reg (warp-circuit-breaker--get-policy-registry))
+               (base-config
+                (if policy-name
+                    (let ((policy (warp:registry-get policy-reg policy-name)))
+                      (unless policy
+                        (warp:error!
+                         :type 'warp-circuit-breaker-policy-not-found-error
+                         :message (format "Policy '%s' not found."
+                                          policy-name)))
+                      (warp-circuit-breaker-policy-config-config policy))
+                  (make-circuit-breaker-config)))
+               (final-config
+                (apply #'make-circuit-breaker-config
+                       (append config-options
+                               (circuit-breaker-config-to-plist
+                                base-config))))
+               (sem-name (format "cb-half-open-%s" service-id))
+               (new-breaker
+                (%%make-circuit-breaker
+                 :service-id service-id
+                 :config final-config
+                 :half-open-semaphore
+                 (loom:semaphore
+                  (warp-circuit-breaker-config-half-open-max-calls
+                   final-config)
+                  sem-name)
+                 :policy-name policy-name
+                 :event-system event-system)))
+          ;; The internal state machine governs the breaker's lifecycle.
+          (setf (warp-circuit-breaker-state-machine new-breaker)
+                (warp:state-machine-create
+                 :name (warp--circuit-breaker-log-target service-id)
+                 :initial-state :closed
+                 :context (list :breaker new-breaker)
+                 :on-transition
+                 #'warp--circuit-breaker-state-machine-on-state-change-hook
+                 :states-list
+                 `((:closed ((:open . :open)))
+                   (:open ((:half-open . :half-open)))
+                   (:half-open ((:closed . :closed)
+                                (:open . :open))))))
+          ;; Attempt to add the new breaker. Handle race condition where
+          ;; another thread might have just added it.
+          (condition-case err
+              (progn
+                (warp:registry-add registry service-id new-breaker)
+                new-breaker)
+            (warp-registry-key-exists
+             (warp:log! :debug
+                        (warp--circuit-breaker-log-target service-id)
+                        "Race condition on create; retrieving existing.")
+             (warp:registry-get registry service-id)))))))
 
 ;;;###autoload
 (defun warp:circuit-breaker-unregister (service-id)
@@ -380,14 +378,13 @@ Arguments:
 - `SERVICE-ID` (string): The unique ID of the circuit breaker to remove.
 
 Returns:
-- `t` if the circuit breaker was found and removed, `nil` otherwise.
+- The `warp-circuit-breaker` instance that was removed, or `nil`.
 
 Side Effects:
-- Removes the circuit breaker from the global
-  `warp-circuit-breaker--registry`.
-- Acquires `warp-circuit-breaker--registry-lock` for thread safety."
-  (loom:with-mutex! warp-circuit-breaker--registry-lock
-    (remhash service-id warp-circuit-breaker--registry)))
+- Removes the circuit breaker from the instance registry.
+- Emits an `:item-removed` event from the registry."
+  (let ((registry (warp-circuit-breaker--get-instance-registry)))
+    (warp:registry-remove registry service-id)))
 
 ;;----------------------------------------------------------------------
 ;;; Breaker Operations
@@ -428,10 +425,6 @@ Side Effects:
              (warp:log! :debug (warp--circuit-breaker-log-target
                                 (warp-circuit-breaker-service-id breaker))
                         "Open timeout expired, transitioning to half-open.")
-             ;; Note: warp:state-machine-emit returns a promise, but since
-             ;; we're in a mutex, we can't await it. The transition will
-             ;; happen asynchronously. The state machine's internal lock
-             ;; ensures correctness.
              (warp:state-machine-emit sm :half-open)))
          ;; Re-check state after potential transition to see if half-open
          ;; and acquire semaphore.
@@ -484,7 +477,6 @@ Side Effects:
 ;;;###autoload
 (defun warp:circuit-breaker-record-failure (breaker &optional error-obj)
   "Record a failed operation for the circuit breaker.
-This function should be called after a protected operation fails.
 If a `failure-predicate` is defined in the breaker's config, it is
 used to determine if the `ERROR-OBJ` should count as a failure.
 
@@ -504,8 +496,8 @@ Side Effects:
     (let* ((sm (warp-circuit-breaker-state-machine breaker))
            (current-state (warp:state-machine-current-state sm))
            (config (warp-circuit-breaker-config breaker))
-           (failure-predicate (warp-circuit-breaker-config-failure-predicate
-                               config))
+           (failure-predicate
+            (warp-circuit-breaker-config-failure-predicate config))
            (should-count-as-failure (if failure-predicate
                                         (funcall failure-predicate error-obj)
                                       t))) ; Default: all errors count
@@ -529,43 +521,6 @@ Side Effects:
         (loom:resolved! t)))))
 
 ;;;###autoload
-(defun warp:circuit-breaker-execute-sync (service-id protected-fn &rest args)
-  "Execute a synchronous `PROTECTED-FN` guarded by a circuit breaker.
-The circuit breaker for `SERVICE-ID` is retrieved (or created) and its
-state is checked before executing `PROTECTED-FN`. Failures and successes
-are recorded automatically.
-
-Arguments:
-- `SERVICE-ID` (string): The identifier for the service being called.
-- `PROTECTED-FN` (function): A function to execute.
-- `ARGS` (rest): Arguments to pass to `PROTECTED-FN`.
-
-Returns:
-- The result of `PROTECTED-FN` if the operation is successful.
-
-Signals:
-- `warp-circuit-breaker-open-error`: If the circuit is open and prevents
-  execution.
-- Any error signaled by `PROTECTED-FN` is re-signaled.
-
-Side Effects:
-- Calls success/failure recording functions on the circuit breaker.
-- May create a new circuit breaker instance if one doesn't exist for
-  `SERVICE-ID`."
-  (let ((breaker (warp:circuit-breaker-get service-id))) 
-    (if (warp:circuit-breaker-can-execute-p breaker)
-        (condition-case err
-            (let ((result (apply protected-fn args)))
-              (warp:circuit-breaker-record-success breaker)
-              result)
-          (error
-           (warp:circuit-breaker-record-failure breaker err)
-           (signal (loom-error-type err) (loom-error-data err))))
-      (signal (warp:error! :type 'warp-circuit-breaker-open-error
-                           :message (format "Circuit breaker '%s' is open"
-                                            service-id))))))
-
-;;;###autoload
 (defun warp:circuit-breaker-execute (service-id protected-async-fn &rest args)
   "Execute an asynchronous `PROTECTED-ASYNC-FN` guarded by a circuit breaker.
 This is the preferred high-level API for promise-based operations.
@@ -579,17 +534,8 @@ Arguments:
 Returns:
 - (loom-promise): A promise that resolves with the result of the
   async operation, or rejects if the circuit is open or if the
-  operation itself fails.
-
-Signals:
-- `warp-circuit-breaker-open-error`: If the circuit is open and prevents
-  execution (wrapped in a rejected promise).
-
-Side Effects:
-- Calls success/failure recording functions on the circuit breaker.
-- May create a new circuit breaker instance if one doesn't exist for
-  `SERVICE-ID`."
-  (let ((breaker (warp:circuit-breaker-get service-id))) 
+  operation itself fails."
+  (let ((breaker (warp:circuit-breaker-get service-id)))
     (if (warp:circuit-breaker-can-execute-p breaker)
         (braid! (apply protected-async-fn args)
           (:then (lambda (result)
@@ -598,33 +544,14 @@ Side Effects:
           (:catch (lambda (err)
                     (warp:circuit-breaker-record-failure breaker err)
                     (loom:rejected! err))))
-      (loom:rejected! (warp:error! :type 'warp-circuit-breaker-open-error
-                                   :message (format "Circuit breaker '%s' is open"
-                                                    service-id))))))
+      (loom:rejected!
+       (warp:error! :type 'warp-circuit-breaker-open-error
+                    :message (format "Circuit breaker '%s' is open"
+                                     service-id))))))
 
 ;;----------------------------------------------------------------------
 ;;; Status & Control
 ;;----------------------------------------------------------------------
-
-;;;###autoload
-(defun warp:circuit-breaker-get-metrics (service-id)
-  "Retrieve basic metrics for a single circuit breaker instance.
-
-Arguments:
-- `SERVICE-ID` (string): The unique identifier of the circuit breaker.
-
-Returns:
-- (plist): A property list containing basic metrics:
-  `:total-calls`, `:total-failures`, `:total-successes`, `:state`.
-  Returns `nil` if no breaker is found for `SERVICE-ID`."
-  (when-let ((breaker (gethash service-id warp-circuit-breaker--registry)))
-    (loom:with-mutex! (warp-circuit-breaker-lock breaker)
-      `(:total-calls ,(warp-circuit-breaker-total-requests breaker)
-        :total-failures ,(warp-circuit-breaker-total-failures breaker)
-        :total-successes (- (warp-circuit-breaker-total-requests breaker)
-                            (warp-circuit-breaker-total-failures breaker))
-        :state ,(warp:state-machine-current-state
-                 (warp-circuit-breaker-state-machine breaker))))))
 
 ;;;###autoload
 (defun warp:circuit-breaker-status (service-id)
@@ -636,22 +563,23 @@ Arguments:
 Returns:
 - (plist): A property list containing the breaker's current state and
   statistics, or `nil` if no breaker is found for `SERVICE-ID`."
-  (when-let ((breaker (gethash service-id warp-circuit-breaker--registry)))
-    (loom:with-mutex! (warp-circuit-breaker-lock breaker)
-      `(:service-id ,(warp-circuit-breaker-service-id breaker)
-        :state ,(warp:state-machine-current-state
-                 (warp-circuit-breaker-state-machine breaker))
-        :failure-count ,(warp-circuit-breaker-failure-count breaker)
-        :failure-threshold
-        ,(warp-circuit-breaker-config-failure-threshold
-          (warp-circuit-breaker-config breaker))
-        :success-count ,(warp-circuit-breaker-success-count breaker)
-        :success-threshold
-        ,(warp-circuit-breaker-config-success-threshold
-          (warp-circuit-breaker-config breaker))
-        :total-requests ,(warp-circuit-breaker-total-requests breaker)
-        :total-failures ,(warp-circuit-breaker-total-failures breaker)
-        :policy-name ,(warp-circuit-breaker-policy-name breaker)))))
+  (let ((registry (warp-circuit-breaker--get-instance-registry)))
+    (when-let ((breaker (warp:registry-get registry service-id)))
+      (loom:with-mutex! (warp-circuit-breaker-lock breaker)
+        `(:service-id ,(warp-circuit-breaker-service-id breaker)
+          :state ,(warp:state-machine-current-state
+                   (warp-circuit-breaker-state-machine breaker))
+          :failure-count ,(warp-circuit-breaker-failure-count breaker)
+          :failure-threshold
+          ,(warp-circuit-breaker-config-failure-threshold
+            (warp-circuit-breaker-config breaker))
+          :success-count ,(warp-circuit-breaker-success-count breaker)
+          :success-threshold
+          ,(warp-circuit-breaker-config-success-threshold
+            (warp-circuit-breaker-config breaker))
+          :total-requests ,(warp-circuit-breaker-total-requests breaker)
+          :total-failures ,(warp-circuit-breaker-total-failures breaker)
+          :policy-name ,(warp-circuit-breaker-policy-name breaker))))))
 
 ;;;###autoload
 (defun warp:circuit-breaker-reset (service-id)
@@ -663,18 +591,13 @@ Arguments:
 - `SERVICE-ID` (string): The identifier of the circuit breaker to reset.
 
 Returns: (loom-promise): A promise that resolves to `t` if the breaker
-  was found and reset, or rejects if not found or state transition fails.
-
-Side Effects:
-- Transitions the specified circuit breaker's state to `:closed`."
-  (when-let ((breaker (gethash service-id warp-circuit-breaker--registry)))
-    (loom:with-mutex! (warp-circuit-breaker-lock breaker)
-      ;; Await is needed here because warp:state-machine-emit returns a promise,
-      ;; and this function itself needs to return a promise that resolves *after*
-      ;; the state transition is initiated.
-      (loom:await (warp:state-machine-emit
-                   (warp-circuit-breaker-state-machine breaker) :closed)))
-    t))
+  was found and reset, or rejects if not found."
+  (let ((registry (warp-circuit-breaker--get-instance-registry)))
+    (when-let ((breaker (warp:registry-get registry service-id)))
+      (loom:with-mutex! (warp-circuit-breaker-lock breaker)
+        (loom:await (warp:state-machine-emit
+                     (warp-circuit-breaker-state-machine breaker) :closed)))
+      t)))
 
 ;;;###autoload
 (defun warp:circuit-breaker-force-open (service-id)
@@ -686,18 +609,18 @@ Arguments:
 - `SERVICE-ID` (string): The identifier of the circuit breaker to open.
 
 Returns: (loom-promise): A promise that resolves to `t` if the breaker
-  was found and opened, or rejects if not found or state transition fails.
+  was found and opened, or rejects if not found.
 
 Side Effects:
 - Transitions the specified circuit breaker's state to `:open`.
 - Updates `last-failure-time` to the current time."
-  (when-let ((breaker (gethash service-id warp-circuit-breaker--registry)))
-    (loom:with-mutex! (warp-circuit-breaker-lock breaker)
-      (setf (warp-circuit-breaker-last-failure-time breaker) (float-time))
-      ;; Await is needed here for the same reason as warp:circuit-breaker-reset.
-      (loom:await (warp:state-machine-emit
-                   (warp-circuit-breaker-state-machine breaker) :open)))
-    t))
+  (let ((registry (warp-circuit-breaker--get-instance-registry)))
+    (when-let ((breaker (warp:registry-get registry service-id)))
+      (loom:with-mutex! (warp-circuit-breaker-lock breaker)
+        (setf (warp-circuit-breaker-last-failure-time breaker) (float-time))
+        (loom:await (warp:state-machine-emit
+                     (warp-circuit-breaker-state-machine breaker) :open)))
+      t)))
 
 ;;;###autoload
 (defun warp:circuit-breaker-list-all ()
@@ -706,8 +629,7 @@ Side Effects:
 Returns:
 - (list): A list of strings, where each string is a registered
   `service-id`."
-  (loom:with-mutex! warp-circuit-breaker--registry-lock
-    (hash-table-keys warp-circuit-breaker--registry)))
+  (warp:registry-list-keys (warp-circuit-breaker--get-instance-registry)))
 
 ;;;###autoload
 (defun warp:circuit-breaker-get-all-stats ()
@@ -715,61 +637,12 @@ Returns:
 circuit breakers.
 
 Returns:
-- (hash-table): A hash table mapping service IDs to their status plists.
-  Returns an empty hash table if no breakers are registered."
-  (let ((stats (make-hash-table :test 'equal)))
-    (dolist (id (warp:circuit-breaker-list-all))
+- (hash-table): A hash table mapping service IDs to their status plists."
+  (let ((stats (make-hash-table :test 'equal))
+        (registry (warp-circuit-breaker--get-instance-registry)))
+    (dolist (id (warp:registry-list-keys registry))
       (puthash id (warp:circuit-breaker-status id) stats))
     stats))
-
-;;;###autoload
-(defun warp:circuit-breaker-get-all-aggregated-metrics ()
-  "Get aggregated metrics across all circuit breakers in the global
-registry. This provides an overall health summary.
-
-Returns:
-- (plist): A property list containing aggregated metrics:
-  `:total-calls`, `:total-failures`, `:total-successes`,
-  `:failure-rate`, `:open-breakers`, `:half-open-breakers`,
-  `:closed-breakers`."
-  (loom:with-mutex! warp-circuit-breaker--registry-lock
-    (let ((total-calls 0)
-          (total-failures 0)
-          (total-successes 0)
-          (open-count 0)
-          (half-open-count 0)
-          (closed-count 0))
-      (maphash (lambda (_id cb)
-                 (let* ((metrics (warp:circuit-breaker-get-metrics
-                                  (warp-circuit-breaker-service-id cb)))
-                        (state (plist-get metrics :state)))
-                   (cl-incf total-calls (plist-get metrics :total-calls))
-                   (cl-incf total-failures (plist-get metrics :total-failures))
-                   (cl-incf total-successes (plist-get metrics :total-successes))
-                   (pcase state
-                     (:open (cl-incf open-count))
-                     (:half-open (cl-incf half-open-count))
-                     (:closed (cl-incf closed-count)))))
-               warp-circuit-breaker--registry)
-      `(:total-calls ,total-calls
-        :total-failures ,total-failures
-        :total-successes ,total-successes
-        :failure-rate ,(if (> total-calls 0)
-                           (/ (* total-failures 100.0) total-calls)
-                         0.0)
-        :open-breakers ,open-count
-        :half-open-breakers ,half-open-count
-        :closed-breakers ,closed-count))))
-
-;;----------------------------------------------------------------------
-;;; Shutdown Hook
-;;----------------------------------------------------------------------
-
-(add-hook 'kill-emacs-hook
-          (lambda ()
-            (loom:with-mutex! warp-circuit-breaker--registry-lock
-              (clrhash warp-circuit-breaker--registry)
-              (clrhash warp-circuit-breaker--policies))))
 
 (provide 'warp-circuit-breaker)
 ;;; warp-circuit-breaker.el ends here
