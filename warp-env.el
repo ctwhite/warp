@@ -1,7 +1,6 @@
 ;;; warp-env.el --- Consistent Environment Variable Management for Warp -*- lexical-binding: t; -*-
 
 ;;; Commentary:
-;;
 ;; This module provides a centralized and type-safe way to define,
 ;; manage, and access environment variables used throughout the Warp
 ;; distributed computing framework. Instead of scattering raw string
@@ -44,7 +43,9 @@
   - `launch-id` (string): The key for a unique ID for a launch attempt.
   - `launch-token` (string): The key for a cryptographic auth token.
   - `worker-transport-options` (string): The key for serialized transport
-    options for the worker's connection back to the master."
+    options for the worker's connection back to the master.
+  - `coordinator-peers` (string): The key for the list of coordinator
+    peer addresses, enabling leader discovery."
   (ipc-id "WARP_IPC_ID" :type string :read-only t)
   (worker-id "WARP_WORKER_ID" :type string :read-only t)
   (worker-rank "WARP_WORKER_RANK" :type string :read-only t)
@@ -57,7 +58,8 @@
   (launch-id "WARP_LAUNCH_ID" :type string :read-only t)
   (launch-token "WARP_LAUNCH_TOKEN" :type string :read-only t)
   (worker-transport-options "WARP_WORKER_TRANSPORT_OPTIONS"
-                            :type string :read-only t))
+                            :type string :read-only t)
+  (coordinator-peers "WARP_COORDINATOR_PEERS" :type string :read-only t))
 
 (defvar warp--env-config (%%make-warp-env-config)
   "A singleton instance of `warp-env-config`.")
