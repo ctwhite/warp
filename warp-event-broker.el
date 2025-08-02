@@ -3,465 +3,177 @@
 ;;; Commentary:
 ;;
 ;; This module defines a specialized `warp-worker` type designed to act as
-;; a dedicated **Event Broker** within a Warp cluster. Its sole
-;; responsibility is to manage the reliable propagation of distributed
-;; `warp-event`s (with `:cluster` or `:global` scope) between the
-;; master and other workers.
+;; a dedicated **Event Broker** within a Warp cluster. Its primary
+;; responsibility is to facilitate **distributed event communication** by
+;; acting as a bridge:
 ;;
-;; By centralizing event fan-out through a dedicated broker, this
-;; architecture offers significant benefits:
+;; 1.  It subscribes to a central Redis Pub/Sub channel (e.g.,
+;;     `warp:events:cluster`) where other Warp components publish
+;;     cluster-wide or global events.
+;; 2.  Upon receiving an event from Redis, it deserializes it and
+;;     **re-emits** it onto its own **local, in-memory `warp-event-system`**.
+;;     This allows any components running *within the broker process* to
+;;     react to cluster-wide events in a decoupled manner, without needing
+;;     direct Redis access.
 ;;
-;; - **Scalability**: Offloads the heavy task of event fanning out from
-;;   the master process, allowing the master to focus on orchestration.
-;; - **Decoupling**: Further decouples event emitters from event
-;;   consumers, as all distributed events are sent to and relayed by
-;;   the broker.
-;; - **Resilience**: The broker can implement sophisticated retry and
-;;   delivery guarantees for distributed events, isolating this complexity.
-;; - **Automatic Backpressure**: Leverages an internal `warp-thread-pool`
-;;   (which uses `warp-stream`) to automatically apply backpressure to
-;;   producers if events arrive faster than they can be processed.
-;; - **Network Efficiency**: Maintains persistent connections to other
-;;   workers to reduce the high overhead of connection churn.
+;; By centralizing event fan-in and fan-out through a Redis-backed model,
+;; this architecture offers significant benefits for distributed systems:
+;;
+;; - **Scalability & Decoupling**: Event emitters (e.g., other workers,
+;;   the leader) only need to know how to publish to a well-known Redis
+;;   channel, not where the event broker(s) are located. Similarly, local
+;;   handlers within the broker only subscribe to the local event bus.
+;; - **High Availability (HA)**: While the primary model assumes a single,
+;;   resilient broker instance managed by the cluster, multiple broker
+;;   instances could theoretically subscribe to the same Redis channel
+;;   for enhanced redundancy and failover capabilities (though this
+;;   would require careful handling of duplicate event processing).
+;; - **Durability (Potential)**: While this implementation primarily uses
+;;   Redis Pub/Sub (which is a "fire-and-forget" model), the architecture
+;;   could be extended to use more robust Redis features like **Redis Streams**
+;;   for full event durability, ensuring no events are lost even if brokers
+;;   are temporarily offline. This provides a clear upgrade path for stricter
+;;   reliability requirements.
+;; - **Centralized Event Monitoring**: All distributed events flow through
+;;   the Redis channel, making it a central point for monitoring, logging,
+;;   and debugging cluster-wide event activity.
 
 ;;; Code:
 
 (require 'cl-lib)
-(require 'loom)
-(require 'braid)
+(require 'loom)  ; For asynchronous operations and promises
+(require 'braid) ; For promise-based control flow
 
 (require 'warp-log)
 (require 'warp-error)
-(require 'warp-protocol)
-(require 'warp-rpc)
-(require 'warp-event)
-(require 'warp-worker)
-(require 'warp-service)
-(require 'warp-connection-manager)
-(require 'warp-transport)
-(require 'warp-circuit-breaker)
-(require 'warp-health-orchestrator)
-(require 'warp-metrics-pipeline)
-(require 'warp-thread)
-(require 'warp-config)
-(require 'warp-component)
+(require 'warp-protocol) ; Defines communication protocols (e.g., event formats)
+(require 'warp-rpc)      ; For potential RPC communication if broker needs it
+(require 'warp-event)    ; The core event system for local dispatch
+(require 'warp-worker)   ; Base module for defining Warp worker processes
+(require 'warp-redis)    ; Provides Redis client functionality
+(require 'warp-component) ; For Warp's dependency injection system
+(require 'warp-config)    ; For defining configuration schemas
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Configuration
 
 (warp:defconfig event-broker-config
   "Configuration for the Warp Event Broker worker.
-This defines operational parameters for its internal thread pool, retries,
-and fault tolerance, allowing performance and resilience to be tuned.
+This defines the operational parameters for how the event broker
+connects to and interacts with the Redis backend.
 
 Fields:
-- `max-queue-size` (integer): Max number of events in the internal task
-  queue before applying backpressure.
-- `processing-threads` (integer): Number of threads for fanning out events.
-- `max-retry-attempts` (integer): Max retries for sending an event to a
-  single failing worker.
-- `retry-backoff-ms` (integer): Base backoff time in milliseconds for the
-  first retry. Subsequent retries use exponential backoff.
-- `circuit-breaker-threshold` (integer): Number of consecutive failures to a
-  worker before its circuit breaker trips.
-- `health-check-interval-ms` (integer): Interval in milliseconds for the
-  broker to perform internal health checks."
-  (max-queue-size          10000 :type integer :validate (> $ 0))
-  (processing-threads      4     :type integer :validate (> $ 0))
-  (max-retry-attempts      3     :type integer :validate (>= $ 0))
-  (retry-backoff-ms        100   :type integer :validate (> $ 0))
-  (circuit-breaker-threshold 5   :type integer :validate (>= $ 0))
-  (health-check-interval-ms 30000 :type integer :validate (> $ 0)))
+- `redis-key-prefix` (string): The namespace for Redis keys and channels
+  used by the event broker. This should match the prefix used by other
+  components publishing distributed events (e.g., `warp:events`). It ensures
+  isolation and prevents key collisions in Redis.
+- `redis-options` (plist): A plist of options to configure the connection
+  to the Redis server (e.g., `:host`, `:port`, `:password`, `:db`). These
+  options are passed directly to `warp:redis-service-create`."
+  (redis-key-prefix "warp:events" :type string)
+  (redis-options nil :type (or null plist)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Private Functions
 
-;;----------------------------------------------------------------------------
-;;; Event Broker Specific Component Definitions
-;;----------------------------------------------------------------------------
-
-(defun warp-event-broker--get-component-definitions (broker-config base-worker)
-  "Returns a list of specialized component definitions for an event broker.
-These definitions override or extend the standard worker components to
-implement event brokering logic.
+(defun warp-event-broker--handle-redis-message (broker-event-system channel-name message-payload)
+  "Callback for messages received from the Redis Pub/Sub channel.
+This is the core logic of the event broker. When a message arrives from
+Redis, it's deserialized into a `warp-event` object and then immediately
+re-emitted onto the broker's local, in-memory `warp-event-system`.
+This effectively bridges distributed events into the local process.
 
 Arguments:
-- `broker-config` (event-broker-config): The event broker's configuration.
-- `base-worker` (warp-worker): The worker instance that this broker is.
+- `BROKER-EVENT-SYSTEM` (warp-event-system): The broker's own local
+  `warp-event-system` instance, where the deserialized event will be
+  re-emitted.
+- `CHANNEL-NAME` (string): The Redis channel from which the message
+  was received (e.g., \"warp:events:cluster\").
+- `MESSAGE-PAYLOAD` (string): The raw, serialized `warp-event` object
+  received from Redis (expected to be JSON format).
+
+Returns:
+- This is a callback function for `warp:redis-subscribe` and does not
+  have a meaningful return value. Its purpose is side-effects (re-emitting
+  the event or logging errors).
+
+Side Effects:
+- Deserializes `MESSAGE-PAYLOAD`.
+- Emits a new local event via `warp:emit-event-with-options`.
+- Logs errors if deserialization or re-emission fails.
+- Crucially, sets `distribution-scope` to `:local` to prevent re-publishing
+  to Redis and creating an infinite loop."
+  (warp:log! :trace (warp-event-system-id broker-event-system)
+             "Received distributed event from Redis on channel '%s'."
+             channel-name)
+  (condition-case err
+      (let ((event (warp:deserialize message-payload :protocol :json)))
+        (unless (warp-event-p event)
+          (error "Deserialized payload is not a valid warp-event"))
+        ;; Re-emit the event on the LOCAL bus. This is crucial to prevent
+        ;; an infinite loop where the broker would otherwise try to
+        ;; re-publish it to Redis if its handlers also had a :cluster scope.
+        ;; By setting :distribution-scope to :local, we ensure it stays
+        ;; within the broker's process for local subscribers.
+        (warp:emit-event-with-options
+         broker-event-system
+         (warp-event-type event)
+         (warp-event-data event)
+         :source-id (warp-event-source-id event)
+         :correlation-id (warp-event-correlation-id event)
+         :priority (warp-event-priority event)
+         :metadata (warp-event-metadata event)
+         :distribution-scope :local))
+    (error
+     (warp:log! :error (warp-event-system-id broker-event-system)
+                "Failed to process incoming event from Redis: %S. Payload: %s"
+                err message-payload))))
+
+(defun warp-event-broker--get-component-definitions (broker-config)
+  "Returns a list of specialized component definitions for an event broker.
+These components define the specific services that an event broker
+worker needs to function, primarily its Redis connection and its
+listener for Redis Pub/Sub messages. These are added to the base
+`warp-worker` components.
+
+Arguments:
+- `BROKER-CONFIG` (event-broker-config): The event broker's configuration,
+  used to parameterize the Redis service and channel subscription.
 
 Returns:
 - (list): A list of plists, each defining a specialized component."
-  (list
-   ;; Override connection manager to connect to ALL workers (peers) for event
-   ;; fan-out, not just the master.
-   `(:name :connection-manager
-     :deps (:event-system :rpc-system)
-     :factory (lambda (es rpc-system)
-                (warp:connection-manager
-                 :endpoints nil ;; Dynamically populated
-                 :event-system es
-                 :on-message-fn
-                 (lambda (msg-string conn)
-                   (let ((rpc-msg (warp:marshal-from-string msg-string)))
-                     (pcase (warp-rpc-message-type rpc-msg)
-                       (:request
-                        (let ((router
-                               (warp:component-system-get
-                                (warp-worker-component-system base-worker)
-                                :command-router)))
-                          (warp:rpc-handle-request rpc-system rpc-msg conn)))
-                       (:response
-                        (warp:rpc-handle-response rpc-system rpc-msg)))))))
-     :start (lambda (cm _) (loom:await (warp:connection-manager-connect cm)))
-     :stop (lambda (cm _) (loom:await (warp:connection-manager-shutdown cm))))
+  `((:name :redis-service
+     ;; Provides the connection to the Redis server. This is a core
+     ;; dependency for the event broker's functionality.
+     :factory (lambda () (apply #'warp:redis-service-create
+                                 (event-broker-config-redis-options
+                                  ,broker-config)))
+     :start (lambda (svc _) (loom:await (warp:redis-service-start svc)))
+     :stop (lambda (svc _) (loom:await (warp:redis-service-stop svc))))
 
-   ;; Dedicated thread pool for processing event fan-out.
-   `(:name :event-processing-pool
-     :factory (lambda ()
-                (let ((w-id (warp-worker-worker-id base-worker)))
-                  (warp:thread-pool-create
-                   :name ,(format "%s-event-proc-pool" w-id)
-                   :pool-size (warp-event-broker-config-processing-threads
-                               broker-config)
-                   :max-queue-size (warp-event-broker-config-max-queue-size
-                                    broker-config)
-                   :overflow-policy :block)))
-     :stop (lambda (pool _) (loom:await (warp:thread-pool-shutdown pool))))
-
-   ;; The core event system for the broker.
-   `(:name :event-system
-     :factory (lambda ()
-                (let ((w-id (warp-worker-worker-id base-worker)))
-                  (warp:event-system-create
-                   :id ,(format "%s-events" w-id)
-                   :max-queue-size (warp-event-broker-config-max-queue-size
-                                    broker-config)
-                   :connected-peer-map (make-hash-table :test 'equal)))))
-
-   ;; Specialized RPC Service to handle event propagation.
-   `(:name :rpc-service
-     :deps (:command-router :event-processing-pool :event-system :rpc-system)
-     :priority 10 ; Start early
-     :start (lambda (_rpc-svc system)
-              (let ((router (warp:component-system-get system :command-router))
-                    (pool (warp:component-system-get system :event-processing-pool))
-                    (broker-es (warp:component-system-get system :event-system)))
-                (warp:defrpc-handlers router
-                  (:propagate-event .
-                   (lambda (cmd ctx)
-                     (warp-event-broker--handle-propagate-event
-                      cmd ctx base-worker pool broker-es)))))))
-
-   ;; Dynamically add/remove workers from the connection manager.
-   `(:name :worker-discovery-service
-     :deps (:event-system :connection-manager)
+    (:name :broker-listener-service
+     ;; This component defines the Redis Pub/Sub listener. It subscribes
+     ;; to a wildcard channel pattern to receive all distributed events
+     ;; published to the cluster.
+     :deps (:redis-service :event-system) ; Needs Redis to subscribe, and local ES to re-emit
      :start (lambda (_ system)
-              (let ((es (warp:component-system-get system :event-system))
-                    (cm (warp:component-system-get system :connection-manager))
-                    (b-id (warp:worker-id base-worker)))
-                (warp:subscribe
-                 es :worker-ready-signal-received
-                 (lambda (event)
-                   (braid! (warp-event-broker--handle-worker-registered
-                            base-worker cm event)
-                     (:catch (lambda (err)
-                               (warp:log! :error b-id
-                                "Failed to handle worker registered: %S" err))))))
-                (warp:subscribe
-                 es :worker-deregistered
-                 (lambda (event)
-                   (braid! (warp-event-broker--handle-worker-deregistered
-                            base-worker cm event)
-                     (:catch (lambda (err)
-                               (warp:log! :error b-id
-                                "Failed to handle worker deregistered: %S" err)))))))))
-
-   ;; Standard worker health checks and heartbeat service.
-   `(:name :health-orchestrator
-     :factory (lambda ()
-                (let ((w-id (warp-worker-worker-id base-worker)))
-                  (warp:health-orchestrator-create :name ,(format "%s-health" w-id))))
-     :start (lambda (ho _) (warp:health-orchestrator-start ho))
-     :stop (lambda (ho _) (loom:await (warp:health-orchestrator-stop ho))))
-
-   `(:name :heartbeat-service
-     :deps (:connection-manager :system-monitor :health-orchestrator
-            :event-system :service-registry :key-manager :rpc-system)
-     :priority 60
-     :factory (lambda () (make-hash-table)) ; Holder for the timer
-     :start (lambda (holder system)
-              (let ((interval (warp-worker-config-heartbeat-interval
-                               (warp-worker-config base-worker))))
-                (puthash :timer
-                         (run-at-time t interval
-                          (lambda () (loom:await
-                                      (warp-worker--send-heartbeat
-                                       base-worker system))))
-                         holder)))
-     :stop (lambda (holder _)
-             (when-let (timer (gethash :timer holder)) (cancel-timer timer))))
-
-   ;; Component for initial sync with master to get active workers.
-   `(:name :event-broker-initial-sync-service
-     :deps (:connection-manager :rpc-system :event-system)
-     :priority 70 ; Run after core systems are up
-     :start (lambda (_sync-svc system)
-              (let* ((cm (warp:component-system-get system :connection-manager))
-                     (rpc-sys (warp:component-system-get system :rpc-system))
-                     (broker-id (warp:worker-id base-worker)))
-                (warp:log! :info broker-id "Initiating sync for active workers...")
-                (braid!
-                 (warp:protocol-get-all-active-workers
-                  rpc-sys (warp:connection-manager-get-connection cm)
-                  broker-id "master"
-                  :origin-instance-id (warp-component-system-id system))
-                 (:then
-                  (lambda (response)
-                    (let* ((payload (warp-rpc-command-args response))
-                           (workers (warp-get-all-active-workers-response-payload-active-workers
-                                     payload)))
-                      (warp:log! :info broker-id "Received %d active workers."
-                                 (length workers))
-                      (dolist (info workers)
-                        (let ((w-id (plist-get info :worker-id))
-                              (addr (plist-get info :inbox-address)))
-                          (braid!
-                           (let ((event
-                                  (make-warp-event
-                                   :type :worker-ready-signal-received
-                                   :data `(:worker-id ,w-id
-                                           :inbox-address ,addr))))
-                             (warp-event-broker--handle-worker-registered
-                              base-worker cm event))
-                           (:catch
-                            (lambda (err)
-                              (warp:log! :warn broker-id
-                               "Failed to add worker '%s': %S" w-id err)))))))))
-                 (:catch (lambda (err)
-                           (warp:log! :error broker-id
-                                      "Initial worker sync failed: %S" err)))))))))
-
-;;----------------------------------------------------------------------------
-;;; Event Handling for Broker Functionality
-;;----------------------------------------------------------------------------
-
-(defun warp-event-broker--handle-propagate-event
-    (command context broker-worker event-proc-pool broker-event-system)
-  "Handles `:propagate-event` RPCs by submitting event to a thread pool.
-This provides backpressure and concurrency for event fan-out.
-
-Arguments:
-- `command` (warp-rpc-command): The incoming RPC command.
-- `context` (plist): The RPC context from the command router.
-- `broker-worker` (warp-worker): The event broker worker instance.
-- `event-proc-pool` (warp-thread-pool): The broker's thread pool.
-- `broker-event-system` (warp-event-system): The broker's event system.
-
-Returns:
-- (loom-promise): A promise that resolves when the event is submitted."
-  (let* ((event (warp-propagate-event-payload-event
-                 (warp-rpc-command-args command)))
-         (broker-id (warp:worker-id broker-worker)))
-    (warp:log! :debug broker-id "Queuing event '%S' (ID: %s) for propagation."
-               (warp-event-type event) (warp-event-id event))
-    ;; Submit the fan-out task to the dedicated thread pool.
-    (warp:thread-pool-submit
-     event-proc-pool
-     (lambda ()
-       (loom:await (warp-event-broker--process-event-task
-                    broker-worker event broker-event-system)))
-     nil)))
-
-(defun warp-event-broker--handle-worker-registered (broker-worker cm event)
-  "Event handler to add a newly registered worker to the broadcast list.
-Establishes a connection and maps the worker ID to the connection object.
-
-Arguments:
-- `broker-worker` (warp-worker): The event broker instance.
-- `cm` (warp-connection-manager): The broker's connection manager.
-- `event` (warp-event): The `:worker-ready-signal-received` event.
-
-Returns:
-- (loom-promise): A promise that resolves when the worker is added."
-  (let* ((broker-id (warp:worker-id broker-worker))
-         (data (warp-event-data event))
-         (new-worker-id (plist-get data :worker-id))
-         (address (plist-get data :inbox-address))
-         (es (warp:component-system-get
-              (warp-worker-component-system broker-worker) :event-system))
-         (peer-map (warp-event-system-connected-peer-map es)))
-    (braid!
-     (warp:log! :info broker-id "Adding worker '%s' to broadcast list."
-                new-worker-id)
-     (:then (lambda (_)
-              (if (and new-worker-id address
-                       (not (string= new-worker-id broker-id))
-                       (not (string= new-worker-id "master")))
-                  (braid!
-                   (warp:connection-manager-add-endpoint cm address)
-                   (:then (lambda (_)
-                            ;; Loop until connection becomes active.
-                            (loom:loop!
-                             (let ((conn (warp:connection-manager-get-connection
-                                          cm address)))
-                               (if conn
-                                   (loom:break! conn)
-                                 (loom:delay! 0.1 (loom:continue!)))))))
-                   (:then (lambda (connection)
-                            (loom:with-mutex! (warp-event-system-lock es)
-                              (puthash new-worker-id connection peer-map))
-                            (warp:log! :info broker-id "Mapped worker '%s'."
-                                       new-worker-id)
-                            connection))
-                   (:catch (lambda (err)
-                             (warp:log! :error broker-id
-                                        "Failed to connect to '%s': %S"
-                                        new-worker-id err)
-                             (loom:rejected! err))))
-                (loom:resolved! nil))))
-     (:catch (lambda (err)
-               (warp:log! :error broker-id
-                          "Failed to handle worker registered event: %S" err)
-               (loom:rejected! err))))))
-
-(defun warp-event-broker--handle-worker-deregistered (broker-worker cm event)
-  "Event handler to remove a deregistered worker from the broadcast list.
-
-Arguments:
-- `broker-worker` (warp-worker): The event broker instance.
-- `cm` (warp-connection-manager): The broker's connection manager.
-- `event` (warp-event): The `:worker-deregistered` event.
-
-Returns:
-- (loom-promise): A promise that resolves when the worker is removed."
-  (let* ((broker-id (warp:worker-id broker-worker))
-         (data (warp-event-data event))
-         (old-worker-id (plist-get data :worker-id))
-         (address (plist-get data :inbox-address))
-         (es (warp:component-system-get
-              (warp-worker-component-system broker-worker) :event-system))
-         (peer-map (warp-event-system-connected-peer-map es)))
-    (braid!
-     (warp:log! :info broker-id "Removing worker '%s' from broadcast list."
-                old-worker-id)
-     (:then (lambda (_)
-              (when (and old-worker-id address)
-                (warp:connection-manager-remove-endpoint cm address)
-                (loom:with-mutex! (warp-event-system-lock es)
-                  (remhash old-worker-id peer-map))
-                (warp:log! :info broker-id
-                           "Removed worker '%s' from connected peers."
-                           old-worker-id)
-                t)))
-     (:catch (lambda (err)
-               (warp:log! :error broker-id "Failed to remove worker '%s': %S"
-                          old-worker-id err)
-               (loom:rejected! err))))))
-
-(defun warp-event-broker--send-event-to-worker
-    (broker-worker target-worker-id target-connection event)
-  "Sends an event to a target worker with retry and circuit breaking.
-
-Arguments:
-- `broker-worker` (warp-worker): The event broker instance.
-- `target-worker-id` (string): The logical ID of the target worker.
-- `target-connection` (warp-transport-connection): The connection.
-- `event` (warp-event): The `warp-event` object to send.
-
-Returns:
-- (loom-promise): Resolves on success or rejects on failure."
-  (let* ((broker-id (warp:worker-id broker-worker))
-         (system (warp-worker-component-system broker-worker))
-         (rpc-system (warp:component-system-get system :rpc-system))
-         (broker-cfg (warp-event-broker-config (warp-worker-config broker-worker)))
-         (max-retries (warp-event-broker-config-max-retry-attempts broker-cfg))
-         (backoff-ms (warp-event-broker-config-retry-backoff-ms broker-cfg))
-         (cb-thresh (warp-event-broker-config-circuit-breaker-threshold broker-cfg))
-         (cb-id (format "broker-fanout-%s" target-worker-id))
-         (cb (warp:circuit-breaker-get
-              cb-id
-              :config-options `(:failure-threshold ,cb-thresh
-                                :recovery-timeout 60.0))))
-    (braid!
-     (warp:circuit-breaker-execute cb
-       (lambda ()
-         (loom:retry
-          (braid!
-           (unless target-connection
-             (signal (warp:error!
-                      :type 'warp-errors-no-connection
-                      :message (format "No active connection to %s."
-                                       target-worker-id))))
-           (warp:protocol-send-distributed-event
-            rpc-system target-connection (warp-event-source-id event)
-            target-worker-id event
-            :origin-instance-id (warp-component-system-id system)))
-          :retries max-retries
-          :delay (lambda (n _) (/ (* backoff-ms (expt 2 (1- n))) 1000.0))
-          :pred (lambda (err)
-                  (or (cl-typep err 'warp-errors-no-connection)
-                      (cl-typep err 'warp-rpc-error)
-                      (cl-typep err 'loom-timeout-error))))))
-     (:then (lambda (res)
-              (warp:log! :trace broker-id "Sent event %S to %s."
-                         (warp-event-id event) target-worker-id)
-              res))
-     (:catch (lambda (err)
-               (warp:log! :warn broker-id
-                          "Failed to send event %S to %s: %S"
-                          (warp-event-id event) target-worker-id err)
-               (loom:rejected!
-                (warp:error!
-                 :type 'warp-error-internal-error
-                 :message (format "Delivery failed to %s" target-worker-id)
-                 :cause err)))))))
-
-(defun warp-event-broker--process-event-task (broker-worker event es)
-  "Core task to re-emit an event locally and fan it out to other workers.
-
-Arguments:
-- `broker-worker` (warp-worker): The event broker instance.
-- `event` (warp-event): The `warp-event` object to propagate.
-- `es` (warp-event-system): The broker's local event system.
-
-Returns:
-- (loom-promise): A promise that resolves when fan-out is complete."
-  (let* ((broker-id (warp:worker-id broker-worker))
-         (sender-id (warp-event-source-id event))
-         (peer-map (warp-event-system-connected-peer-map es)))
-    (braid!
-     ;; Step 1: Re-emit event locally (e.g., for metrics).
-     (warp:emit-event-with-options
-      es (warp-event-type event) (warp-event-data event)
-      :source-id sender-id
-      :correlation-id (warp-event-correlation-id event)
-      :priority (warp-event-priority event)
-      :metadata (warp-event-metadata event)
-      :distribution-scope :local) ; Crucial to prevent loops.
-
-     ;; Step 2: Determine fan-out targets.
-     (:then (lambda (_)
-              (let ((targets (cl-set-difference (hash-table-keys peer-map)
-                                                (list sender-id broker-id)
-                                                :test #'string=)))
-                (warp:log! :debug broker-id "Fanning out event '%S' to %d peers."
-                           (warp-event-type event) (length targets))
-                targets)))
-
-     ;; Step 3: Fan out to all targets in parallel.
-     (:map (lambda (target-id)
-             (if-let (conn (gethash target-id peer-map))
-                 (warp-event-broker--send-event-to-worker
-                  broker-worker target-id conn event)
-               (progn
-                 (warp:log! :warn broker-id "Skipping %s: No connection found."
-                            target-id)
-                 (loom:resolved! nil)))))
-     (:all-settled)
-     (:then (lambda (_results)
-              (warp:log! :debug broker-id "Fan-out complete for event '%S'."
-                         (warp-event-type event))
-              t)))))
+              (let* ((redis (warp:component-system-get system :redis-service))
+                     (es (warp:component-system-get system :event-system))
+                     ;; Subscribe to all channels under the configured prefix.
+                     ;; E.g., if prefix is "warp:events", it subscribes to
+                     ;; "warp:events:cluster", "warp:events:global", etc.
+                     (channel-pattern (format "%s:*"
+                                              (event-broker-config-redis-key-prefix
+                                               ,broker-config))))
+                (warp:log! :info (warp-event-system-id es)
+                           "Event broker subscribing to Redis channel pattern: %s."
+                           channel-pattern)
+                (warp:redis-subscribe
+                 redis channel-pattern
+                 ;; Use the private handler function as the callback.
+                 (lambda (channel payload)
+                   (warp-event-broker--handle-redis-message
+                    es channel payload))))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
@@ -469,30 +181,39 @@ Returns:
 ;;;###autoload
 (defun warp:event-broker-create (&rest options)
   "Creates and configures a dedicated Event Broker worker instance.
-This factory configures a `warp-worker` with custom components for
-high-performance, resilient event brokering.
+This factory function sets up a specialized `warp-worker` that includes
+components necessary for acting as a Redis-backed event broker. It
+configures the worker to connect to Redis and listen for distributed
+events, bridging them to its local event bus.
 
 Arguments:
-- `&rest OPTIONS` (plist, optional): Configuration for `event-broker-config`
-  and the underlying `warp-worker`.
+- `&rest OPTIONS` (plist, optional): Configuration options for the event
+  broker. These can include options for `event-broker-config` (like
+  `redis-options` or `redis-key-prefix`) and any standard `warp-worker`
+  creation options.
 
 Returns:
-- (warp-worker): A new, configured but unstarted event broker worker."
+- (warp-worker): A new, configured but unstarted event broker worker.
+  To activate it, `warp:worker-start` must be called on the returned object."
   (let* ((broker-config (apply #'make-event-broker-config options))
+         ;; Generate a unique ID for this specific event broker worker.
          (worker-id (format "event-broker-%s"
                             (warp-worker--generate-worker-id)))
+         ;; Prepare worker creation options, including the broker-specific config.
          (worker-options (append options (list :name "event-broker"
                                                :config broker-config
                                                :worker-id worker-id)))
+         ;; Create the base warp-worker.
          (broker-worker (apply #'warp:worker-create worker-options))
+         ;; Get the component system of the newly created worker.
          (cs (warp-worker-component-system broker-worker)))
-    ;; Override/add broker-specific component definitions.
+    ;; Override/add broker-specific component definitions to the worker's
+    ;; component system. This is where the Redis client and listener are injected.
     (setf (warp-component-system-definitions cs)
-          (append (warp-event-broker--get-component-definitions
-                   broker-config broker-worker)
+          (append (warp-event-broker--get-component-definitions broker-config)
                   (warp-component-system-definitions cs)))
     (warp:log! :info (warp:worker-id broker-worker)
-               "Event Broker Worker created.")
+               "Event Broker Worker created (Redis-backed).")
     broker-worker))
 
 (provide 'warp-event-broker)

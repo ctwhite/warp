@@ -56,7 +56,8 @@ Fields:
 - `leader-challenge-token` (string): The token provided by the leader.
 - `worker-signature` (string): The worker's signature over the token.
 - `worker-public-key` (string): The worker's public key for verification.
-- `inbox-address` (string): The IPC address the worker is listening on."
+- `inbox-address` (string): The IPC address the worker is listening on.
+- `pool-name` (string): The name of the pool this worker belongs to."
   (worker-id nil :type string)
   (rank nil :type integer)
   (status nil :type symbol)
@@ -64,7 +65,8 @@ Fields:
   (leader-challenge-token nil :type (or null string))
   (worker-signature nil :type (or null string))
   (worker-public-key nil :type (or null string))
-  (inbox-address nil :type (or null string)))
+  (inbox-address nil :type (or null string))
+  (pool-name nil :type (or null string)))
 
 (warp:defprotobuf-mapping warp-worker-ready-payload
   "Protobuf mapping for `warp-worker-ready-payload` for efficient
@@ -76,7 +78,8 @@ binary serialization."
     (leader-challenge-token 5 :string)
     (worker-signature 6 :string)
     (worker-public-key 7 :string)
-    (inbox-address 8 :string)))
+    (inbox-address 8 :string)
+    (pool-name 9 :string)))
 
 (warp:defschema warp-worker-heartbeat-payload
     ((:constructor make-warp-worker-heartbeat-payload))
@@ -532,7 +535,7 @@ Returns:
                 inbox-address
                 (expect-response t)
                 origin-instance-id
-                pool-name) ; Added missing pool-name argument
+                pool-name)
   "Sends a `:worker-ready` notification from a worker to the leader.
 This is the initial handshake RPC used by a worker to announce its
 presence and status to the control plane, and perform a secure challenge.
@@ -564,7 +567,7 @@ Returns:
               :worker-signature signature
               :worker-public-key public-key
               :inbox-address inbox-address
-              :pool-name pool-name))) ; Pass pool-name to payload
+              :pool-name pool-name)))
     (warp:rpc-request rpc-system connection worker-id leader-id cmd
                       :expect-response expect-response
                       :origin-instance-id origin-instance-id)))
