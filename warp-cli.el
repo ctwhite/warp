@@ -96,32 +96,22 @@
 
 ;;; Code:
 
-(require 'cl-lib) ; For Common Lisp extensions like `cl-loop`
-(require 'json)   ; For reading/writing JSON configuration and data
-(require 's)      ; For string manipulation functions (`s-split`)
-(require 'thread) ; For `make-thread` used in `warp:cli-with-spinner`
-(require 'yaml)   ; For YAML configuration file parsing (requires `yaml.el` library)
-(require 'custom) ; For `defcustom` and `defgroup`
-(require 'subr-x) ; For `string-match-p` and other string utilities.
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; ### Part 1: The Warp CLI Framework Library
-;;; This section defines the generic, reusable components for building
-;;; command-line interfaces in Emacs Lisp. It provides utilities for
-;;; argument parsing, help generation, and user feedback.
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(require 'cl-lib) 
+(require 'json)   
+(require 's)      
+(require 'thread) 
+(require 'yaml)   
+(require 'custom) 
+(require 'subr-x) 
 
 ;;;---------------------------------------------------------------------
-;;; Customization Group
+;;; Customization
 ;;---------------------------------------------------------------------
 
 (defgroup warp-cli nil
   "Customization options for the Warp Command-Line Interface."
-  :group 'applications)
-
-;;;---------------------------------------------------------------------
-;;; Customization Variables
-;;---------------------------------------------------------------------
+  :group 'warp
+  :prefix "warp-cli-")
 
 (defcustom warp-cli-version "2.0.0"
   "The version string for the Warp CLI tool."
@@ -629,14 +619,6 @@ Returns:
           (princ (format "%-*s  " (nth i col-widths) (nth i row)) out))
         (princ "\n" out))
       (get-output-stream-string out))))
-
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; ### Part 2: `warp-cli` Application Logic
-;;; This section defines the actual command-line interface commands for
-;;; interacting with a Warp cluster. It leverages the CLI framework
-;;; defined above and communicates with the core Warp components.
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Load necessary Warp libraries from the project root.
 ;; This ensures that the CLI has access to the full Warp API.

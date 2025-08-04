@@ -48,6 +48,7 @@
 ;;                                                                      :city "Boston"))))))
 
 ;;; Code:
+
 (require 'cl-lib)
 (require 'subr-x)
 (require 'bindat)
@@ -1405,7 +1406,12 @@ Returns:
     (:string value)
     (:bytes (base64-encode-string (warp-protobuf--ensure-unibyte value)))
     (:enum (if (symbolp value) (symbol-name value) value))
-    (:message (warp-protobuf-to-json (plist-get (nthcdr 4 (cl-find-if (lambda (f) (eq (nth 2 f) :message)) (list :dummy-field 0 :message :optional :schema (plist-get value :schema)))) :schema) value)) ; Nested message needs its schema
+    (:message (warp-protobuf-to-json (plist-get 
+      (nthcdr 4 (cl-find-if (lambda (f) 
+                              (eq (nth 2 f) :message)) (list :dummy-field 0 
+                                                             :message :optional 
+                                                             :schema (plist-get value :schema)))) 
+                                                             :schema) value)) ; Nested message needs its schema
     (:any (list (cons "type_url" (plist-get value :type-url))
                 (cons "value" (base64-encode-string
                                (warp-protobuf--ensure-unibyte

@@ -1,1561 +1,1019 @@
-;;; warp-protobuf.el --- Complete Protocol Buffers implementation for Emacs Lisp -*- lexical-binding: t; -*-
+;;; warp-protocol.el --- Warp Component Communication Protocol -*- lexical-binding: t; -*-
 
 ;;; Commentary:
+;; This module defines the high-level **protocol schemas** and provides a
+;; **protocol client** for communication between Warp components. It acts
+;; as a shared vocabulary or data contract layer, defining the specific
+;; content of RPC calls and their binary serialization format via
+;; Protobuf mappings.
 ;;
-;; This module provides a complete Protocol Buffers implementation for Emacs
-;; Lisp, supporting the full wire format specification with proper schema
-;; definitions, field validation, and extensible encoding/decoding. It's a
-;; foundational piece for enabling language-agnostic communication within the
-;; Warp distributed computing framework.
+;; ## Architectural Role:
 ;;
-;; ## Features:
-;; - Complete wire format support (varint, fixed32, fixed64,
-;;   length-delimited).
-;; - All standard protobuf types (int32, int64, uint32, uint64, sint32,
-;;   sint64, fixed32, fixed64, sfixed32, sfixed64, float, double, bool,
-;;   string, bytes).
-;; - Repeated fields and packed encoding.
-;; - Nested messages and enums.
-;; - Map fields (proto3 style).
-;; - Oneof fields (union types).
-;; - Any type support for dynamic messages.
-;; - JSON serialization/deserialization (for Protobuf messages).
-;; - Schema reflection and validation.
-;; - Unknown field preservation.
-;; - Default value handling.
-;; - Comprehensive error reporting via `warp:error!`.
-;;
-;; ## Usage:
-;;   ;; Define a schema for a nested message
-;;   (warp:defprotobuf-schema address-schema
-;;     (street 1 :string :required)
-;;     (city 2 :string :required))
-;;
-;;   ;; Define a schema with advanced features
-;;   (warp:defprotobuf-schema person-schema
-;;     (name 1 :string :required)
-;;     (id 2 :int32 :required)
-;;     (phones 4 :string :repeated)
-;;     (addresses 5 :map :optional :key-type :string
-;;                  :value-type :message :value-schema address-schema))
-;;
-;;   ;; Encode a message
-;;   (setq encoded (warp:protobuf-encode person-schema
-;;                                     '(:name "John Doe"
-;;                                       :id 123
-;;                                       :phones ("555-1234" "555-5678")
-;;                                       :addresses (("home" (:street "123 Main"
-;;                                                                    :city "Boston"))))))
+;; 1.  **Shared Schemas**: It contains all the `warp:defschema` and
+;;     `warp:defprotobuf-mapping` definitions for the payloads used in
+;;     operational RPCs. This ensures components agree on both the
+;;     structure and the wire format of the data they exchange.
+;; 2.  **Protocol Client**: It introduces a `warp-protocol-client`
+;;     component that encapsulates the logic for sending all standard
+;;     protocol RPCs, providing a clean, high-level API.
 
 ;;; Code:
-(require 'cl-lib)
-(require 'subr-x)
-(require 'bindat)
-(require 'json)
 
+(require 'cl-lib)
+(require 's)
+(require 'loom)
+(require 'braid)
+
+(require 'warp-log)
 (require 'warp-error)
+(require 'warp-marshal)
+(require 'warp-rpc)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
 
-(define-error 'warp-protobuf-error 
-  "Generic Protocol Buffers error" 
-  'warp-error)
-
-(define-error 'warp-protobuf-decode-error 
-  "Protocol Buffers decode error" 
-  'warp-protobuf-error)
-
-(define-error 'warp-protobuf-encode-error 
-  "Protocol Buffers encode error" 
-  'warp-protobuf-error)
-
-(define-error 'warp-protobuf-schema-error 
-  "Protocol Buffers schema error" 
-  'warp-protobuf-error)
-
-(define-error 'warp-protobuf-validation-error 
-  "Protocol Buffers validation error" 
-  'warp-protobuf-error)
-
-(define-error 'warp-protobuf-oneof-error 
-  "Protocol Buffers oneof error" 
-  'warp-protobuf-error)
-
-(define-error 'warp-protobuf-any-error 
-  "Protocol Buffers any error" 
-  'warp-protobuf-error)
+(define-error 'warp-protocol-error
+  "A generic error for `warp-protocol` operations."
+  'warp-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Constants
+;;; Schema Definitions
 
-(defconst warp-protobuf--wire-varint 0
-  "Wire type for variable-length integers (varints).")
+;;----------------------------------------------------------------------
+;;; Worker RPC Payloads
+;;----------------------------------------------------------------------
 
-(defconst warp-protobuf--wire-fixed64 1
-  "Wire type for 64-bit fixed-size data.")
+(warp:defschema warp-worker-ready-payload
+    ((:constructor make-warp-worker-ready-payload))
+  "Payload for the `:worker-ready` RPC sent to the control plane leader.
+This message is critical for the initial handshake and registration.
 
-(defconst warp-protobuf--wire-length-delimited 2
-  "Wire type for length-delimited data (strings, bytes, messages).")
+Fields:
+- `worker-id` (string): The unique identifier of the worker process.
+- `rank` (integer): The numerical rank assigned to the worker.
+- `status` (symbol): The initial status of the worker (e.g., `:starting`).
+- `launch-id` (string): A one-time ID for this launch, for security.
+- `leader-challenge-token` (string): The token provided by the leader.
+- `worker-signature` (string): The worker's signature over the token.
+- `worker-public-key` (string): The worker's public key for verification.
+- `inbox-address` (string): The IPC address the worker is listening on.
+- `pool-name` (string): The name of the pool this worker belongs to."
+  (worker-id nil :type string)
+  (rank nil :type integer)
+  (status nil :type symbol)
+  (launch-id nil :type (or null string))
+  (leader-challenge-token nil :type (or null string))
+  (worker-signature nil :type (or null string))
+  (worker-public-key nil :type (or null string))
+  (inbox-address nil :type (or null string))
+  (pool-name nil :type (or null string)))
 
-(defconst warp-protobuf--wire-fixed32 5
-  "Wire type for 32-bit fixed-size data.")
+(warp:defprotobuf-mapping warp-worker-ready-payload
+  "Protobuf mapping for `warp-worker-ready-payload` for efficient
+binary serialization."
+  `((worker-id 1 :string)
+    (rank 2 :int32)
+    (status 3 :string)
+    (launch-id 4 :string)
+    (leader-challenge-token 5 :string)
+    (worker-signature 6 :string)
+    (worker-public-key 7 :string)
+    (inbox-address 8 :string)
+    (pool-name 9 :string)))
 
-(defconst warp-protobuf--type-wire-map
-  '((:int32 . 0) (:int64 . 0) (:uint32 . 0) (:uint64 . 0)
-    (:sint32 . 0) (:sint64 . 0) (:bool . 0) (:enum . 0)
-    (:fixed64 . 1) (:sfixed64 . 1) (:double . 1)
-    (:string . 2) (:bytes . 2) (:message . 2) (:map . 2) (:any . 2)
-    (:fixed32 . 5) (:sfixed32 . 5) (:float . 5))
-  "Alist mapping Protobuf field types to their corresponding wire types.")
+(warp:defschema warp-worker-heartbeat-payload
+    ((:constructor make-warp-worker-heartbeat-payload))
+  "Payload for the periodic `:heartbeat` RPC to the control plane leader.
+Note: The worker's public key is NOT sent with every heartbeat; it's
+typically exchanged during the initial `:worker-ready` handshake.
 
-(defconst warp-protobuf--type-defaults
-  '((:int32 . 0) (:int64 . 0) (:uint32 . 0) (:uint64 . 0)
-    (:sint32 . 0) (:sint64 . 0) (:bool . nil) (:enum . 0)
-    (:fixed32 . 0) (:fixed64 . 0) (:sfixed32 . 0) (:sfixed64 . 0)
-    (:float . 0.0) (:double . 0.0) (:string . "") (:bytes . "")
-    (:map . nil) (:any . nil))
-  "Alist mapping Protobuf field types to their proto3 default values.")
+Fields:
+- `worker-id` (string): ID of the worker sending the heartbeat.
+- `status` (symbol): Current operational status (e.g., `:running`).
+- `timestamp` (float): `float-time` when the heartbeat was created.
+- `services` (list): Lisp objects describing services on the worker.
+- `metrics` (bytes): Serialized metrics hash-table (e.g., `warp-worker-metrics`)."
+  (worker-id nil :type string)
+  (status nil :type symbol)
+  (timestamp (float-time) :type float)
+  (services nil :type list)
+  (metrics nil :type bytes)) ;; Added metrics field to schema and docstring
 
-(defconst warp-protobuf--any-type-url-prefix "type.googleapis.com/"
-  "URL prefix for well-known Google Protobuf `Any` type.")
+(warp:defprotobuf-mapping warp-worker-heartbeat-payload
+  "Protobuf mapping for `warp-worker-heartbeat-payload`."
+  `((worker-id 1 :string)
+    (status 2 :string)
+    (timestamp 3 :double)
+    (services 4 :bytes) ;; Services (list of plists) are marshaled to bytes
+    (metrics 5 :bytes))) ;; Metrics (hash-table) are marshaled to bytes
+
+(warp:defschema warp-get-init-payload-args
+    ((:constructor make-warp-get-init-payload-args))
+  "Arguments for the `:get-init-payload` RPC sent from a worker.
+Allows a worker to request custom, rank-specific configuration.
+
+Fields:
+- `worker-id` (string): The unique ID of the worker making the request.
+- `rank` (integer): The rank for which the payload is being requested."
+  (worker-id nil :type string)
+  (rank nil :type integer))
+
+(warp:defprotobuf-mapping warp-get-init-payload-args
+  "Protobuf mapping for `warp-get-init-payload-args`."
+  `((worker-id 1 :string)
+    (rank 2 :int32)))
+
+(warp:defschema warp-ping-payload
+    ((:constructor make-warp-ping-payload))
+  "Payload for `:ping` requests and their responses.
+Used for basic liveness checks and round-trip time measurements.
+
+Fields:
+- `message` (string): Optional message, e.g., \"ping\" or \"pong\".
+- `timestamp` (float): The `float-time` of message creation."
+  (message nil :type (or null string))
+  (timestamp (float-time) :type float))
+
+(warp:defprotobuf-mapping warp-ping-payload
+  "Protobuf mapping for `warp-ping-payload`."
+  `((message 1 :string)
+    (timestamp 2 :double)))
+
+;;----------------------------------------------------------------------
+;;; Map-Reduce RPC Payloads
+;;----------------------------------------------------------------------
+
+(warp:defschema warp-cluster-map-payload
+    ((:constructor make-warp-cluster-map-payload))
+  "Payload for `:evaluate-map-chunk` RPC for a map-reduce operation.
+
+Fields:
+- `function-form` (t): A Lisp form (code) that evaluates to the map fn.
+- `chunk-data` (list): The list of data items for the worker to process."
+  (function-form nil :type t)
+  (chunk-data nil :type list))
+
+(warp:defprotobuf-mapping warp-cluster-map-payload
+  "Protobuf mapping for `warp-cluster-map-payload`."
+  `((function-form 1 :bytes) ;; Lisp form marshaled to bytes
+    (chunk-data 2 :bytes)))  ;; List data marshaled to bytes
+
+(warp:defschema warp-cluster-map-result
+    ((:constructor make-warp-cluster-map-result))
+  "Result payload for an `:evaluate-map-chunk` RPC.
+
+Fields:
+- `results` (list): Results after applying the map function."
+  (results nil :type list))
+
+(warp:defprotobuf-mapping warp-cluster-map-result
+  "Protobuf mapping for `warp-cluster-map-result`."
+  `((results 1 :bytes))) ;; List of results marshaled to bytes
+
+;;----------------------------------------------------------------------
+;;; Provisioning RPC Payloads
+;;----------------------------------------------------------------------
+
+(warp:defschema warp-provision-request-payload
+    ((:constructor make-warp-provision-request-payload))
+  "Payload for an RPC from a worker requesting its provision.
+
+Fields:
+- `worker-id` (string): ID of the worker requesting the provision.
+- `current-version` (string): Version of the provision the worker has.
+- `provision-type` (keyword): Type of provision requested."
+  (worker-id nil :type string)
+  (current-version nil :type (or null string))
+  (provision-type :worker-provision :type keyword))
+
+(warp:defprotobuf-mapping warp-provision-request-payload
+  "Protobuf mapping for `warp-provision-request-payload`."
+  `((worker-id 1 :string)
+    (current-version 2 :string)
+    (provision-type 3 :string)))
+
+(warp:defschema warp-provision-response-payload
+    ((:constructor make-warp-provision-response-payload))
+  "Payload for the leader's RPC response containing the provision.
+
+Fields:
+- `version` (string): The version identifier of the returned provision.
+- `provision` (t): The provision object itself."
+  (version nil :type string)
+  (provision nil :type t))
+
+(warp:defprotobuf-mapping warp-provision-response-payload
+  "Protobuf mapping for `warp-provision-response-payload`."
+  `((version 1 :string)
+    (provision 2 :bytes))) ;; Provision data (arbitrary Lisp object) marshaled to bytes
+
+(warp:defschema warp-provision-update-payload
+    ((:constructor make-warp-provision-update-payload))
+  "Payload for a provision update event pushed from the leader to workers.
+
+Fields:
+- `version` (string): The new version identifier of the provision.
+- `provision` (t): The new provision object.
+- `provision-type` (keyword): The type of provision being updated.
+- `target-ids` (list): Optional list of specific worker IDs to target."
+  (version nil :type string)
+  (provision nil :type t)
+  (provision-type :worker-provision :type keyword)
+  (target-ids nil :type (or null list)))
+
+(warp:defprotobuf-mapping warp-provision-update-payload
+  "Protobuf mapping for `warp-provision-update-payload`."
+  `((version 1 :string)
+    (provision 2 :bytes) ;; Provision data marshaled to bytes
+    (provision-type 3 :string)
+    (target-ids 4 :bytes))) ;; List of strings marshaled to bytes
+
+(warp:defschema warp-provision-jwt-keys-payload
+    ((:constructor make-warp-provision-jwt-keys-payload))
+  "Provision payload for distributing trusted JWT public keys.
+
+Fields:
+- `trusted-keys` (list): An alist or plist mapping key IDs to
+  PEM-encoded public keys."
+  (trusted-keys nil :type (or null list)))
+
+(warp:defprotobuf-mapping warp-provision-jwt-keys-payload
+  "Protobuf mapping for `warp-provision-jwt-keys-payload`."
+  `((trusted-keys 1 :bytes))) ;; List of (key . value) pairs marshaled to bytes
+
+;;----------------------------------------------------------------------
+;;; Coordination RPC Payloads
+;;----------------------------------------------------------------------
+
+(warp:defschema warp-propagate-event-payload
+    ((:constructor make-warp-propagate-event-payload))
+  "Payload for `propagate-event` RPC sent to the event broker.
+
+Fields:
+- `event` (warp-event): The `warp-event` object to be propagated."
+  (event nil :type warp-event))
+
+(warp:defprotobuf-mapping warp-propagate-event-payload
+  "Protobuf mapping for `warp-propagate-event-payload`."
+  `((event 1 :bytes))) ;; Event struct marshaled to bytes
+
+(warp:defschema warp-coordinator-get-leader-response
+    ((:constructor make-warp-coordinator-get-leader-response))
+  "Response payload for `:get-coordinator-leader` RPC.
+This allows a node to query a coordinator peer for the current leader's
+advertised address.
+
+Fields:
+- `leader-id` (string): The ID of the currently elected leader.
+- `leader-address` (string): The public contact address of the leader."
+  (leader-id nil :type (or null string))
+  (leader-address nil :type (or null string)))
+
+(warp:defprotobuf-mapping warp-coordinator-get-leader-response
+  "Protobuf mapping for `warp-coordinator-get-leader-response`."
+  `((leader-id 1 :string)
+    (leader-address 2 :string)))
+
+(warp:defschema warp-coordinator-request-vote-payload
+    ((:constructor make-warp-coordinator-request-vote-payload))
+  "Payload for `RequestVote` RPC in Raft-like consensus.
+
+Fields:
+- `term` (integer): Candidate's term.
+- `candidate-id` (string): Candidate requesting vote.
+- `last-log-index` (integer): Index of candidate's last log entry.
+- `last-log-term` (integer): Term of candidate's last log entry."
+  (term nil :type integer)
+  (candidate-id nil :type string)
+  (last-log-index nil :type integer)
+  (last-log-term nil :type integer))
+
+(warp:defprotobuf-mapping warp-coordinator-request-vote-payload
+  "Protobuf mapping for `warp-coordinator-request-vote-payload`."
+  `((term 1 :int32)
+    (candidate-id 2 :string)
+    (last-log-index 3 :int32)
+    (last-log-term 4 :int32)))
+
+(warp:defschema warp-coordinator-request-vote-response-payload
+    ((:constructor make-warp-coordinator-request-vote-response-payload))
+  "Response payload for `RequestVote` RPC.
+
+Fields:
+- `term` (integer): Current term of responder.
+- `vote-granted-p` (boolean): `t` if candidate received vote.
+- `error` (string): Optional error message if vote not granted."
+  (term nil :type integer)
+  (vote-granted-p nil :type boolean)
+  (error nil :type (or null string)))
+
+(warp:defprotobuf-mapping warp-coordinator-request-vote-response-payload
+  "Protobuf mapping for `warp-coordinator-request-vote-response-payload`."
+  `((term 1 :int32)
+    (vote-granted-p 2 :bool)
+    (error 3 :string)))
+
+(warp:defschema warp-coordinator-append-entries-payload
+    ((:constructor make-warp-coordinator-append-entries-payload))
+  "Payload for `AppendEntries` RPC (heartbeats and log replication).
+
+Fields:
+- `term` (integer): Leader's term.
+- `leader-id` (string): Leader's ID.
+- `prev-log-index` (integer): Index of log entry immediately preceding
+  new ones.
+- `prev-log-term` (integer): Term of `prev-log-index` entry.
+- `entries` (list): Log entries to append (empty for heartbeats).
+- `leader-commit` (integer): Leader's commit index."
+  (term nil :type integer)
+  (leader-id nil :type string)
+  (prev-log-index nil :type integer)
+  (prev-log-term nil :type integer)
+  (entries nil :type list)
+  (leader-commit nil :type integer))
+
+(warp:defprotobuf-mapping warp-coordinator-append-entries-payload
+  "Protobuf mapping for `warp-coordinator-append-entries-payload`."
+  `((term 1 :int32)
+    (leader-id 2 :string)
+    (prev-log-index 3 :int32)
+    (prev-log-term 4 :int32)
+    (entries 5 :bytes) ; Log entries themselves are marshaled as bytes
+    (leader-commit 6 :int32)))
+
+(warp:defschema warp-coordinator-append-entries-response-payload
+    ((:constructor make-warp-coordinator-append-entries-response-payload))
+  "Response payload for `AppendEntries` RPC.
+
+Fields:
+- `term` (integer): Current term of follower.
+- `success-p` (boolean): `t` if follower contained `prev-log-index` and
+  `prev-log-term`.
+- `error` (string): Optional error message."
+  (term nil :type integer)
+  (success-p nil :type boolean)
+  (error nil :type (or null string)))
+
+(warp:defprotobuf-mapping warp-coordinator-append-entries-response-payload
+  "Protobuf mapping for `warp-coordinator-append-entries-response-payload`."
+  `((term 1 :int32)
+    (success-p 2 :bool)
+    (error 3 :string)))
+
+(warp:defschema warp-coordinator-lock-request-payload
+    ((:constructor make-warp-coordinator-lock-request-payload))
+  "Payload for `acquire-lock` or `release-lock` RPC.
+
+Fields:
+- `lock-name` (string): Name of the distributed lock.
+- `holder-id` (string): ID of the client trying to acquire/release.
+- `expiry-time` (float): Desired expiry for acquisition."
+  (lock-name nil :type string)
+  (holder-id nil :type string)
+  (expiry-time nil :type float))
+
+(warp:defprotobuf-mapping warp-coordinator-lock-request-payload
+  "Protobuf mapping for `warp-coordinator-lock-request-payload`."
+  `((lock-name 1 :string)
+    (holder-id 2 :string)
+    (expiry-time 3 :double)))
+
+(warp:defschema warp-coordinator-lock-response-payload
+    ((:constructor make-warp-coordinator-lock-response-payload))
+  "Response payload for `acquire-lock` or `release-lock` RPC.
+
+Fields:
+- `granted-p` (boolean): `t` if lock was acquired/released, `nil` if denied.
+- `leader-id` (string): Current leader ID, for redirection.
+- `error` (string): Optional error message."
+  (granted-p nil :type boolean)
+  (leader-id nil :type (or null string))
+  (error nil :type (or null string)))
+
+(warp:defprotobuf-mapping warp-coordinator-lock-response-payload
+  "Protobuf mapping for `warp-coordinator-lock-response-payload`."
+  `((granted-p 1 :bool)
+    (leader-id 2 :string)
+    (error 3 :string)))
+
+(warp:defschema warp-coordinator-barrier-increment-payload
+    ((:constructor make-warp-coordinator-barrier-increment-payload))
+  "Payload for `barrier-increment` RPC.
+
+Fields:
+- `barrier-name` (string): Name of the distributed barrier.
+- `participant-id` (string): ID of the participant.
+- `total-participants` (integer): Target count for the barrier."
+  (barrier-name nil :type string)
+  (participant-id nil :type string)
+  (total-participants nil :type integer))
+
+(warp:defprotobuf-mapping warp-coordinator-barrier-increment-payload
+  "Protobuf mapping for `warp-coordinator-barrier-increment-payload`."
+  `((barrier-name 1 :string)
+    (participant-id 2 :string)
+    (total-participants 3 :int32)))
+
+(warp:defschema warp-coordinator-barrier-response-payload
+    ((:constructor make-warp-coordinator-barrier-response-payload))
+  "Response payload for `barrier-increment` RPC.
+
+Fields:
+- `success-p` (boolean): `t` if increment was successful.
+- `current-count` (integer): Current participants at the barrier.
+- `is-met-p` (boolean): `t` if barrier is now met.
+- `error` (string): Optional error message."
+  (success-p nil :type boolean)
+  (current-count nil :type integer)
+  (is-met-p nil :type boolean)
+  (error nil :type (or null string)))
+
+(warp:defprotobuf-mapping warp-coordinator-barrier-response-payload
+  "Protobuf mapping for `warp-coordinator-barrier-response-payload`."
+  `((success-p 1 :bool)
+    (current-count 2 :int32)
+    (is-met-p 3 :bool)
+    (error 4 :string)))
+
+(warp:defschema warp-coordinator-propose-change-payload
+    ((:constructor make-warp-coordinator-propose-change-payload))
+  "Payload for `propose-change` RPC to the leader.
+
+Fields:
+- `key` (list): The state path to change.
+- `value` (t): The new value for the state path."
+  (key nil :type list)
+  (value nil :type t))
+
+(warp:defprotobuf-mapping warp-coordinator-propose-change-payload
+  "Protobuf mapping for `warp-coordinator-propose-change-payload`."
+  `((key 1 :bytes) ; Key (path list) marshaled as bytes.
+    (value 2 :bytes))) ; Value (arbitrary Lisp data) marshaled as bytes.
+
+(warp:defschema warp-coordinator-propose-change-response-payload
+    ((:constructor make-warp-coordinator-propose-change-response-payload))
+  "Response payload for `propose-change` RPC.
+
+Fields:
+- `success-p` (boolean): `t` if change was applied.
+- `error` (string): Optional error message."
+  (success-p nil :type boolean)
+  (error nil :type (or null string)))
+
+(warp:defprotobuf-mapping warp-coordinator-propose-change-response-payload
+  "Protobuf mapping for `warp-coordinator-propose-change-response-payload`."
+  `((success-p 1 :bool)
+    (error 2 :string)))
+
+(warp:defschema warp-get-all-active-workers-args
+    ((:constructor make-warp-get-all-active-workers-args))
+  "Empty args payload for `:get-all-active-workers` RPC from event broker.
+This RPC requests a list of all active worker IDs and their addresses
+from the master's registry.
+
+Fields: None.")
+
+(warp:defprotobuf-mapping warp-get-all-active-workers-args
+  "Protobuf mapping for `warp-get-all-active-workers-args`. No fields."
+  `())
+
+(warp:defschema warp-get-all-active-workers-response-payload
+    ((:constructor make-warp-get-all-active-workers-response-payload))
+  "Response payload for `:get-all-active-workers` RPC.
+
+Fields:
+- `active-workers` (list): A list of plists, where each plist has
+  `:worker-id` (string) and `:inbox-address` (string)."
+  (active-workers nil :type list))
+
+(warp:defprotobuf-mapping warp-get-all-active-workers-response-payload
+  "Protobuf mapping for `warp-get-all-active-workers-response-payload`."
+  `((active-workers 1 :bytes))) ; List of plists marshaled as bytes.
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Global Registry
+;;; Struct Definitions
 
-(defvar warp-protobuf--schema-registry (make-hash-table :test 'equal)
-  "Global registry for protobuf schemas, keyed by schema name (symbol).")
+(cl-defstruct (warp-protocol-client
+               (:constructor %%make-protocol-client))
+  "A component providing a high-level API for sending protocol RPCs.
+This acts as a 'client facade' over the lower-level `rpc-system`,
+offering convenience functions for sending specific, protocol-defined
+messages without needing to manually construct RPC commands.
 
-(defvar warp-protobuf--enum-registry (make-hash-table :test 'equal)
-  "Global registry for protobuf enums, keyed by enum name (symbol).")
-
-(defun warp-protobuf-register-schema (name schema)
-  "Register SCHEMA with NAME in global registry.
-
-Arguments:
-- `NAME` (symbol): The name of the schema.
-- `SCHEMA` (list): The schema definition list.
-
-Returns: `nil`.
-
-Side Effects:
-- Modifies the global `warp-protobuf--schema-registry` hash table."
-  (puthash name schema warp-protobuf--schema-registry))
-
-(defun warp-protobuf-get-schema (name)
-  "Get schema by NAME from global registry.
-
-Arguments:
-- `NAME` (symbol): The name of the schema.
-
-Returns:
-- (list or nil): The schema definition list, or `nil` if not found."
-  (gethash name warp-protobuf--schema-registry))
-
-(defun warp-protobuf-register-enum (name enum-def)
-  "Register ENUM-DEF with NAME in global registry.
-
-Arguments:
-- `NAME` (symbol): The name of the enum.
-- `ENUM-DEF` (alist): The enum definition (alist of `(symbol . number)`).
-
-Returns: `nil`.
-
-Side Effects:
-- Modifies the global `warp-protobuf--enum-registry` hash table."
-  (puthash name enum-def warp-protobuf--enum-registry))
-
-(defun warp-protobuf-get-enum (name)
-  "Get enum definition by NAME from global registry.
-
-Arguments:
-- `NAME` (symbol): The name of the enum.
-
-Returns:
-- (alist or nil): The enum definition, or `nil` if not found."
-  (gethash name warp-protobuf--enum-registry))
+Fields:
+- `rpc-system` (warp-rpc-system): The underlying RPC system used to
+  actually send the requests."
+  (rpc-system (cl-assert nil) :type (or null t)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Utility Functions
+;;; Private Functions
 
-(defun warp-protobuf--ensure-unibyte (str)
-  "Ensure STR is a unibyte string, encoding if necessary.
-This function is crucial for handling binary data accurately with
-`bindat` and for ensuring consistent byte-level operations.
-
-Arguments:
-- `str` (string): The input string.
-
-Returns:
-- (string): A unibyte string representation of `str`."
-  (if (multibyte-string-p str)
-      (encode-coding-string str 'utf-8-unix t)
-    str))
-
-(defun warp-protobuf--clamp-int32 (n)
-  "Clamp N to 32-bit signed integer range.
+(defun warp-protocol--make-command
+    (name args-constructor &rest args-plist)
+  "Constructs a `warp-rpc-command` object with its payload.
+This helper standardizes the creation of RPC command objects by taking
+a command name, a schema constructor for its arguments, and a plist of
+those arguments, then wrapping them into a `warp-rpc-command` struct. The
+payload is automatically serialized to bytes via `warp:marshal` if needed
+(e.g., for `t` or `list` types in the schema).
 
 Arguments:
-- `n` (integer): The integer to clamp.
+- `NAME` (keyword): The symbolic name of the RPC command (e.g., `:ping`).
+- `ARGS-CONSTRUCTOR` (function): The constructor for the payload schema
+  (e.g., `#'make-warp-ping-payload`).
+- `&rest ARGS-PLIST` (plist): A property list of arguments for the
+  payload, passed directly to `ARGS-CONSTRUCTOR`.
 
 Returns:
-- (integer): `n` clamped to `[-2^31, 2^31 - 1]`."
-  (max -2147483648 (min 2147483647 n)))
-
-(defun warp-protobuf--clamp-uint32 (n)
-  "Clamp N to 32-bit unsigned integer range.
-
-Arguments:
-- `n` (integer): The integer to clamp.
-
-Returns:
-- (integer): `n` clamped to `[0, 2^32 - 1]`."
-  (max 0 (min 4294967295 n)))
-
-(defun warp-protobuf--clamp-int64 (n)
-  "Clamp N to 64-bit signed integer range.
-
-Arguments:
-- `n` (integer): The integer to clamp.
-
-Returns:
-- (integer): `n` clamped to `[-2^63, 2^63 - 1]`."
-  (max -9223372036854775808 (min 9223372036854775807 n)))
-
-(defun warp-protobuf--clamp-uint64 (n)
-  "Clamp N to 64-bit unsigned integer range.
-
-Arguments:
-- `n` (integer): The integer to clamp.
-
-Returns:
-- (integer): `n` clamped to `[0, 2^64 - 1]`."
-  (max 0 (min 18446744073709551615 n)))
+- (warp-rpc-command): A new, fully-formed RPC command object, ready to
+  be included in a `warp-rpc-message`."
+  (let ((payload (apply args-constructor args-plist)))
+    (make-warp-rpc-command :name name :args payload)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Varint Encoding/Decoding
+;;; Public API
 
-(defun warp-protobuf-encode-varint (n)
-  "Encode integer N as a Protocol Buffers varint.
-A varint is a compact encoding for non-negative integers, where smaller
-numbers take fewer bytes.
+;;;###autoload
+(cl-defun warp:protocol-client-create (&key rpc-system)
+  "Creates a new `warp-protocol-client` component.
+This factory function should be used within a `warp:defcomponent`
+definition.
 
 Arguments:
-- `n` (integer): The non-negative integer to encode.
+- `:rpc-system` (warp-rpc-system): The `rpc-system` component that
+  this client will use for sending all requests.
 
 Returns:
-- (string): A unibyte string representing the varint encoding.
+- (warp-protocol-client): A new protocol client instance."
+  (%%make-protocol-client :rpc-system rpc-system))
 
-Signals:
-- `warp-protobuf-encode-error`: If `n` is negative or not an integer."
-  (unless (and (integerp n) (>= n 0))
-    (signal 'warp-protobuf-encode-error
-            (list (warp:error! :type 'warp-protobuf-encode-error
-                               :message "Varint must be a non-negative integer"
-                               :details `(:value ,n)))))
-  (if (< n 128)
-      (string n)
-    (let ((bytes '()))
-      ;; Each byte stores 7 bits of data. The most significant bit (MSB)
-      ;; is set to 1 if there are more bytes to follow.
-      (while (>= n 128)
-        (push (logior (logand n #x7F) #x80) bytes)
-        (setq n (lsh n -7)))
-      (push n bytes)
-      (apply #'unibyte-string (nreverse bytes)))))
-
-(defun warp-protobuf-decode-varint (data &optional offset)
-  "Decode a varint from DATA starting at OFFSET.
-Reads bytes from `DATA` until a byte without the most significant bit
-(MSB) set is encountered, accumulating the value.
+;;;###autoload
+(cl-defun warp:protocol-send-worker-ready
+    (rpc-system connection worker-id rank status leader-id
+                &key launch-id
+                challenge-token
+                signature
+                public-key
+                inbox-address
+                (expect-response t)
+                origin-instance-id
+                pool-name)
+  "Sends a `:worker-ready` notification from a worker to the leader.
+This is the initial handshake RPC used by a worker to announce its
+presence and status to the control plane, and perform a secure challenge.
 
 Arguments:
-- `data` (string): The unibyte string containing the varint.
-- `offset` (integer, optional): The starting offset in `data`. Defaults to 0.
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system managing the request.
+- `CONNECTION` (t): The active `warp-transport` connection to the leader.
+- `WORKER-ID` (string): The unique identifier of the worker.
+- `RANK` (integer): The worker's assigned rank.
+- `STATUS` (keyword): The worker's current status (e.g., `:starting`).
+- `LEADER-ID` (string): The ID of the leader node to send the message to.
+- `:launch-id` (string, optional): A one-time ID for this launch, for security.
+- `:challenge-token` (string, optional): The cryptographic challenge token.
+- `:signature` (string, optional): The worker's digital signature over the token.
+- `:public-key` (string, optional): The worker's public key for verification.
+- `:inbox-address` (string, optional): The IPC address the worker is listening on.
+- `:pool-name` (string, optional): The name of the worker pool this worker belongs to.
+- `:expect-response` (boolean, optional): Whether a response is expected.
+- `:origin-instance-id` (string, optional): ID of the component system instance.
 
 Returns:
-- (cons `(value . new-offset)` or nil): A cons cell where `value` is the
-  decoded integer and `new-offset` is the position after the varint.
-  Returns `nil` if `data` is too short or malformed.
+- (loom-promise or nil): A promise for the response if `expect-response`
+  is `t`, otherwise `nil`."
+  (let ((cmd (warp-protocol--make-command
+              :worker-ready #'make-warp-worker-ready-payload
+              :worker-id worker-id :rank rank :status status
+              :launch-id launch-id
+              :leader-challenge-token challenge-token
+              :worker-signature signature
+              :worker-public-key public-key
+              :inbox-address inbox-address
+              :pool-name pool-name)))
+    (warp:rpc-request rpc-system connection worker-id leader-id cmd
+                      :expect-response expect-response
+                      :origin-instance-id origin-instance-id)))
 
-Signals:
-- `warp-protobuf-decode-error`: If the varint is too long (would exceed
-  64 bits)."
-  (setq offset (or offset 0))
-  (let ((value 0)
-        (shift 0)
-        (pos offset))
-    (while (< pos (length data))
-      (let ((byte (aref data pos)))
-        (setq value (logior value (lsh (logand byte #x7F) shift)))
-        (cl-incf pos)
-        ;; The MSB of the last byte in a varint is 0.
-        (when (zerop (logand byte #x80))
-          (return (cons value pos)))
-        (cl-incf shift 7)
-        ;; A varint should not be longer than 10 bytes (for a 64-bit number).
-        (when (> shift 63)
-          (signal 'warp-protobuf-decode-error
-                  (list (warp:error! :type 'warp-protobuf-decode-error
-                                     :message "Varint is too long (exceeds 64 bits)"))))))
-    nil))
-
-(defun warp-protobuf-encode-zigzag32 (n)
-  "Encode signed 32-bit integer N using ZigZag encoding.
-ZigZag encoding maps signed integers to unsigned integers such that
-small negative numbers are mapped to small unsigned numbers, which is
-efficient for varint encoding.
+;;;###autoload
+(cl-defun warp:protocol-send-heartbeat
+    (rpc-system connection worker-id status services leader-id
+                &key metrics (expect-response nil) origin-instance-id) ;; Added metrics, public-key was removed.
+  "Sends a periodic `:heartbeat` from a worker to the leader.
+Heartbeats are used to report the worker's liveness and current metrics.
 
 Arguments:
-- `n` (integer): The signed 32-bit integer to encode.
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system managing the request.
+- `CONNECTION` (t): The active `warp-transport` connection to the leader.
+- `WORKER-ID` (string): The ID of the worker sending the heartbeat.
+- `STATUS` (keyword): The worker's current operational status.
+- `SERVICES` (list): A list describing services hosted by the worker.
+- `LEADER-ID` (string): The ID of the leader node to send the message to.
+- `:metrics` (bytes): Serialized `warp-worker-metrics` data.
+- `:expect-response` (boolean, optional): Whether a response is expected.
+- `:origin-instance-id` (string, optional): ID of the component system instance.
 
 Returns:
-- (string): A unibyte string representing the ZigZag varint encoding."
-  (setq n (warp-protobuf--clamp-int32 n))
-  (warp-protobuf-encode-varint
-   (logxor (lsh n 1) (lsh n -31))))
+- (loom-promise or nil): A promise for the response if `expect-response`
+  is `t`, otherwise `nil`."
+  (let ((cmd (warp-protocol--make-command
+              :heartbeat #'make-warp-worker-heartbeat-payload
+              :worker-id worker-id :status status :services services :metrics metrics)))
+    (warp:rpc-request rpc-system connection worker-id leader-id cmd
+                      :expect-response expect-response
+                      :origin-instance-id origin-instance-id)))
 
-(defun warp-protobuf-decode-zigzag32 (data &optional offset)
-  "Decode ZigZag encoded 32-bit integer from DATA.
+;;;###autoload
+(cl-defun warp:protocol-ping (rpc-system
+                              connection
+                              sender-id
+                              recipient-id
+                              &key (expect-response t)
+                              origin-instance-id)
+  "Sends a `:ping` RPC to check liveness between two nodes.
+This is a basic liveness probe or round-trip time measurement.
 
 Arguments:
-- `data` (string): The unibyte string containing the ZigZag varint.
-- `offset` (integer, optional): The starting offset in `data`. Defaults to 0.
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system managing the request.
+- `CONNECTION` (t): The `warp-transport` connection to the target node.
+- `SENDER-ID` (string): The unique ID of the node sending the ping.
+- `RECIPIENT-ID` (string): The unique ID of the node being pinged.
+- `:expect-response` (boolean, optional): Whether a response is expected.
+- `:origin-instance-id` (string, optional): ID of the component system instance.
 
 Returns:
-- (cons `(value . new-offset)` or nil): A cons cell where `value` is the
-  decoded signed 32-bit integer and `new-offset` is the position after.
-  Returns `nil` if decoding fails."
-  (when-let ((result (warp-protobuf-decode-varint data offset)))
-    (let* ((value (car result))
-           ;; Reverse the ZigZag mapping.
-           (decoded (logxor (lsh value -1) (- (logand value 1)))))
-      (cons (warp-protobuf--clamp-int32 decoded)
-            (cdr result)))))
+- (loom-promise or nil): A promise for the response (e.g., \"pong\") if
+  `expect-response` is `t`, otherwise `nil`."
+  (let ((cmd (warp-protocol--make-command
+              :ping #'make-warp-ping-payload
+              :message "ping")))
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response expect-response
+                      :origin-instance-id origin-instance-id)))
 
-(defun warp-protobuf-encode-zigzag64 (n)
-  "Encode signed 64-bit integer N using ZigZag encoding.
+;;;###autoload
+(cl-defun warp:protocol-request-map-chunk (client
+                                            connection
+                                            control-plane-id
+                                            worker-id
+                                            function-form
+                                            chunk-data
+                                            &key (expect-response t)
+                                            origin-instance-id)
+  "Requests a worker to evaluate a map function over a chunk of data.
+This RPC is part of a distributed map-reduce pattern, allowing a leader
+to distribute computation to workers.
 
 Arguments:
-- `n` (integer): The signed 64-bit integer to encode.
+- `CLIENT` (warp-protocol-client): The protocol client instance.
+- `CONNECTION` (t): The connection to the target worker.
+- `CONTROL-PLANE-ID` (string): The leader's unique ID (acting as the sender).
+- `WORKER-ID` (string): The target worker's unique ID.
+- `FUNCTION-FORM` (form): S-expression that evaluates to the map function.
+- `CHUNK-DATA` (list): The list of data items for the worker to process.
+- `:expect-response` (boolean, optional): Whether a response is expected.
+- `:origin-instance-id` (string, optional): ID of the component system instance.
 
 Returns:
-- (string): A unibyte string representing the ZigZag varint encoding."
-  (setq n (warp-protobuf--clamp-int64 n))
-  (warp-protobuf-encode-varint
-   (logxor (lsh n 1) (lsh n -63))))
+- (loom-promise or nil): A promise for the `warp-cluster-map-result` if
+  `expect-response` is `t`, otherwise `nil`."
+  (let ((cmd (warp-protocol--make-command
+              :evaluate-map-chunk #'make-warp-cluster-map-payload
+              :function-form function-form :chunk-data chunk-data)))
+    (warp:rpc-request (warp-protocol-client-rpc-system client)
+                      connection control-plane-id worker-id cmd
+                      :expect-response expect-response
+                      :origin-instance-id origin-instance-id)))
 
-(defun warp-protobuf-decode-zigzag64 (data &optional offset)
-  "Decode ZigZag encoded 64-bit integer from DATA.
+;;;###autoload
+(cl-defun warp:protocol-request-provision (client
+                                            connection
+                                            worker-id
+                                            leader-id
+                                            current-version
+                                            provision-type
+                                            &key (expect-response t)
+                                            origin-instance-id)
+  "Sends a `:provision-request` RPC from a worker to the leader.
+Workers use this to fetch their configuration or other provisioning data.
 
 Arguments:
-- `data` (string): The unibyte string containing the ZigZag varint.
-- `offset` (integer, optional): The starting offset in `data`. Defaults to 0.
+- `CLIENT` (warp-protocol-client): The protocol client instance.
+- `CONNECTION` (t): The active `warp-transport` connection to the leader.
+- `WORKER-ID` (string): The ID of the worker requesting the provision.
+- `LEADER-ID` (string): The ID of the leader node to send the message to.
+- `CURRENT-VERSION` (string): The version of the provision the worker has.
+- `PROVISION-TYPE` (keyword): The type of provision requested.
+- `:expect-response` (boolean, optional): Whether a response is expected.
+- `:origin-instance-id` (string, optional): ID of the component system instance.
 
 Returns:
-- (cons `(value . new-offset)` or nil): A cons cell where `value` is the
-  decoded signed 64-bit integer and `new-offset` is the position after.
-  Returns `nil` if decoding fails."
-  (when-let ((result (warp-protobuf-decode-varint data offset)))
-    (let* ((value (car result))
-           ;; Reverse the ZigZag mapping.
-           (decoded (logxor (lsh value -1) (- (logand value 1)))))
-      (cons (warp-protobuf--clamp-int64 decoded)
-            (cdr result)))))
+- (loom-promise or nil): A promise for the `warp-provision-response-payload`
+  if `expect-response` is `t`, otherwise `nil`."
+  (let ((cmd (warp-protocol--make-command
+              :get-provision #'make-warp-provision-request-payload
+              :worker-id worker-id
+              :current-version current-version
+              :provision-type provision-type)))
+    (warp:rpc-request (warp-protocol-client-rpc-system client)
+                      connection worker-id leader-id cmd
+                      :expect-response expect-response
+                      :origin-instance-id origin-instance-id)))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Fixed-Size Encoding/Decoding
-
-(defun warp-protobuf-encode-fixed32 (n)
-  "Encode 32-bit integer N as little-endian fixed32.
-Used for `fixed32`, `sfixed32`, and `float` types.
+;;;###autoload
+(cl-defun warp:protocol-publish-provision (rpc-system
+                                            connection
+                                            sender-id
+                                            recipient-id
+                                            version
+                                            provision-obj
+                                            provision-type
+                                            &key target-ids
+                                            (expect-response nil)
+                                            origin-instance-id)
+  "Sends a `:provision-update` event from the leader to workers.
+The leader uses this to push configuration updates to workers.
 
 Arguments:
-- `n` (integer): The unsigned 32-bit integer to encode.
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system managing the request.
+- `CONNECTION` (t): The `warp-transport` connection to the target node.
+- `SENDER-ID` (string): ID of the leader sending the update.
+- `RECIPIENT-ID` (string): ID of the target worker (or \"cluster\").
+- `VERSION` (string): The new version identifier of the provision.
+- `PROVISION-OBJ` (any): The new provision object.
+- `PROVISION-TYPE` (keyword): The type of provision being updated.
+- `:target-ids` (list, optional): Optional list of specific worker IDs to target.
+- `:expect-response` (boolean, optional): Whether a response is expected.
+- `:origin-instance-id` (string, optional): ID of the component system instance.
 
 Returns:
-- (string): A unibyte string representing the 4-byte fixed32 encoding."
-  (setq n (warp-protobuf--clamp-uint32 n))
-  (bindat-pack '((v u32)) `((v . ,n))))
+- (loom-promise or nil): A promise for the response if `expect-response`
+  is `t`, otherwise `nil`."
+  (let ((cmd (warp-protocol--make-command
+              :provision-update #'make-warp-provision-update-payload
+              :version version
+              :provision provision-obj
+              :provision-type provision-type
+              :target-ids target-ids)))
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response expect-response
+                      :origin-instance-id origin-instance-id)))
 
-(defun warp-protobuf-decode-fixed32 (data &optional offset)
-  "Decode little-endian fixed32 from DATA at OFFSET.
+;;;###autoload
+(cl-defun warp:protocol-send-distributed-event
+    (rpc-system connection sender-id recipient-id event &key origin-instance-id)
+  "Sends a distributed event to a target event broker worker.
+This is used by event systems to propagate events with `:cluster` or
+`:global` scope.
 
 Arguments:
-- `data` (string): The unibyte string containing the fixed32 data.
-- `offset` (integer, optional): The starting offset in `data`. Defaults to 0.
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system.
+- `CONNECTION` (t): The `warp-transport` connection to the broker.
+- `SENDER-ID` (string): The ID of the event's original emitter.
+- `RECIPIENT-ID` (string): The ID of the event broker (target).
+- `EVENT` (warp-event): The `warp-event` object to propagate.
+- `:origin-instance-id` (string, optional): ID of the component system instance.
 
 Returns:
-- (cons `(value . new-offset)` or nil): A cons cell where `value` is the
-  decoded integer and `new-offset` is the position after the fixed32.
-  Returns `nil` if `data` is too short."
-  (setq offset (or offset 0))
-  (when (>= (length data) (+ offset 4))
-    (let ((result (bindat-unpack '((v u32))
-                                 (substring data offset (+ offset 4)))))
-      (cons (bindat-get-field result 'v) (+ offset 4)))))
+- (loom-promise): A promise that resolves when the event is sent to the broker."
+  (let ((cmd (warp-protocol--make-command
+              :propagate-event #'make-warp-propagate-event-payload
+              :event event)))
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response nil
+                      :origin-instance-id origin-instance-id)))
 
-(defun warp-protobuf-encode-fixed64 (n)
-  "Encode 64-bit integer N as little-endian fixed64.
-Used for `fixed64`, `sfixed64`, and `double` types.
+;;;###autoload
+(cl-defun warp:protocol-get-coordinator-leader (rpc-system 
+                                                connection 
+                                                sender-id 
+                                                recipient-id 
+                                                &key origin-instance-id)
+  "Requests the current leader's address from a coordinator peer.
+This RPC is used by workers to dynamically discover the active leader
+for the control plane.
 
 Arguments:
-- `n` (integer): The unsigned 64-bit integer to encode.
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system.
+- `CONNECTION` (t): The `warp-transport` connection to the coordinator peer.
+- `SENDER-ID` (string): The ID of the requesting node (e.g., worker ID).
+- `RECIPIENT-ID` (string): The ID of the coordinator peer to query.
+- `:origin-instance-id` (string, optional): ID of the component system instance.
 
 Returns:
-- (string): A unibyte string representing the 8-byte fixed64 encoding."
-  (setq n (warp-protobuf--clamp-uint64 n))
-  (bindat-pack '((v u64)) `((v . ,n))))
+- (loom-promise): A promise that resolves with a `warp-coordinator-get-leader-response`
+  containing the leader's ID and address, or rejects on error."
+  (let ((cmd (make-warp-rpc-command :name :get-coordinator-leader))) ;; No args needed for this request
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response t
+                      :origin-instance-id origin-instance-id)))
 
-(defun warp-protobuf-decode-fixed64 (data &optional offset)
-  "Decode little-endian fixed64 from DATA at OFFSET.
+;;;###autoload
+(cl-defun warp:protocol-coordinator-request-vote (rpc-system
+                                                  connection
+                                                  sender-id
+                                                  recipient-id
+                                                  candidate-id
+                                                  term
+                                                  last-log-index
+                                                  last-log-term
+                                                  &key origin-instance-id)
+  "Sends a `RequestVote` RPC in Raft-like consensus.
 
 Arguments:
-- `data` (string): The unibyte string containing the fixed64 data.
-- `offset` (integer, optional): The starting offset in `data`. Defaults to 0.
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system.
+- `CONNECTION` (t): The `warp-transport` connection to the peer.
+- `SENDER-ID` (string): The ID of the candidate sending the request.
+- `RECIPIENT-ID` (string): The ID of the peer to request vote from.
+- `CANDIDATE-ID` (string): The ID of the candidate requesting vote.
+- `TERM` (integer): Candidate's current term.
+- `LAST-LOG-INDEX` (integer): Index of candidate's last log entry.
+- `LAST-LOG-TERM` (integer): Term of candidate's last log entry.
+- `:origin-instance-id` (string, optional): ID of the component system instance.
 
 Returns:
-- (cons `(value . new-offset)` or nil): A cons cell where `value` is the
-  decoded integer and `new-offset` is the position after the fixed64.
-  Returns `nil` if `data` is too short."
-  (setq offset (or offset 0))
-  (when (>= (length data) (+ offset 8))
-    (let ((result (bindat-unpack '((v u64))
-                                 (substring data offset (+ offset 8)))))
-      (cons (bindat-get-field result 'v) (+ offset 8)))))
+- (loom-promise): A promise that resolves with the response payload."
+  (let ((cmd (warp-protocol--make-command
+              :coordinator-request-vote #'make-warp-coordinator-request-vote-payload
+              :term term :candidate-id candidate-id
+              :last-log-index last-log-index :last-log-term last-log-term)))
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response t
+                      :origin-instance-id origin-instance-id)))
 
-(defun warp-protobuf-encode-float (f)
-  "Encode float F as IEEE 754 binary32.
+;;;###autoload
+(cl-defun warp:protocol-coordinator-append-entries (rpc-system
+                                                    connection
+                                                    sender-id
+                                                    recipient-id
+                                                    term
+                                                    leader-id
+                                                    prev-log-index
+                                                    prev-log-term
+                                                    entries
+                                                    leader-commit
+                                                    &key origin-instance-id)
+  "Sends an `AppendEntries` RPC (heartbeats and log replication) in Raft-like consensus.
 
 Arguments:
-- `f` (float): The float number to encode.
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system.
+- `CONNECTION` (t): The `warp-transport` connection to the peer.
+- `SENDER-ID` (string): The ID of the leader sending the request.
+- `RECIPIENT-ID` (string): The ID of the peer.
+- `TERM` (integer): Leader's current term.
+- `LEADER-ID` (string): Leader's ID.
+- `PREV-LOG-INDEX` (integer): Index of log entry immediately preceding new ones.
+- `PREV-LOG-TERM` (integer): Term of `prev-log-index` entry.
+- `ENTRIES` (list): Log entries to append (empty for heartbeats).
+- `LEADER-COMMIT` (integer): Leader's commit index.
+- `:origin-instance-id` (string, optional): ID of the component system instance.
 
 Returns:
-- (string): A unibyte string representing the 4-byte float encoding."
-  (bindat-pack '((v f32)) `((v . ,f))))
+- (loom-promise): A promise that resolves with the response payload."
+  (let ((cmd (warp-protocol--make-command
+              :coordinator-append-entries #'make-warp-coordinator-append-entries-payload
+              :term term :leader-id leader-id
+              :prev-log-index prev-log-index :prev-log-term prev-log-term
+              :entries entries :leader-commit leader-commit)))
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response t
+                      :origin-instance-id origin-instance-id)))
 
-(defun warp-protobuf-decode-float (data &optional offset)
-  "Decode IEEE 754 binary32 from DATA.
+;;;###autoload
+(cl-defun warp:protocol-coordinator-acquire-lock (rpc-system
+                                                  connection
+                                                  sender-id
+                                                  recipient-id
+                                                  lock-name
+                                                  holder-id
+                                                  expiry-time
+                                                  &key origin-instance-id)
+  "Sends an `acquire-lock` RPC to a coordinator.
 
 Arguments:
-- `data` (string): The unibyte string containing the float data.
-- `offset` (integer, optional): The starting offset in `data`. Defaults to 0.
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system.
+- `CONNECTION` (t): The `warp-transport` connection to the coordinator.
+- `SENDER-ID` (string): The ID of the client sending the request.
+- `RECIPIENT-ID` (string): The ID of the target coordinator.
+- `LOCK-NAME` (string): The name of the lock.
+- `HOLDER-ID` (string): The ID of the client trying to acquire.
+- `EXPIRY-TIME` (float): Desired expiry for acquisition.
+- `:origin-instance-id` (string, optional): ID of the component system instance.
 
 Returns:
-- (cons `(value . new-offset)` or nil): A cons cell where `value` is the
-  decoded float and `new-offset` is the position after.
-  Returns `nil` if `data` is too short."
-  (setq offset (or offset 0))
-  (when (>= (length data) (+ offset 4))
-    (let ((result (bindat-unpack '((v f32))
-                                 (substring data offset (+ offset 4)))))
-      (cons (bindat-get-field result 'v) (+ offset 4)))))
+- (loom-promise): A promise that resolves with the response payload."
+  (let ((cmd (warp-protocol--make-command
+              :coordinator-acquire-lock #'make-warp-coordinator-lock-request-payload
+              :lock-name lock-name :holder-id holder-id :expiry-time expiry-time)))
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response t
+                      :origin-instance-id origin-instance-id)))
 
-(defun warp-protobuf-encode-double (d)
-  "Encode double D as IEEE 754 binary64.
+;;;###autoload
+(cl-defun warp:protocol-coordinator-release-lock (rpc-system
+                                                  connection
+                                                  sender-id
+                                                  recipient-id
+                                                  lock-name
+                                                  holder-id
+                                                  &key origin-instance-id)
+  "Sends a `release-lock` RPC to a coordinator.
 
 Arguments:
-- `d` (float): The double number to encode.
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system.
+- `CONNECTION` (t): The `warp-transport` connection to the coordinator.
+- `SENDER-ID` (string): The ID of the client sending the request.
+- `RECIPIENT-ID` (string): The ID of the target coordinator.
+- `LOCK-NAME` (string): The name of the lock.
+- `HOLDER-ID` (string): The ID of the client trying to release.
+- `:origin-instance-id` (string, optional): ID of the component system instance.
 
 Returns:
-- (string): A unibyte string representing the 8-byte double encoding."
-  (bindat-pack '((v f64)) `((v . ,d))))
+- (loom-promise): A promise that resolves with the response payload."
+  (let ((cmd (warp-protocol--make-command
+              :coordinator-release-lock #'make-warp-coordinator-lock-request-payload
+              :lock-name lock-name :holder-id holder-id)))
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response t
+                      :origin-instance-id origin-instance-id)))
 
-(defun warp-protobuf-decode-double (data &optional offset)
-  "Decode IEEE 754 binary64 from DATA.
+;;;###autoload
+(cl-defun warp:protocol-coordinator-barrier-increment (rpc-system
+                                                       connection
+                                                       sender-id
+                                                       recipient-id
+                                                       barrier-name
+                                                       participant-id
+                                                       total-participants
+                                                       &key origin-instance-id)
+  "Sends a `barrier-increment` RPC to a coordinator.
 
 Arguments:
-- `data` (string): The unibyte string containing the double data.
-- `offset` (integer, optional): The starting offset in `data`. Defaults to 0.
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system.
+- `CONNECTION` (t): The `warp-transport` connection to the coordinator.
+- `SENDER-ID` (string): The ID of the participant.
+- `RECIPIENT-ID` (string): The ID of the target coordinator.
+- `BARRIER-NAME` (string): The name of the barrier.
+- `PARTICIPANT-ID` (string): The ID of the participant.
+- `TOTAL-PARTICIPANTS` (integer): The target count for the barrier.
+- `:origin-instance-id` (string, optional): ID of the component system instance.
 
 Returns:
-- (cons `(value . new-offset)` or nil): A cons cell where `value` is the
-  decoded double and `new-offset` is the position after.
-  Returns `nil` if `data` is too short."
-  (setq offset (or offset 0))
-  (when (>= (length data) (+ offset 8))
-    (let ((result (bindat-unpack '((v f64))
-                                 (substring data offset (+ offset 8)))))
-      (cons (bindat-get-field result 'v) (+ offset 8)))))
+- (loom-promise): A promise that resolves with the response payload."
+  (let ((cmd (warp-protocol--make-command
+              :coordinator-barrier-increment #'make-warp-coordinator-barrier-increment-payload
+              :barrier-name barrier-name :participant-id participant-id
+              :total-participants total-participants)))
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response t
+                      :origin-instance-id origin-instance-id)))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Length-Delimited Encoding/Decoding
-
-(defun warp-protobuf-encode-length-delimited (data)
-  "Encode DATA with a varint length prefix.
-Used for strings, bytes, embedded messages, and packed repeated fields.
+;;;###autoload
+(cl-defun warp:protocol-coordinator-propose-change
+    (rpc-system connection sender-id recipient-id key value &key origin-instance-id)
+  "Sends a `propose-change` RPC to a coordinator leader.
 
 Arguments:
-- `data` (string): The unibyte string (or raw bytes) to encode.
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system.
+- `CONNECTION` (t): The `warp-transport` connection to the coordinator.
+- `SENDER-ID` (string): The ID of the client proposing the change.
+- `RECIPIENT-ID` (string): The ID of the target coordinator (leader).
+- `KEY` (list): The state path to change.
+- `VALUE` (t): The new value for the state path.
+- `:origin-instance-id` (string, optional): ID of the component system instance.
 
 Returns:
-- (string): A unibyte string with the length prefix followed by `data`."
-  (let ((data-bytes (warp-protobuf--ensure-unibyte data)))
-    (concat (warp-protobuf-encode-varint (length data-bytes)) data-bytes)))
+- (loom-promise): A promise that resolves with the response payload."
+  (let ((cmd (warp-protocol--make-command
+              :coordinator-propose-change #'make-warp-coordinator-propose-change-payload
+              :key key :value value)))
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response t
+                      :origin-instance-id origin-instance-id)))
 
-(defun warp-protobuf-decode-length-delimited (data &optional offset)
-  "Decodes a length-delimited field from DATA at OFFSET.
-First decodes the varint length prefix, then extracts the specified
-number of bytes.
+;;;###autoload
+(cl-defun warp:protocol-get-all-active-workers (rpc-system
+                                                connection
+                                                sender-id
+                                                recipient-id
+                                                &key origin-instance-id)
+  "Sends a `:get-all-active-workers` RPC to the master.
 
 Arguments:
-- `data` (string): The unibyte string containing the length-delimited data.
-- `offset` (integer, optional): The starting offset in `data`. Defaults to 0.
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system managing the request.
+- `CONNECTION` (t): The `warp-transport` connection to the master.
+- `SENDER-ID` (string): The ID of the client sending the request.
+- `RECIPIENT-ID` (string): The ID of the master.
+- `:origin-instance-id` (string, optional): The ID of the component system
+  instance originating this RPC. Crucial for remote promise resolution.
 
 Returns:
-- (cons `(value . new-offset)` or nil): A cons cell where `value` is the
-  decoded substring and `new-offset` is the position after the field.
-  Returns `nil` if `data` is too short or malformed."
-  (setq offset (or offset 0))
-  (when-let ((len-result (warp-protobuf-decode-varint data offset)))
-    (let ((length (car len-result))
-          (data-start (cdr len-result)))
-      (when (<= (+ data-start length) (length data))
-        (cons (substring data data-start (+ data-start length))
-              (+ data-start length))))))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Field Header Encoding/Decoding
-
-(defun warp-protobuf-encode-field-header (field-number wire-type)
-  "Encode field header with FIELD-NUMBER and WIRE-TYPE.
-The header is a varint that combines the field number and wire type.
-
-Arguments:
-- `field-number` (integer): The unique number of the field in the schema.
-- `wire-type` (integer): The wire type of the field (0, 1, 2, or 5).
-
-Returns:
-- (string): A unibyte string representing the varint encoded header."
-  (warp-protobuf-encode-varint (logior (lsh field-number 3) wire-type)))
-
-(defun warp-protobuf-decode-field-header (data &optional offset)
-  "Decode field header from DATA at OFFSET.
-Extracts the field number and wire type from a varint header.
-
-Arguments:
-- `data` (string): The unibyte string containing the header.
-- `offset` (integer, optional): The starting offset in `data`. Defaults to 0.
-
-Returns:
-- (cons `((field-number . wire-type) . new-offset)` or nil): A cons cell
-  where `(field-number . wire-type)` is a cons representing the decoded
-  header, and `new-offset` is the position after the header.
-  Returns `nil` if decoding fails."
-  (setq offset (or offset 0))
-  (when-let ((result (warp-protobuf-decode-varint data offset)))
-    (let ((header (car result)))
-      (cons (cons (lsh header -3) (logand header 7)) (cdr result)))))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Enum Support
-
-(defun warp-protobuf-enum-to-number (enum-name value)
-  "Convert enum VALUE (symbol) to its numeric representation using
-ENUM-NAME definition.
-
-Arguments:
-- `enum-name` (symbol): The name of the registered enum schema.
-- `value` (symbol or integer): The enum value to convert. Can be a symbol
-  or already a number.
-
-Returns:
-- (integer): The numeric representation of the enum value.
-
-Signals:
-- `warp-protobuf-schema-error`: If `enum-name` is not a registered enum.
-- `warp-protobuf-validation-error`: If `value` is not a valid symbol for
-  the given enum."
-  (if-let ((enum-def (warp-protobuf-get-enum enum-name)))
-      (or (cdr (assq value enum-def))
-          (signal 'warp-protobuf-validation-error
-                  (list (warp:error! :type 'warp-protobuf-validation-error
-                                     :message "Unknown enum value"
-                                     :details `(:enum ,enum-name :value ,value)))))
-    (signal 'warp-protobuf-schema-error
-            (list (warp:error! :type 'warp-protobuf-schema-error
-                               :message "Unknown enum"
-                               :details `(:enum ,enum-name))))))
-
-(defun warp-protobuf-number-to-enum (enum-name number)
-  "Convert NUMBER to its symbolic enum value using ENUM-NAME definition.
-If `number` does not map to a known symbol in the enum, the `number`
-itself is returned (Protobuf behavior for unknown enum values).
-
-Arguments:
-- `enum-name` (symbol): The name of the registered enum schema.
-- `number` (integer): The numeric enum value to convert.
-
-Returns:
-- (symbol or integer): The symbolic enum value, or the original `number`
-  if no mapping is found.
-
-Signals:
-- `warp-protobuf-schema-error`: If `enum-name` is not a registered enum."
-  (if-let ((enum-def (warp-protobuf-get-enum enum-name)))
-      (or (car (rassq number enum-def))
-          number)
-    (signal 'warp-protobuf-schema-error
-            (list (warp:error! :type 'warp-protobuf-schema-error
-                               :message "Unknown enum"
-                               :details `(:enum ,enum-name))))))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Map Support
-
-(defun warp-protobuf-encode-map-entry
-    (key-type value-type key value value-schema)
-  "Encode a single map entry (key-value pair) as a Protobuf message.
-Map entries are internally treated as a message with field number 1 for
-the key and field number 2 for the value.
-
-Arguments:
-- `key-type` (keyword): The Protobuf type of the map key.
-- `value-type` (keyword): The Protobuf type of the map value.
-- `key` (any): The map key value.
-- `value` (any): The map value.
-- `value-schema` (symbol or list): The schema for the value if `value-type`
-  is `:message`.
-
-Returns:
-- (string): A unibyte string representing the encoded map entry message."
-  (let ((entry-data ""))
-    ;; Encode key (field number 1)
-    (setq entry-data
-          (concat entry-data
-                  (warp-protobuf-encode-field-header
-                   1 (cdr (assq key-type warp-protobuf--type-wire-map)))
-                  (warp-protobuf-encode-value key-type key)))
-    ;; Encode value (field number 2)
-    (when value
-      (setq entry-data
-            (concat entry-data
-                    (warp-protobuf-encode-field-header
-                     2 (cdr (assq value-type warp-protobuf--type-wire-map)))
-                    (if (eq value-type :message)
-                        (warp-protobuf-encode-value
-                         value-type value :schema value-schema)
-                      (warp-protobuf-encode-value value-type value)))))
-    entry-data))
-
-(defun warp-protobuf-decode-map-entry
-    (key-type value-type data value-schema)
-  "Decode a single map entry from DATA.
-Parses the internal message format of a map entry to extract the key
-and value.
-
-Arguments:
-- `key-type` (keyword): The Protobuf type of the map key.
-- `value-type` (keyword): The Protobuf type of the map value.
-- `data` (string): The unibyte string containing the encoded map entry.
-- `value-schema` (symbol or list): The schema for the value if `value-type`
-  is `:message`.
-
-Returns:
-- (cons `(key . value)`): A cons cell representing the decoded map entry."
-  (let ((offset 0) key value)
-    (while (< offset (length data))
-      (when-let ((header-result
-                  (warp-protobuf-decode-field-header data offset)))
-        (let* ((field-number (caar header-result))
-               (field-offset (cdr header-result)))
-          (cond
-            ((= field-number 1)
-             (when-let ((key-result
-                         (warp-protobuf-decode-value key-type data
-                                                     field-offset)))
-               (setq key (car key-result)
-                     offset (cdr key-result))))
-            ((= field-number 2)
-             (when-let ((value-result
-                         (if (eq value-type :message)
-                             (let ((msg-result (warp-protobuf-decode-length-delimited
-                                                 data field-offset)))
-                               (when msg-result
-                                 (cons (warp-protobuf-decode-message
-                                        value-schema (car msg-result))
-                                       (cdr msg-result))))
-                           (warp-protobuf-decode-value
-                            value-type data field-offset))))
-               (setq value (car value-result)
-                     offset (cdr value-result))))
-            (t
-             (setq offset (length data)))))))
-    (cons key value)))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Any Type Support
-
-(defun warp-protobuf-encode-any (type-url message-data)
-  "Encode Any type with TYPE-URL and MESSAGE-DATA.
-The `Any` type allows embedding arbitrary Protobuf messages, typically
-defined in other schemas, into a message. It holds `type_url` (string)
-and `value` (bytes).
-
-Arguments:
-- `type-url` (string): A URL that uniquely identifies the type of the
-  embedded message (e.g., \"type.googleapis.com/package.MessageType\").
-- `message-data` (string): The raw binary (unibyte string) of the
-  embedded message.
-
-Returns:
-- (string): A unibyte string representing the encoded `Any` message."
-  (let ((any-message ""))
-    ;; Field 1: type_url (string, length-delimited)
-    (setq any-message
-          (concat any-message
-                  (warp-protobuf-encode-field-header
-                   1 warp-protobuf--wire-length-delimited)
-                  (warp-protobuf-encode-length-delimited
-                   (encode-coding-string type-url 'utf-8-unix t))))
-    ;; Field 2: value (bytes, length-delimited)
-    (setq any-message
-          (concat any-message
-                  (warp-protobuf-encode-field-header
-                   2 warp-protobuf--wire-length-delimited)
-                  (warp-protobuf-encode-length-delimited message-data)))
-    any-message))
-
-(defun warp-protobuf-decode-any (data &optional offset)
-  "Decode Any type from DATA.
-Parses the `type_url` and `value` fields from an encoded `Any` message.
-
-Arguments:
-- `data` (string): The unibyte string containing the encoded `Any` message.
-- `offset` (integer, optional): The starting offset in `data`. Defaults to 0.
-
-Returns:
-- (plist): A plist `(:type-url TYPE-URL :value VALUE)` where `TYPE-URL`
-  is the string type URL and `VALUE` is the raw binary content
-  (unibyte string) of the embedded message. Returns `nil` if decoding
-  fails.
-
-Signals:
-- `warp-protobuf-any-error`: If the decoded `Any` message is missing
-  `type_url` or `value`."
-  (setq offset (or offset 0))
-  (let (type-url value)
-    (while (< offset (length data))
-      (when-let ((header-result
-                  (warp-protobuf-decode-field-header data offset)))
-        (let* ((field-number (caar header-result))
-               (field-offset (cdr header-result)))
-          (cond
-            ((/= field-number 1) (warp:log! :warn "protobuf"
-                                               "Unexpected field number in Any. \
-                                               Expected 1 for type_url, got %S"
-                                               field-number))) ; Log warning
-            ((= field-number 1) ; type_url field
-             (when-let ((url-result
-                         (warp-protobuf-decode-length-delimited data
-                                                                field-offset)))
-               (setq type-url (decode-coding-string (car url-result)
-                                                    'utf-8-unix)
-                     offset (cdr url-result))))
-            ((/= field-number 2) (warp:log! :warn "protobuf"
-                                               "Unexpected field number in Any. \
-                                               Expected 2 for value, got %S"
-                                               field-number))) ; Log warning
-            ((= field-number 2) ; value field
-             (when-let ((value-result
-                         (warp-protobuf-decode-length-delimited data
-                                                                field-offset)))
-               (setq value (car value-result)
-                     offset (cdr value-result))))
-            (t ; Unknown field in Any message, skip
-             (setq offset (length data)))))))
-    (unless (and type-url value)
-      (signal 'warp-protobuf-any-error
-              (list (warp:error! :type 'warp-protobuf-any-error
-                                 :message "Malformed Any message: missing \
-                                             type_url or value"))))
-    (list :type-url type-url :value value)))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Oneof Support
-
-(defun warp-protobuf-validate-oneof (oneof-fields message)
-  "Validate that only one field in ONEOF-FIELDS is set in MESSAGE.
-Protobuf's `oneof` feature allows only one field within a defined group
-to be present in a message. This function enforces that constraint.
-
-Arguments:
-- `oneof-fields` (list): A list of symbols, representing the field names
-  that belong to a single `oneof` group.
-- `message` (plist): The message as a plist.
-
-Returns: `nil`.
-
-Signals:
-- `warp-protobuf-oneof-error`: If more than one field in `oneof-fields`
-  is present in `message`."
-  (let ((set-fields '()))
-    (dolist (field oneof-fields)
-      (let ((keyword (intern (concat ":" (symbol-name field)))))
-        (when (plist-get message keyword)
-          (push field set-fields))))
-    (when (> (length set-fields) 1)
-      (signal 'warp-protobuf-oneof-error
-              (list (warp:error! :type 'warp-protobuf-oneof-error
-                                 :message "Multiple oneof fields set"
-                                 :details `(:fields ,set-fields)))))))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Enhanced Schema Validation
-
-(defun warp-protobuf-validate-schema (schema)
-  "Validate a protobuf SCHEMA definition with enhanced features.
-This function performs comprehensive checks on a schema, ensuring field
-names and numbers are unique, field types and labels are valid, and
-`oneof` and `map` field definitions are correct.
-
-Arguments:
-- `schema` (list): The schema definition list.
-
-Returns: `t` if the schema is valid.
-
-Signals:
-- `warp-protobuf-schema-error`: If any part of the schema definition
-  is invalid or inconsistent."
-  (unless (listp schema)
-    (signal 'warp-protobuf-schema-error
-            (list (warp:error! :type 'warp-protobuf-schema-error
-                               :message "Schema must be a list"))))
-  (let ((seen-numbers (make-hash-table :test 'eq))
-        (seen-names (make-hash-table :test 'eq))
-        (oneof-groups (make-hash-table :test 'eq)))
-    (dolist (field schema)
-      (unless (and (listp field) (>= (length field) 3))
-        (signal 'warp-protobuf-schema-error
-                (list (warp:error! :type 'warp-protobuf-schema-error
-                                   :message "Invalid field definition"
-                                   :details `(:field ,field)))))
-      (let* ((name (nth 0 field))
-             (number (nth 1 field))
-             (type (nth 2 field))
-             (label (nth 3 field))
-             (extra-props (nthcdr 4 field)))
-        (unless (symbolp name)
-          (signal 'warp-protobuf-schema-error
-                  (list (warp:error! :type 'warp-protobuf-schema-error
-                                     :message "Field name must be a symbol"
-                                     :details `(:name ,name)))))
-        (when (gethash name seen-names)
-          (signal 'warp-protobuf-schema-error
-                  (list (warp:error! :type 'warp-protobuf-schema-error
-                                     :message "Duplicate field name"
-                                     :details `(:name ,name)))))
-        (puthash name t seen-names)
-        (unless (and (integerp number) (> number 0) (< number 536870912))
-          (signal 'warp-protobuf-schema-error
-                  (list (warp:error! :type 'warp-protobuf-schema-error
-                                     :message "Invalid field number"
-                                     :details `(:number ,number)))))
-        (when (gethash number seen-numbers)
-          (signal 'warp-protobuf-schema-error
-                  (list (warp:error! :type 'warp-protobuf-schema-error
-                                     :message "Duplicate field number"
-                                     :details `(:number ,number)))))
-        (puthash number t seen-numbers)
-        (cond
-          ((eq type :map)
-           (unless (and (plist-get extra-props :key-type)
-                        (plist-get extra-props :value-type))
-             (signal 'warp-protobuf-schema-error
-                     (list (warp:error! :type 'warp-protobuf-schema-error
-                                        :message "Map field missing :key-type \
-                                         or :value-type"
-                                        :details `(:field ,name))))))
-          ((eq type :oneof)
-           (unless (listp label) ; 'label' actually contains the oneof fields
-             (signal 'warp-protobuf-schema-error
-                     (list (warp:error! :type 'warp-protobuf-schema-error
-                                        :message "Oneof field requires a list \
-                                         of field names"
-                                        :details `(:field ,name)))))
-           (puthash name label oneof-groups))
-          ((eq type :any))
-          ((not (assq type warp-protobuf--type-wire-map))
-           (signal 'warp-protobuf-schema-error
-                   (list (warp:error! :type 'warp-protobuf-schema-error
-                                      :message "Unknown field type"
-                                      :details `(:type ,type))))))
-        ;; Labels are not present for map, oneof, any
-        (unless (memq type '(:map :oneof :any))
-          (unless (memq label '(:required :optional :repeated))
-            (signal 'warp-protobuf-schema-error
-                    (list (warp:error! :type 'warp-protobuf-schema-error
-                                       :message "Invalid field label"
-                                       :details `(:label ,label))))))))
-    ;; Validate oneof group fields don't overlap
-    (let ((all-oneof-fields '()))
-      (maphash (lambda (_group fields)
-                 (dolist (field fields)
-                   (when (memq field all-oneof-fields)
-                     (signal 'warp-protobuf-schema-error
-                             (list (warp:error! :type 'warp-protobuf-schema-error
-                                                :message "Field appears in \
-                                                 multiple oneof groups"
-                                                :details `(:field ,field)))))
-                   (push field all-oneof-fields)))
-               oneof-groups)))
-  t)
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Enhanced Value Encoding/Decoding
-
-(defun warp-protobuf-encode-value (type value &rest extra-args)
-  "Encode VALUE according to TYPE with optional EXTRA-ARGS.
-This is a polymorphic function that dispatches to the correct low-level
-encoding function based on the Protobuf `type`. It handles type-specific
-conversions (e.g., clamping integers, encoding strings to UTF-8).
-
-Arguments:
-- `type` (keyword): The Protobuf field type (e.g., `:int32`, `:string`,
-  `:message`).
-- `value` (any): The Emacs Lisp value to encode.
-- `&rest extra-args` (plist): Optional arguments needed for complex types:
-  - `:enum-name` (symbol): For `:enum` type, the registered enum name.
-  - `:schema` (list): For `:message` type, the schema of the nested message.
-
-Returns:
-- (string): A unibyte string representing the encoded value.
-
-Signals:
-- `warp-protobuf-encode-error`: If `type` is unknown or `value` is
-  malformed for its `type`.
-- `warp-protobuf-validation-error`: For enum conversion errors.
-- `warp-protobuf-any-error`: For malformed `:any` types."
-  (pcase type
-    ((or :int32 :int64 :uint32 :uint64 :bool)
-     (warp-protobuf-encode-varint
-      (pcase type
-        (:int32 (warp-protobuf--clamp-int32 value))
-        (:int64 (warp-protobuf--clamp-int64 value))
-        (:uint32 (warp-protobuf--clamp-uint32 value))
-        (:uint64 (warp-protobuf--clamp-uint64 value))
-        (:bool (if value 1 0))
-        (_ value))))
-    (:sint32 (warp-protobuf-encode-zigzag32 value))
-    (:sint64 (warp-protobuf-encode-zigzag64 value))
-    (:enum
-     (let ((enum-name (plist-get extra-args :enum-name)))
-       (warp-protobuf-encode-varint
-        (if enum-name
-            (warp-protobuf-enum-to-number enum-name value)
-          value))))
-    (:fixed32 (warp-protobuf-encode-fixed32 value))
-    (:fixed64 (warp-protobuf-encode-fixed64 value))
-    (:sfixed32 (warp-protobuf-encode-fixed32 value))
-    (:sfixed64 (warp-protobuf-encode-fixed64 value))
-    (:float (warp-protobuf-encode-float value))
-    (:double (warp-protobuf-encode-double value))
-    (:string (warp-protobuf-encode-length-delimited
-              (encode-coding-string value 'utf-8-unix t)))
-    (:bytes (warp-protobuf-encode-length-delimited
-             (warp-protobuf--ensure-unibyte value)))
-    (:message
-     (let ((schema-name (plist-get extra-args :schema))
-           (schema (warp-protobuf-get-schema (plist-get extra-args :schema))))
-       (unless schema
-         (signal 'warp-protobuf-encode-error
-                 (list (warp:error! :type 'warp-protobuf-schema-error
-                                    :message "Nested message schema not found"
-                                    :details `(:schema-name ,schema-name)))))
-       (warp-protobuf-encode-length-delimited
-        (warp-protobuf-encode-message schema value))))
-    (:any
-     (unless (and (plist-get value :type-url) (plist-get value :value))
-       (signal 'warp-protobuf-any-error
-               (list (warp:error! :type 'warp-protobuf-any-error
-                                  :message "Any type requires :type-url and :value"
-                                  :details `(:value ,value)))))
-     (warp-protobuf-encode-length-delimited
-      (warp-protobuf-encode-any (plist-get value :type-url)
-                                (plist-get value :value))))
-    (_ (signal 'warp-protobuf-encode-error
-               (list (warp:error! :type 'warp-protobuf-encode-error
-                                  :message "Unknown type for encoding"
-                                  :details `(:type ,type)))))))
-
-(defun warp-protobuf-decode-value
-    (type data &optional offset &rest extra-args)
-  "Decode value of TYPE from DATA at OFFSET with optional EXTRA-ARGS.
-This is a polymorphic function that dispatches to the correct low-level
-decoding function based on the Protobuf `type`. It handles type-specific
-conversions (e.g., clamping integers, decoding UTF-8 strings).
-
-Arguments:
-- `type` (keyword): The Protobuf field type (e.g., `:int32`, `:string`,
-  `:message`).
-- `data` (string): The unibyte string containing the encoded value.
-- `offset` (integer, optional): The starting offset in `data`. Defaults to 0.
-- `&rest extra-args` (plist): Optional arguments needed for complex types:
-  - `:enum-name` (symbol): For `:enum` type, the registered enum name.
-  - `:schema` (list): For `:message` type, the schema of the nested message.
-
-Returns:
-- (cons `(value . new-offset)` or nil): A cons cell where `value` is the
-  decoded Emacs Lisp value and `new-offset` is the position after the
-  decoded field. Returns `nil` if decoding fails.
-
-Signals:
-- `warp-protobuf-decode-error`: If `type` is unknown or `data` is
-  malformed for its `type`.
-- `warp-protobuf-schema-error`: For enum conversion errors when enum
-  name is not found."
-  (setq offset (or offset 0))
-  (pcase type
-    ((or :int32 :int64 :uint32 :uint64 :bool)
-     (when-let ((result (warp-protobuf-decode-varint data offset)))
-       (cons (pcase type
-               (:int32 (warp-protobuf--clamp-int32 (car result)))
-               (:int64 (warp-protobuf--clamp-int64 (car result)))
-               (:uint32 (warp-protobuf--clamp-uint32 (car result)))
-               (:uint64 (warp-protobuf--clamp-uint64 (car result)))
-               (:bool (not (zerop (car result))))
-               (_ value))
-             (cdr result))))
-    (:sint32 (warp-protobuf-decode-zigzag32 data offset))
-    (:sint64 (warp-protobuf-decode-zigzag64 data offset))
-    (:enum
-     (when-let ((result (warp-protobuf-decode-varint data offset)))
-       (let ((enum-name (plist-get extra-args :enum-name)))
-         (cons (if enum-name
-                   (warp-protobuf-number-to-enum enum-name (car result))
-                 (car result))
-               (cdr result)))))
-    (:fixed32 (warp-protobuf-decode-fixed32 data offset))
-    (:fixed64 (warp-protobuf-decode-fixed64 data offset))
-    (:sfixed32
-     (when-let ((result (warp-protobuf-decode-fixed32 data offset)))
-       (cons (warp-protobuf--clamp-int32 (car result)) (cdr result))))
-    (:sfixed64
-     (when-let ((result (warp-protobuf-decode-fixed64 data offset)))
-       (cons (warp-protobuf--clamp-int64 (car result)) (cdr result))))
-    (:float (warp-protobuf-decode-float data offset))
-    (:double (warp-protobuf-decode-double data offset))
-    (:string
-     (when-let ((result (warp-protobuf-decode-length-delimited data offset)))
-       (cons (decode-coding-string (car result) 'utf-8-unix) (cdr result))))
-    (:bytes (warp-protobuf-decode-length-delimited data offset))
-    (:message
-     (when-let ((result (warp-protobuf-decode-length-delimited data offset)))
-       (let* ((schema-name (plist-get extra-args :schema))
-              (schema (warp-protobuf-get-schema schema-name)))
-         (unless schema
-           (signal 'warp-protobuf-decode-error
-                   (list (warp:error! :type 'warp-protobuf-schema-error
-                                      :message "Nested message schema not found"
-                                      :details `(:schema-name ,schema-name)))))
-         (cons (warp-protobuf-decode-message schema (car result))
-               (cdr result)))))
-    (:any
-     (when-let ((result (warp-protobuf-decode-length-delimited data offset)))
-       (cons (warp-protobuf-decode-any (car result)) (cdr result))))
-    (_ (signal 'warp-protobuf-decode-error
-               (list (warp:error! :type 'warp-protobuf-decode-error
-                                  :message "Unknown type for decoding"
-                                  :details `(:type ,type)))))))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Message Encoding/Decoding
-
-(defun warp-protobuf-encode-message (schema message)
-  "Encode MESSAGE according to SCHEMA.
-This function validates the message against its schema, handles oneof
-constraints, and then serializes each field based on its type and label
-(e.g., single, repeated, packed, map, Any).
-
-Arguments:
-- `schema` (list): The schema definition list for the message.
-- `message` (plist): The message data as a plist, where keys are keywords
-  matching field names (e.g., `:field-name`).
-
-Returns:
-- (string): A unibyte string representing the encoded Protobuf message.
-
-Signals:
-- `warp-protobuf-schema-error`: If the schema itself is invalid.
-- `warp-protobuf-validation-error`: If a required field is missing or
-  an enum value is unknown.
-- `warp-protobuf-oneof-error`: If multiple fields in a oneof group are set.
-- `warp-protobuf-encode-error`: For other encoding failures (e.g., missing
-  schema for nested message).
-- `warp-protobuf-any-error`: For malformed Any types."
-  (warp-protobuf-validate-schema schema)
-  (let ((result "")
-        (oneof-groups (make-hash-table :test 'eq)))
-    ;; Collect oneof group definitions from the schema.
-    (dolist (field schema)
-      (when (eq (nth 2 field) :oneof)
-        (puthash (nth 0 field) (nth 3 field) oneof-groups)))
-    ;; Validate oneof constraints before encoding.
-    (maphash (lambda (_group fields)
-               (warp-protobuf-validate-oneof fields message))
-             oneof-groups)
-    ;; Iterate through fields in schema order for encoding.
-    (dolist (field schema)
-      (let* ((name (nth 0 field))
-             (number (nth 1 field))
-             (type (nth 2 field))
-             (label (nth 3 field))
-             (extra-props (nthcdr 4 field))
-             (keyword (intern (concat ":" (symbol-name name))))
-             (value (plist-get message keyword)))
-        (cond
-          ;; Map fields are encoded as repeated messages.
-          ((eq type :map)
-           (when value
-             (let ((key-type (plist-get extra-props :key-type))
-                   (value-type (plist-get extra-props :value-type))
-                   (value-schema (plist-get extra-props :value-schema)))
-               (dolist (entry value)
-                 (let ((entry-data (warp-protobuf-encode-map-entry
-                                    key-type value-type
-                                    (car entry) (cdr entry) value-schema)))
-                   (setq result
-                         (concat result
-                                 (warp-protobuf-encode-field-header
-                                  number warp-protobuf--wire-length-delimited)
-                                 (warp-protobuf-encode-length-delimited
-                                  entry-data))))))))
-          ;; Oneof is a pseudo-field; its contained fields are handled individually.
-          ((eq type :oneof))
-          ;; Handle regular fields (optional, required, repeated).
-          (t
-           (when (or value (eq label :required))
-             (when (and (not value) (eq label :required))
-               (signal 'warp-protobuf-validation-error
-                       (list (warp:error! :type 'warp-protobuf-validation-error
-                                          :message "Required field missing"
-                                          :details `(:field ,name)))))
-             (when value
-               (let ((wire-type (cdr (assq type warp-protobuf--type-wire-map))))
-                 (cond
-                   ((eq label :repeated)
-                    (when (listp value)
-                      (let ((packed (plist-get extra-props :packed)))
-                        (if (and packed
-                                 (memq type '(:int32 :int64 :uint32 :uint64
-                                              :sint32 :sint64 :bool :enum
-                                              :fixed32 :fixed64 :sfixed32
-                                              :sfixed64 :float :double)))
-                            ;; Packed encoding: encode all values into a single
-                            ;; length-delimited field.
-                            (let ((packed-data ""))
-                              (dolist (item value)
-                                (setq packed-data
-                                      (concat packed-data
-                                              (apply #'warp-protobuf-encode-value
-                                                     type item extra-props))))
-                              (setq result
-                                    (concat result
-                                            (warp-protobuf-encode-field-header
-                                             number
-                                             warp-protobuf--wire-length-delimited)
-                                            (warp-protobuf-encode-length-delimited
-                                             packed-data))))
-                          ;; Unpacked encoding: each item has its own header.
-                          (dolist (item value)
-                            (setq result
-                                  (concat result
-                                          (warp-protobuf-encode-field-header
-                                           number wire-type)
-                                          (apply #'warp-protobuf-encode-value
-                                                 type item extra-props))))))))
-                   ;; Single field (required or optional)
-                   (t
-                    (setq result
-                          (concat result
-                                  (warp-protobuf-encode-field-header
-                                   number wire-type)
-                                  (apply #'warp-protobuf-encode-value
-                                         type value extra-props))))))))))
-    result))
-
-(defun warp-protobuf-decode-message (schema data)
-  "Decode MESSAGE from DATA according to SCHEMA.
-This function parses a binary Protobuf message, using the provided
-schema to interpret fields. It handles known fields (single, repeated,
-packed, map, oneof) and preserves unknown fields for forward
-compatibility.
-
-Arguments:
-- `schema` (list): The schema definition list for the message.
-- `data` (string): The unibyte string containing the encoded Protobuf
-  message.
-
-Returns:
-- (plist): The decoded message data as a plist. Repeated fields are
-  returned as lists. Unknown fields are collected under the
-  `:unknown-fields` key as a list of `(field-number wire-type raw-bytes)`
-  tuples.
-
-Signals:
-- `warp-protobuf-schema-error`: If the schema itself is invalid or for
-  missing nested message schemas.
-- `warp-protobuf-decode-error`: If the data is malformed or types
-  don't match expectations.
-- `warp-protobuf-any-error`: For malformed Any types during decoding."
-  (warp-protobuf-validate-schema schema)
-  (let ((result '())
-        (offset 0)
-        (field-map (make-hash-table :test 'eq))
-        (unknown-fields '()))
-    ;; Populate field-map for quick lookup by field number.
-    (dolist (field schema)
-      (puthash (nth 1 field) field field-map))
-    ;; Iterate through the binary data, decoding fields one by one.
-    (while (< offset (length data))
-      (if-let ((header-result
-                (warp-protobuf-decode-field-header data offset)))
-          (let* ((field-number (caar header-result))
-                 (wire-type (cdar header-result))
-                 (field-offset (cdr header-result))
-                 (field-def (gethash field-number field-map)))
-            (if field-def
-                ;; Known field: dispatch to appropriate decoder.
-                (let* ((type (nth 2 field-def))
-                       (label (nth 3 field-def))
-                       (value-result
-                        (cond
-                         ;; Packed repeated fields are length-delimited.
-                         ((and (eq label :repeated)
-                               (plist-get (nthcdr 4 field-def) :packed)
-                               (= wire-type warp-protobuf--wire-length-delimited))
-                          (warp-protobuf--decode-packed-repeated-field
-                           field-def data field-offset))
-                         ;; All other fields are decoded based on their type.
-                         (t (apply #'warp-protobuf-decode-value
-                                   type data field-offset (nthcdr 4 field-def))))))
-                  (when value-result
-                    (let ((keyword (intern (concat ":" (symbol-name (car field-def)))))
-                          (value (car value-result)))
-                      (if (eq label :repeated)
-                          ;; Append to list for repeated fields.
-                          (setq result (plist-put result keyword
-                                                  (append value (plist-get result keyword))))
-                        ;; Set value for single fields.
-                        (setq result (plist-put result keyword value)))
-                      (setq offset (cdr value-result)))))
-              ;; Unknown field: skip it and store raw bytes for forward
-              ;; compatibility.
-              (let ((skip-result (warp-protobuf-skip-unknown-field
-                                  wire-type data field-offset)))
-                (when skip-result
-                  (push (list field-number wire-type
-                              (substring data field-offset (cdr skip-result)))
-                        unknown-fields)
-                  (setq offset (cdr skip-result))))))
-        ;; If we can't decode a header, assume end of message.
-        (setq offset (length data))))
-    ;; Reverse repeated field lists (they were built in reverse order).
-    (dolist (field schema)
-      (when (eq (nth 3 field) :repeated)
-        (let* ((name (nth 0 field))
-               (keyword (intern (concat ":" (symbol-name name))))
-               (values (plist-get result keyword)))
-          (when values
-            (setq result (plist-put result keyword (nreverse values)))))))
-    ;; Add any preserved unknown fields to the final result.
-    (when unknown-fields
-      (setq result (plist-put result :unknown-fields
-                              (nreverse unknown-fields))))
-    result))
-
-(defun warp-protobuf--decode-packed-repeated-field (field-def data offset)
-  "Helper to decode a packed repeated field.
-This reads a length-delimited chunk and then iteratively decodes
-items of the specified type from it.
-
-Arguments:
-- `field-def` (list): The schema definition for the field.
-- `data` (string): The binary message data.
-- `offset` (integer): The starting offset of the length-delimited chunk.
-
-Returns:
-- (cons `(value-list . new-offset)` or nil): A cons cell with the list of
-  decoded values and the new offset in the main data buffer."
-  (when-let ((packed-result (warp-protobuf-decode-length-delimited data offset)))
-    (let* ((type (nth 2 field-def))
-           (extra-props (nthcdr 4 field-def))
-           (packed-data (car packed-result))
-           (packed-offset 0)
-           (values '()))
-      (while (< packed-offset (length packed-data))
-        (when-let ((value-result
-                    (apply #'warp-protobuf-decode-value
-                           type packed-data packed-offset extra-props)))
-          (push (car value-result) values)
-          (setq packed-offset (cdr value-result))))
-      (cons (nreverse values) (cdr packed-result)))))
-
-(defun warp-protobuf-skip-unknown-field (wire-type data offset)
-  "Skip unknown field with WIRE-TYPE from DATA at OFFSET.
-This function is used during decoding to skip fields that are not
-defined in the provided schema, allowing for forward compatibility.
-
-Arguments:
-- `wire-type` (integer): The wire type of the unknown field.
-- `data` (string): The unibyte string containing the encoded message.
-- `offset` (integer): The starting offset of the field's data.
-
-Returns:
-- (cons `(nil . new-offset)` or nil): A cons cell where `new-offset` is
-  the position after the skipped field. Returns `nil` if the data
-  is too short for the given wire type."
-  (pcase wire-type
-    (0 (warp-protobuf-decode-varint data offset))       ; Varint
-    (1 (when (>= (length data) (+ offset 8)) ; Fixed64
-         (cons nil (+ offset 8))))
-    (2 (warp-protobuf-decode-length-delimited data offset)) ; Length-delimited
-    (5 (when (>= (length data) (+ offset 4)) ; Fixed32
-         (cons nil (+ offset 4))))
-    (_ nil)))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; JSON Serialization Support (for Protobuf messages)
-
-(defun warp-protobuf-to-json (schema message)
-  "Convert protobuf MESSAGE to JSON according to SCHEMA.
-This function implements the standard Protobuf JSON mapping, including
-stringifying large integers, base64 encoding bytes, and handling nested
-messages and repeated fields.
-
-Arguments:
-- `schema` (list): The schema definition list for the message.
-- `message` (plist): The message data as a plist.
-
-Returns:
-- (string): A JSON string representation of the message.
-
-Signals:
-- `warp-protobuf-encode-error`: If any value cannot be converted to JSON."
-  (let ((json-object '()))
-    (dolist (field schema)
-      (let* ((name (nth 0 field))
-             (type (nth 2 field))
-             (label (nth 3 field))
-             (keyword (intern (concat ":" (symbol-name name))))
-             (value (plist-get message keyword)))
-        (when value
-          (let ((json-key (symbol-name name))
-                (json-value (warp-protobuf-value-to-json type value label)))
-            (push (cons json-key json-value) json-object)))))
-    (json-encode (nreverse json-object))))
-
-(defun warp-protobuf-value-to-json (type value label)
-  "Convert protobuf VALUE of TYPE and LABEL to JSON representation.
-This is a helper for `warp-protobuf-to-json` that handles individual
-field values, including lists for repeated fields.
-
-Arguments:
-- `type` (keyword): The Protobuf field type.
-- `value` (any): The Lisp value of the field.
-- `label` (keyword): The field label (`:optional`, `:required`,
-  `:repeated`).
-
-Returns:
-- (any): The JSON-compatible representation of the value."
-  (cond
-   ((eq label :repeated)
-    (mapcar (lambda (item) (warp-protobuf-single-value-to-json type item))
-            value))
-   (t (warp-protobuf-single-value-to-json type value))))
-
-(defun warp-protobuf-single-value-to-json (type value)
-  "Convert single protobuf VALUE of TYPE to JSON.
-Handles type-specific JSON mapping rules (e.g., large integers as
-strings, boolean as true/false, enum as string, bytes as base64).
-
-Arguments:
-- `type` (keyword): The Protobuf field type.
-- `value` (any): The single Lisp value of the field.
-
-Returns:
-- (any): The JSON-compatible representation of the single value."
-  (pcase type
-    ;; Large integers might exceed JSON's safe integer range,
-    ;; so convert to string. JavaScript's `Number.MAX_SAFE_INTEGER`
-    ;; is 2^53 - 1 = 9007199254740991.
-    ((or :int32 :int64 :uint32 :uint64 :sint32 :sint64 :fixed32 :fixed64
-         :sfixed32 :sfixed64)
-     (if (and (integerp value) (> (abs value) 9007199254740991))
-         (number-to-string value)
-       value))
-    (:bool value)
-    ((or :float :double) value)
-    (:string value)
-    (:bytes (base64-encode-string (warp-protobuf--ensure-unibyte value)))
-    (:enum (if (symbolp value) (symbol-name value) value))
-    (:message (warp-protobuf-to-json (plist-get value :schema) value))
-    (:any (list (cons "type_url" (plist-get value :type-url))
-                (cons "value" (base64-encode-string
-                               (warp-protobuf--ensure-unibyte
-                                (plist-get value :value))))))
-    (_ value)))
-
-(defun warp-protobuf-from-json (schema json-string)
-  "Convert JSON-STRING to protobuf message according to SCHEMA.
-This function parses a JSON string and converts it into a Lisp plist
-representation of a Protobuf message, adhering to standard JSON mapping
-rules (e.g., parsing large integers from strings, base64 decoding bytes).
-
-Arguments:
-- `schema` (list): The schema definition list for the message.
-- `json-string` (string): The JSON string to parse.
-
-Returns:
-- (plist): The decoded message data as a plist.
-
-Signals:
-- `json-parse-error`: If `json-string` is not valid JSON.
-- `warp-protobuf-decode-error`: If any JSON value cannot be converted
-  to the expected Protobuf type."
-  (let* ((json-object (json-read-from-string json-string))
-         (result '()))
-    (dolist (field schema)
-      (let* ((name (nth 0 field))
-             (type (nth 2 field))
-             (label (nth 3 field))
-             (json-key (symbol-name name))
-             (keyword (intern (concat ":" (symbol-name name))))
-             (json-value (cdr (assoc json-key json-object))))
-        (when json-value
-          (let ((protobuf-value
-                 (warp-protobuf-value-from-json type json-value label)))
-            (setq result (plist-put result keyword protobuf-value))))))
-    result))
-
-(defun warp-protobuf-value-from-json (type json-value label)
-  "Convert JSON-VALUE to protobuf value of TYPE.
-This is a helper for `warp-protobuf-from-json` that handles individual
-JSON values, including lists for repeated fields, and converts them
-to appropriate Lisp types.
-
-Arguments:
-- `type` (keyword): The Protobuf field type.
-- `json-value` (any): The single JSON value.
-- `label` (keyword): The field label (`:optional`, `:required`,
-  `:repeated`).
-
-Returns:
-- (any): The Lisp representation of the value."
-  (pcase type
-    ((or :int32 :int64 :uint32 :uint32 :sint32 :sint64 :fixed32 :fixed64
-         :sfixed32 :sfixed64)
-     (if (stringp json-value) (string-to-number json-value) json-value))
-    (:bool json-value)
-    ((or :float :double) (float json-value))
-    (:string json-value)
-    (:bytes (base64-decode-string json-value))
-    (:enum (if (stringp json-value) (intern json-value) json-value))
-    (:message json-value)
-    (:any (list :type-url (cdr (assoc "type_url" json-value))
-                :value (base64-decode-string
-                        (cdr (assoc "value" json-value)))))
-    (_ json-value)))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; High-Level API
-
-(defun warp:protobuf-encode (schema message)
-  "Encode MESSAGE according to SCHEMA.
-This is the primary public function for encoding Protobuf messages into
-their binary wire format. It wraps `warp-protobuf-encode-message`.
-
-Arguments:
-- `schema` (list): The schema definition for the message.
-- `message` (plist): The message data as a plist.
-
-Returns:
-- (string): A unibyte string (raw bytes) representing the encoded
-  Protobuf message.
-
-Signals:
-- All errors propagated from `warp-protobuf-encode-message`, including
-  schema errors, validation errors, and encoding errors."
-  (warp-protobuf-encode-message schema message))
-
-(defun warp:protobuf-decode (schema data)
-  "Decode protobuf DATA according to SCHEMA.
-This is the primary public function for decoding binary Protobuf messages
-into Emacs Lisp plists. It wraps `warp-protobuf-decode-message`.
-
-Arguments:
-- `schema` (list): The schema definition for the message.
-- `data` (string): The unibyte string (raw bytes) containing the encoded
-  Protobuf message.
-
-Returns:
-- (plist): The decoded message data as a plist.
-
-Signals:
-- All errors propagated from `warp-protobuf-decode-message`, including
-  schema errors, decode errors, and Any type errors."
-  (warp-protobuf-decode-message schema data))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Utility Functions for Schema Definition
-
-(defmacro warp:defprotobuf-schema (name &rest fields)
-  "Define a protobuf schema named NAME with FIELDS.
-This macro creates a `defvar` for the schema definition and registers
-it globally, allowing schemas to be referenced by name.
-
-Arguments:
-- `NAME` (symbol): The symbol to name the schema (e.g., `my-message-schema`).
-- `&rest FIELDS` (list of lists): Each inner list defines a field:
-  `(field-name field-number field-type field-label &rest extra-props)`
-  - `field-name` (symbol): Name of the field.
-  - `field-number` (integer): Unique field number (1 to 536,870,911).
-  - `field-type` (keyword): Protobuf type (e.g., `:string`, `:int32`,
-    `:message`, `:map`, `:any`, `:oneof`).
-  - `field-label` (keyword or list): `:required`, `:optional`, `:repeated`.
-    For `:oneof` type, this is a list of symbols representing the
-    fields in the oneof group.
-  - `extra-props` (plist): Additional properties for complex types:
-    - `:schema` (symbol): For `:message` type, the name of the nested schema.
-    - `:packed` (boolean): For `:repeated` numeric types, `t` for packed
-      encoding.
-    - `:key-type`, `:value-type`, `:value-schema`: For `:map` type.
-
-Returns: `nil`.
-
-Side Effects:
-- Defines a global variable `NAME` holding the schema definition.
-- Registers the schema in `warp-protobuf--schema-registry`."
-  `(progn
-     (defvar ,name ',fields ,(format "Protobuf schema for %s" name))
-     (warp-protobuf-register-schema ',name ,name)))
-
-(defmacro warp:defprotobuf-enum (name &rest values)
-  "Define a protobuf enum named NAME with VALUES.
-This macro creates a `defvar` for the enum definition (an alist of
-`(symbol . number)`) and registers it globally.
-
-Arguments:
-- `NAME` (symbol): The symbol to name the enum (e.g., `my-status-enum`).
-- `&rest VALUES` (list of symbols or cons cells): Each value can be:
-  - `symbol`: Assigns the next sequential integer value, starting from 0.
-  - `(symbol . integer)`: Explicitly assigns an integer value.
-
-Returns: `nil`.
-
-Side Effects:
-- Defines a global variable `NAME` holding the enum definition alist.
-- Registers the enum in `warp-protobuf--enum-registry`."
-  (let ((enum-alist '()))
-    (cl-loop for value in values
-             for i from 0 do
-             (if (listp value)
-                 (push (cons (car value) (cadr value)) enum-alist)
-               (push (cons value i) enum-alist)))
-    `(progn
-       (defvar ,name ',(nreverse enum-alist)
-         ,(format "Protobuf enum for %s" name))
-       (warp-protobuf-register-enum ',name ,name))))
-
-(provide 'warp-protobuf)
-;;; warp-protobuf.el ends here
+- (loom-promise): A promise that resolves with the response payload,
+  containing a list of active workers (plist with `:worker-id`, `:inbox-address`)."
+  (let ((cmd (warp-protocol--make-command
+              :get-all-active-workers #'make-warp-get-all-active-workers-args)))
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response t
+                      :origin-instance-id origin-instance-id)))
+
+(provide 'warp-protocol)
+;;; warp-protocol.el ends here
