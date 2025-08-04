@@ -1,0 +1,306 @@
+#!/bin/bash
+# Wrapper script for the Warp CLI tool.
+# This script handles locating the Emacs executable, setting up the
+# environment, and piping output for enhanced readability and daemonization.
+
+# --- Shell Strict Mode ---
+# -e: Exit immediately if a command exits with a non-zero status.
+# -u: Treat unset variables as an error when substituting.
+# -o pipefail: The return value of a pipeline is the status of the last command
+#              to exit with a non-zero status, or zero if all commands exit
+#              successfully.
+set -euo pipefail
+
+# --- Configuration ---
+TOOL_NAME="warp-cli"
+# SCRIPT_DIR is the directory where this wrapper script resides.
+# This is crucial for finding warp-cli.el relative to the wrapper.
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+ELISP_FILE="$SCRIPT_DIR/warp-cli.el" # Path to the core Emacs Lisp logic
+
+# --- Emacs Executable Discovery ---
+EMACS_BIN=$(command -v emacs || true) # `|| true` prevents `set -e` from exiting if not found.
+if [ -z "$EMACS_BIN" ]; then
+    echo "Error: 'emacs' executable not found in your system's PATH." >&2
+    echo "Please install Emacs or ensure it's accessible in your PATH." >&2
+    exit 1
+fi
+EMACS_OPTS=("-Q" "--batch" "--script" "$ELISP_FILE")
+
+# --- Detect Optional Tools ---
+BAT_BIN=$(command -v bat || true)
+JQ_BIN=$(command -v jq || true)
+YQ_BIN=$(command -v yq || true) # Note: 'yq' can be a Go binary or a Python script
+SCREEN_BIN=$(command -v screen || true)
+TMUX_BIN=$(command -v tmux || true)
+FZF_BIN=$(command -v fzf || true) # Detected for interactive mode
+NOTIFY_SEND_BIN=$(command -v notify-send || true) # For Linux desktop notifications
+TERMINAL_NOTIFIER_BIN=$(command -v terminal-notifier || true) # For macOS desktop notifications
+CURL_BIN=$(command -v curl || true) # For HTTP/HTTPS network checks (though not used for Warp leader protocol)
+NC_BIN=$(command -v nc || true)     # For TCP port checks
+PING_BIN=$(command -v ping || true) # For basic host reachability
+
+# --- Define Output Pipelining Function ---
+pipe_structured_output() {
+    # Read the first chunk of input to peek at its format without consuming it
+    # for the actual piping. File descriptor 3 is used for tee.
+    local PEEKED_OUTPUT=$(head -n 20 - | tee /dev/fd/3) 3>&1
+
+    local language="text"       # Default language hint for bat
+    local use_formatter="cat"   # Default formatter if no structured tool
+
+    # Heuristic for structured output detection (JSON/YAML)
+    # Check for common JSON/YAML starting characters or patterns in the first lines
+    if [[ "$PEEKED_OUTPUT" =~ ^[[:space:]]*\{ ]] || [[ "$PEEKED_OUTPUT" =~ ^[[:space:]]*\[ ]]; then
+        if [ -n "$JQ_BIN" ]; then
+            use_formatter="$JQ_BIN ." # Use 'jq .' for pretty-printing JSON
+            language="json"
+        fi
+    elif [[ "$PEEKED_OUTPUT" =~ ^[[:space:]]*[a-zA-Z0-9_-]+:[[:space:]] ]] || [[ "$PEEKED_OUTPUT" =~ ^[[:space:]]*- ]]; then
+        if [ -n "$YQ_BIN" ]; then
+            # yq needs a format specifier for stdin to stdout conversion
+            use_formatter="$YQ_BIN e ."
+            language="yaml"
+        fi
+    fi
+
+    if [ -n "$BAT_BIN" ]; then
+        # If bat is available, pipe through formatter then bat for highlighting and paging
+        # --color=always for pipes, --paging=always for pager behavior
+        # Use the detected language. `"$use_formatter"` ensures jq/yq arguments are correct.
+        exec "$use_formatter" | "$BAT_BIN" --color=always --paging=always --language="$language"
+    else
+        # If bat is not available, use jq/yq directly or cat, and pipe through 'less' for paging
+        if [ "$use_formatter" != "cat" ]; then
+             exec "$use_formatter" | (command -v less >/dev/null 2>&1 && less -RF || cat)
+        else
+            exec cat
+        fi
+    fi
+}
+
+# --- Function for Desktop Notifications ---
+send_desktop_notification() {
+    local title="$1"
+    local message="$2"
+    local icon_path="${SCRIPT_DIR}/icon.png" # Assuming an icon file exists
+
+    if [ -n "$NOTIFY_SEND_BIN" ]; then
+        "$NOTIFY_SEND_BIN" "$title" "$message" --icon="$icon_path" || true
+    elif [ -n "$TERMINAL_NOTIFIER_BIN" ]; then
+        "$TERMINAL_NOTIFIER_BIN" -title "$title" -message "$message" -appIcon "$icon_path" || true
+    fi
+}
+
+# --- Pre-flight Network Check Function ---
+check_leader_reachable() {
+    local leader_addr="$1"
+    local check_timeout=5 # seconds
+    local host=""
+    local port=""
+    local protocol=""
+
+    if [[ "$leader_addr" =~ ^([a-z]+):// ]]; then
+        protocol="${BASH_REMATCH[1]}"
+        host_port=${leader_addr#*://}
+    else
+        protocol="tcp" # Assume tcp if no protocol specified (common for CLI shortcuts)
+        host_port="$leader_addr"
+    fi
+    IFS=':' read -r host port <<< "$host_port"
+
+    echo "Checking connectivity to leader at $leader_addr..." >&2
+
+    # Only perform TCP/port checks for valid warp-transport protocols.
+    # For 'websocket' it's still an underlying TCP connection.
+    if [ -n "$NC_BIN" ]; then
+        if "$NC_BIN" -z -w $check_timeout "$host" "$port" >/dev/null 2>&1; then
+            echo "Leader (TCP port) is reachable." >&2
+            return 0
+        fi
+    fi
+
+    if [ -n "$PING_BIN" ]; then
+        if "$PING_BIN" -c 1 -W $check_timeout "$host" >/dev/null 2>&1; then
+            echo "Leader host is pingable (port check not performed)." >&2
+            return 0
+        fi
+    fi
+
+    echo "Error: Leader at $leader_addr is unreachable or port is closed." >&2
+    return 1 # Indicate failure
+}
+
+# --- Function to run command in background via screen/tmux ---
+run_in_background() {
+    local command="$*"
+    local session_name="${TOOL_NAME}_$(date +%Y%m%d%H%M%S)"
+
+    if [ -n "$TMUX_BIN" ]; then
+        echo "Running '$TOOL_NAME' in a new tmux session: $session_name" >&2
+        tmux new-session -d -s "$session_name" "$command"
+        echo "$session_name"
+    elif [ -n "$SCREEN_BIN" ]; then
+        echo "Running '$TOOL_NAME' in a new screen session: $session_name" >&2
+        screen -dmS "$session_name" bash -c "$command"
+        echo "$session_name"
+    else
+        echo "Error: Neither 'tmux' nor 'screen' found. Cannot daemonize." >&2
+        exit 1
+    fi
+}
+
+
+# --- Main execution logic of the wrapper ---
+main() {
+    local ARGS_FOR_ELISP=("$@")
+    local DAEMONIZE=0
+    local FOLLOW_LOGS=0
+    local LEADER_LOG_FILE=""
+    local SKIP_NETWORK_CHECK=0
+    local INTERACTIVE_MODE=0 # Flag for FZF integration
+
+    # Early arg parsing loop to detect daemonization/log/interactive flags
+    for i in "${!ARGS_FOR_ELISP[@]}"; do
+        case "${ARGS_FOR_ELISP[$i]}" in
+            --daemon)
+                DAEMONIZE=1
+                unset 'ARGS_FOR_ELISP[$i]'
+                ;;
+            --follow-logs)
+                FOLLOW_LOGS=1
+                DAEMONIZE=1
+                unset 'ARGS_FOR_ELISP[$i]'
+                ;;
+            --log-file-path)
+                if ((i + 1) < ${#ARGS_FOR_ELISP[@]}); then
+                    LEADER_LOG_FILE="${ARGS_FOR_ELISP[$((i+1))]}"
+                fi
+                ;;
+            --skip-network-check)
+                SKIP_NETWORK_CHECK=1
+                unset 'ARGS_FOR_ELISP[$i]'
+                ;;
+            --interactive) # Detect interactive mode here
+                INTERACTIVE_MODE=1
+                unset 'ARGS_FOR_ELISP[$i]'
+                ;;
+            *)
+                ;;
+        esac
+    done
+
+    ARGS_FOR_ELISP=("${ARGS_FOR_ELISP[@]}") # Rebuild array
+
+    local subcommand="${ARGS_FOR_ELISP[0]}"
+    local leader_addr_arg=""
+
+    if [ "$subcommand" != "start" ]; then # 'start' doesn't connect to an existing leader
+        for i in "${!ARGS_FOR_ELISP[@]}"; do
+            if [[ "${ARGS_FOR_ELISP[$i]}" == "--leader" ]]; then
+                if ((i + 1) < ${#ARGS_FOR_ELISP[@]}); then
+                    leader_addr_arg="${ARGS_FOR_ELISP[$((i+1))]}"
+                fi
+            elif [[ "${ARGS_FOR_ELISP[$i]}" =~ ^--leader= ]]; then
+                leader_addr_arg="${ARGS_FOR_ELISP[$i]#*=}"
+            fi
+        done
+    fi
+
+    if [ "$subcommand" != "start" ] && [ -n "$leader_addr_arg" ] && [ "$SKIP_NETWORK_CHECK" -eq 0 ]; then
+        check_leader_reachable "$leader_addr_arg" || exit 1
+    fi
+
+    if [ "$DAEMONIZE" -eq 1 ] && [ "$subcommand" == "start" ]; then
+        if [ "$FOLLOW_LOGS" -eq 1 ] && [ -z "$LEADER_LOG_FILE" ]; then
+            echo "Error: --follow-logs requires --log-output file and --log-file-path." >&2
+            exit 1
+        fi
+        
+        DAEMON_COMMAND="$0 $*" # Pass all original args to the daemonized process
+        SESSION_NAME=$(run_in_background "$DAEMON_COMMAND")
+        
+        echo "Warp leader started in background. Session: $SESSION_NAME" >&2
+        send_desktop_notification "Warp CLI" "Cluster leader '$SESSION_NAME' started successfully."
+
+        if [ "$FOLLOW_LOGS" -eq 1 ]; then
+            echo "Following leader logs from: $LEADER_LOG_FILE" >&2
+            if [ -n "$BAT_BIN" ]; then
+                tail -F "$LEADER_LOG_FILE" | "$BAT_BIN" --color=always --language=log
+            else
+                tail -F "$LEADER_LOG_FILE"
+            fi
+            if [ -n "$TMUX_BIN" ]; then
+                echo "To detach: Ctrl+b d. To reattach: tmux attach -t $SESSION_NAME" >&2
+            elif [ -n "$SCREEN_BIN" ]; then
+                echo "To detach: Ctrl+a d. To reattach: screen -r $SESSION_NAME" >&2
+            fi
+        fi
+        exit 0
+    fi
+
+    # --- FZF / Interactive Mode Execution ---
+    if [ "$INTERACTIVE_MODE" -eq 1 ]; then
+        if [ -z "$FZF_BIN" ]; then
+            echo "Error: --interactive requires 'fzf' to be installed and in PATH." >&2
+            exit 1
+        fi
+
+        # Pass --interactive to ELisp to get fzf-friendly tab-separated output
+        local ELISP_FZF_COMMAND=("$EMACS_BIN" "${EMACS_OPTS[@]}" -- "${ARGS_FOR_ELISP[@]}" "--interactive")
+        local FZF_PREVIEW_COMMAND=""
+        local FZF_ARGS="--multi --delimiter='\t' --with-nth=1 --preview-window=right:70%"
+
+        # Set specific preview commands based on the initial subcommand.
+        # These call `warp-cli` again (re-entering the wrapper) with the
+        # specific 'info' subcommand and the selected ID ({1} is the ID from FZF).
+        # We always request JSON output for the preview, then pipe through 'bat'.
+        case "$subcommand" in
+            "list")
+                local list_type="${ARGS_FOR_ELISP[1]}" # e.g., 'workers', 'jobs', 'services'
+                case "$list_type" in
+                    "workers")
+                        FZF_PREVIEW_COMMAND="$0 info worker {1} --leader $leader_addr_arg --output-json | pipe_structured_output";;
+                    "jobs")
+                        FZF_PREVIEW_COMMAND="$0 info job {1} --leader $leader_addr_arg --output-json | pipe_structured_output";;
+                    "services")
+                        FZF_PREVIEW_COMMAND="$0 info service {1} --leader $leader_addr_arg --output-json | pipe_structured_output";;
+                    "clusters")
+                        FZF_PREVIEW_COMMAND="$0 info cluster {1} --leader $leader_addr_arg --output-json | pipe_structured_output";;
+                    *) echo "Warning: No fzf preview for 'list $list_type'." >&2;; esac
+                ;; # Terminate the "list" branch of the outer case correctly
+            "processes")
+                 # For processes, {1} is the PID. We'll show ps aux output for preview.
+                 FZF_PREVIEW_COMMAND="ps aux | grep -E \"\\s{1}{1}\\s\" | grep -v grep | head -n 1 | bat --color=always --language=log"
+                 FZF_ARGS="--multi --with-nth=1 --preview-window=right:70%" # For processes, input is just PIDs, no delimiter
+                 ;;
+            "metrics") # If 'metrics worker <ID>' selected for interactive metrics
+                 if [[ "${ARGS_FOR_ELISP[1]}" == "worker" ]]; then
+                     FZF_PREVIEW_COMMAND="$0 metrics worker {1} --leader $leader_addr_arg --output-json | pipe_structured_output"
+                 else
+                     echo "Warning: No fzf preview for 'metrics ${ARGS_FOR_ELISP[1]}'." >&2; fi
+                 ;; # Terminate the "metrics" branch correctly
+            "state") # For state path selection, preview raw state value
+                FZF_PREVIEW_COMMAND="$0 info state {1} --leader $leader_addr_arg --output-json | pipe_structured_output"
+                FZF_ARGS="--multi --with-nth=1 --preview-window=right:70%" # State keys are simple strings
+                ;;
+            *)
+                echo "Warning: No fzf preview configured for command '$subcommand'." >&2;; esac # Terminate the outer case correctly
+
+        # Execute the ELisp command and pipe into fzf
+        if [ -n "$FZF_PREVIEW_COMMAND" ]; then
+             "${ELISP_FZF_COMMAND[@]}" 3>&1 | "$FZF_BIN" "$FZF_ARGS" --preview="$FZF_PREVIEW_COMMAND" | xargs -r -I{} printf '%s\n' {}
+        else
+            "${ELISP_FZF_COMMAND[@]}" 3>&1 | "$FZF_BIN" "$FZF_ARGS" | xargs -r -I{} printf '%s\n' {}
+        fi
+
+        exit 0
+    fi
+
+    # --- Final Emacs Lisp Execution ---
+    export WARP_CLI_ROOT_DIR="$SCRIPT_DIR"
+    exec "$EMACS_BIN" "${EMACS_OPTS[@]}" -- "${ARGS_FOR_ELISP[@]}"
+}
+
+# --- Execute the main function ---
+main "$@"
