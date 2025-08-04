@@ -116,23 +116,23 @@ Fields:
 - `server-process-handle` (warp-process-handle or nil): A handle to
   the managed `redis-server` process, if this service launched it.
   `nil` if connecting to an external Redis instance.
-- `client-pipe-process` (process or nil): The persistent `redis-cli --pipe`
-  process. This process handles all request-response commands by
-  pipelining them for high throughput.
-- `pending-promises` (list): A FIFO queue of `loom-promise` objects. Each
-  promise corresponds to an outstanding command sent via the pipe, and
-  will be resolved when its response is parsed.
+- `client-pipe-process` (process or nil): The persistent
+  `redis-cli --pipe` process. This process handles all
+  request-response commands by pipelining them for high throughput.
+- `pending-promises` (list): A FIFO queue of `loom-promise` objects.
+  Each promise corresponds to an outstanding command sent via the pipe,
+  and will be resolved when its response is parsed.
 - `response-buffer` (string): A buffer for accumulating partial RESP
-  responses from the `client-pipe-process` before a full response can
-  be parsed.
+  responses from the `client-pipe-process` before a full response
+  can be parsed.
 - `subscriber-process` (process or nil): A separate, dedicated
   `redis-cli` process used exclusively for Pub/Sub subscriptions. This
   prevents Pub/Sub messages from interfering with command responses.
 - `subscription-handlers` (hash-table): Maps Pub/Sub channel patterns
   (strings) to their corresponding Lisp `callback-fn` functions.
-- `lock` (loom-lock): A mutex to synchronize access to the `client-pipe-process`'s
-  output buffer and `pending-promises` queue, ensuring thread safety
-  for concurrent Redis commands."
+- `lock` (loom-lock): A mutex to synchronize access to the
+  `client-pipe-process`'s output buffer and `pending-promises` queue,
+  ensuring thread safety for concurrent Redis commands."
   (name nil :type string)
   (config nil :type redis-service-config)
   (server-process-handle nil :type (or null warp-process-handle))
@@ -149,32 +149,65 @@ Fields:
 (defun warp-redis--parse-resp (response-string)
   "A very simple parser for RESP (REdis Serialization Protocol) responses.
 This parser handles common RESP types: simple strings (`+`), errors (`-`),
-integers (`:`), and bulk strings (`$`). It does **not** currently handle
-arrays (`*`), which is a limitation but sufficient for the basic commands
-used by this module.
+integers (`:`), and bulk strings (`$`), and arrays (`*`).
 
 Arguments:
 - `RESPONSE-STRING` (string): The raw response line(s) from Redis,
   including the RESP type prefix and `\\r\\n` terminators.
 
 Returns:
-- The parsed Lisp value (string, integer, `nil` for null bulk string).
+- The parsed Lisp value (string, integer, `nil` for null bulk string,
+  list for arrays).
 
 Signals:
-- `warp-redis-cli-error`: If the response is a Redis error (`-ERR ...`)."
+- `warp-redis-cli-error`: If the response is a Redis error (`-ERR ...`).
+- `error`: For unhandled RESP types or malformed responses."
   (let ((type (aref response-string 0)))
     (pcase type
-      (?+ (substring response-string 1)) ; Simple String (e.g., "+OK\r\n") -> "OK"
-      (?- (signal 'warp-redis-cli-error (substring response-string 1))) ; Error (e.g., "-ERR unknown command\r\n")
-      (?: (string-to-number (substring response-string 1))) ; Integer (e.g., ":123\r\n") -> 123
-      (?$ ; Bulk String (e.g., "$5\r\nhello\r\n" or "$-1\r\n")
-       (let* ((len-str (s-chop-prefix "$" response-string)) ; "5\r\nhello\r\n" or "-1\r\n"
-              (parts (s-split "\r\n" len-str 2)) ; ("5" "hello\r\n") or ("-1" "")
-              (len (string-to-number (car parts))))
+      (?+ (substring response-string 1 (1- (length response-string))))
+      (?- (signal 'warp-redis-cli-error (substring response-string 1
+                                                    (1- (length response-string)))))
+      (?: (string-to-number (substring response-string 1
+                                       (1- (length response-string)))))
+      (?$ ; Bulk String
+       (let* ((first-crlf (s-search "\r\n" response-string))
+              (len-str (substring response-string 1 first-crlf))
+              (len (string-to-number len-str)))
          (if (= len -1)
-             nil ; Null bulk string ("$-1\r\n")
-           (cadr parts)))) ; Actual data (e.g., "hello")
-      (_ response-string)))) ; Fallback for unhandled/malformed responses
+             nil ; Null bulk string
+           (substring response-string (+ first-crlf 2)
+                      (- (length response-string) 2)))))
+      (?* ; Array
+       (let* ((first-crlf (s-search "\r\n" response-string))
+              (num-elements (string-to-number (substring response-string
+                                                         1 first-crlf)))
+              (rest-of-string (substring response-string
+                                         (+ first-crlf 2)))
+              (elements nil))
+         (cl-loop with current-pos = 0
+                  for i from 0 below num-elements do
+                    (let* ((element-type (aref rest-of-string current-pos))
+                           (element-crlf (s-search "\r\n" rest-of-string
+                                                     current-pos)))
+                      (unless element-crlf
+                        (error "Malformed RESP array: missing CRLF."))
+                      (let* ((element-len-str (substring rest-of-string
+                                                         (1+ current-pos)
+                                                         element-crlf))
+                             (element-len (string-to-number element-len-str))
+                             (start-data (+ element-crlf 2))
+                             (end-data (+ start-data element-len)))
+                        (when (eq element-type ?$)
+                          (when (< (length rest-of-string) end-data)
+                            (error "Malformed RESP array: data truncated."))
+                          (push (substring rest-of-string start-data end-data)
+                                elements))
+                        ;; For simplicity, only handling bulk strings within arrays.
+                        ;; Other types would require recursive calls to warp-redis--parse-resp.
+                        (cl-incf current-pos (+ (length element-len-str) 2 element-len 2))))
+                  finally (cl-return (nreverse elements))))
+       )
+      (_ (error (format "Unsupported RESP type: %s" response-string)))))
 
 (defun warp-redis--pipe-filter (proc output)
   "Process filter to handle asynchronous responses from `redis-cli --pipe`.
@@ -198,44 +231,94 @@ Side Effects:
     (loom:with-mutex! (warp-redis-service-lock service)
       (setf (warp-redis-service-response-buffer service)
             (concat (warp-redis-service-response-buffer service) output))
-      (while (and (s-contains? "\r\n" (warp-redis-service-response-buffer service))
-                  (warp-redis-service-pending-promises service))
+      (while (and (warp-redis-service-pending-promises service)
+                  (s-contains? "\r\n" (warp-redis-service-response-buffer
+                                       service)))
         (let* ((buffer (warp-redis-service-response-buffer service))
-               (first-char (aref buffer 0))) ; Check first char of current buffer content
-          ;; Handle multi-line bulk strings (e.g., "$5\r\nhello\r\n")
-          (if (eq first-char ?$)
-              (let* ((first-line-end (s-search "\r\n" buffer))
-                     (len-str (substring buffer 1 first-line-end))
-                     (len (string-to-number len-str)))
-                (if (= len -1) ; Null bulk string "$-1\r\n"
-                    (when (>= (length buffer) (+ (length len-str) 3)) ; enough for $-1\r\n
-                      (setf (warp-redis-service-response-buffer service)
-                            (substring buffer (+ (length len-str) 3)))
-                      (let ((promise (pop (warp-redis-service-pending-promises service))))
-                        (loom:promise-resolve promise (warp-redis--parse-resp "$-1\r\n"))))
-                  ;; Regular bulk string with data
-                  (let ((data-start (+ first-line-end 2)) ; Skip \r\n
-                        (full-response-len (+ first-line-end 2 len 2))) ; Length of "$len\r\ndata\r\n"
-                    (when (>= (length buffer) full-response-len)
-                      (let ((full-response (substring buffer 0 full-response-len)))
-                        (setf (warp-redis-service-response-buffer service)
-                              (substring buffer full-response-len))
-                        (let ((promise (pop (warp-redis-service-pending-promises service))))
-                          (loom:promise-resolve promise (warp-redis--parse-resp full-response)))))))
-            ;; Handle single-line responses (+, -, :)
-            (let* ((parts (s-split "\r\n" buffer 2))
-                   (response-line (car parts))
-                   (remaining-buffer (cadr parts)))
-              (setf (warp-redis-service-response-buffer service) remaining-buffer)
-              (let ((promise (pop (warp-redis-service-pending-promises service))))
-                (loom:promise-resolve promise (warp-redis--parse-resp response-line)))))))))))
+               (first-char (aref buffer 0))
+               (crlf-pos (s-search "\r\n" buffer))
+               (full-response-parsed-p nil)
+               (parsed-result nil)
+               (error-during-parse nil))
+          (when crlf-pos
+            (condition-case parse-err
+                (pcase first-char
+                  ((or ?+ ?- ?:) ; Simple String, Error, Integer
+                   (setq parsed-result
+                         (warp-redis--parse-resp
+                          (substring buffer 0 (+ crlf-pos 2))))
+                   (setf (warp-redis-service-response-buffer service)
+                         (substring buffer (+ crlf-pos 2)))
+                   (setq full-response-parsed-p t))
+                  (?$ ; Bulk String
+                   (let* ((len-str (substring buffer 1 crlf-pos))
+                          (len (string-to-number len-str))
+                          (total-len (+ crlf-pos 2 len 2))) ; $LEN\r\nDATA\r\n
+                     (when (>= (length buffer) total-len)
+                       (setq parsed-result
+                             (warp-redis--parse-resp
+                              (substring buffer 0 total-len)))
+                       (setf (warp-redis-service-response-buffer service)
+                             (substring buffer total-len))
+                       (setq full-response-parsed-p t))))
+                  (?* ; Array
+                   (let* ((array-header-end (s-search "\r\n" buffer))
+                          (num-elements (string-to-number
+                                         (substring buffer
+                                                    1 array-header-end)))
+                          (temp-parse-buffer (substring buffer
+                                                        (+ array-header-end 2)))
+                          (elements-parsed nil)
+                          (current-pos 0))
+
+                     ;; This is simplified and might not handle all nested types.
+                     ;; For proper array parsing, this needs to be recursive
+                     ;; or use a more complete RESP parser.
+                     (cl-loop for i from 0 below num-elements do
+                              (let* ((type-char (aref temp-parse-buffer current-pos))
+                                     (crlf-pos-elem (s-search "\r\n"
+                                                              temp-parse-buffer
+                                                              current-pos))
+                                     (len-str-elem (substring temp-parse-buffer
+                                                              (1+ current-pos)
+                                                              crlf-pos-elem))
+                                     (len-elem (string-to-number len-str-elem))
+                                     (total-len-elem (+ (length len-str-elem) 2 len-elem 2)))
+                                (when (eq type-char ?$) ; Only support bulk string elements in array
+                                  (when (< (length temp-parse-buffer) (+ current-pos total-len-elem))
+                                    (error "Incomplete array element."))) ; Break loop
+                                (push (substring temp-parse-buffer (+ current-pos (length len-str-elem) 2)
+                                                 (+ current-pos total-len-elem -2))
+                                      elements-parsed)
+                                (cl-incf current-pos total-len-elem))
+
+                     (when (= (length elements-parsed) num-elements)
+                       (setq parsed-result (nreverse elements-parsed))
+                       (setf (warp-redis-service-response-buffer service)
+                             (substring buffer (+ array-header-end 2 current-pos))) ; Update buffer
+                       (setq full-response-parsed-p t))))
+                  (_ (error "Unsupported RESP type or malformed response.")))
+              (error
+               (setq error-during-parse err))))
+
+          (when full-response-parsed-p
+            (let ((promise (pop (warp-redis-service-pending-promises service))))
+              (if error-during-parse
+                  (loom:promise-reject
+                   promise (warp:error! :type 'warp-redis-cli-error
+                                        :message
+                                        (format "RESP parse error: %S"
+                                                error-during-parse)
+                                        :cause error-during-parse))
+                (loom:promise-resolve promise parsed-result))))))))))
 
 (defun warp-redis--subscriber-filter (proc output)
   "Process filter for the Pub/Sub `redis-cli` process.
 This function is attached to the stdout of the dedicated `redis-cli`
 process for Pub/Sub. It continuously reads incoming messages, parses
-them (assuming CSV output from `redis-cli`), and dispatches them to
-the appropriate `subscription-handlers` based on the channel pattern.
+them (assuming CSV output from `redis-cli --csv`), and dispatches
+them to the appropriate `subscription-handlers` based on the channel
+pattern.
 
 Arguments:
 - `PROC` (process): The `redis-cli` subscriber process.
@@ -249,34 +332,32 @@ Side Effects:
 - Invokes registered callbacks in `subscription-handlers` with the
   parsed `channel` and `payload`."
   (let ((service (process-get proc 'service-handle)))
-    (with-current-buffer (process-buffer proc) ; Use process buffer for line-by-line processing
+    (with-current-buffer (process-buffer proc)
       (insert output)
       (goto-char (point-min))
-      (while (re-search-forward ".*\r\n" nil t) ; Find full lines
+      ;; Use `re-search-forward` to find and extract full lines.
+      (while (re-search-forward "^\"[^\"]*\",\"[^\"]*\",\"[^\"]*\",\"[^\"]*\",\.*?\r\n" nil t)
         (let* ((line (match-string 0))
-               ;; Use `s-trim` to remove whitespace, then `json-parse-string`
-               ;; assuming `--csv` output is close enough to JSON array.
-               ;; Example line from --csv PSUBSCRIBE: "pmessage","my:pattern","my:channel","hello world"
-               ;; This needs careful parsing or a proper RESP array parser.
-               ;; For simplicity, we assume `json-parse-string` can handle the CSV-like array.
-               (message-data (ignore-errors
-                               (json-parse-string
-                                (s-trim (format "[%s]" (s-replace "\n" "," line)))))))
-          (delete-region (match-beginning 0) (match-end 0)) ; Remove processed line from buffer
-          (when (and (listp message-data) (equal (elt message-data 0) "pmessage"))
-            (let* ((pattern (elt message-data 1))
-                   (channel (elt message-data 2))
-                   (payload (elt message-data 3))
-                   (handler (gethash pattern (warp-redis-service-subscription-handlers service))))
+               ;; Split the CSV line manually. Example: "pmessage","pattern","channel","message"\r\n
+               (parts (s-split "," (substring line 1 (1- (length line)))))
+               (msg-type (s-chop-prefix "\"" (car parts)))
+               (pattern (s-chop-prefix "\"" (nth 1 parts)))
+               (channel (s-chop-prefix "\"" (nth 2 parts)))
+               (payload (s-chop-prefix "\"" (nth 3 parts))))
+
+          (delete-region (match-beginning 0) (match-end 0))
+          (when (equal msg-type "pmessage")
+            (let ((handler (gethash pattern
+                                    (warp-redis-service-subscription-handlers
+                                     service))))
               (when handler
                 (warp:log! :trace (warp-redis-service-name service)
-                           "Received Pub/Sub message on channel '%s' matching pattern '%s'."
+                           "Received Pub/Sub message on channel '%s' \
+                            matching pattern '%s'."
                            channel pattern)
-                ;; Invoke the registered callback asynchronously to avoid blocking
-                ;; the filter or main thread.
+                ;; Invoke the registered callback asynchronously to avoid
+                ;; blocking the filter or main thread.
                 (loom:task (lambda () (funcall handler channel payload)))
-                ;; In a real system, consider a dedicated thread for handler invocation
-                ;; or sending to an event system to prevent blocking this filter.
                 )))))))
 
 (defun warp-redis--execute-pipelined (service &rest args)
@@ -299,14 +380,17 @@ Returns:
           (proc (warp-redis-service-client-pipe-process service)))
       (unless (process-live-p proc)
         (warp:log! :error (warp-redis-service-name service)
-                   "Redis client pipe process is not running. Command failed: %S" args)
+                   "Redis client pipe process is not running. Command failed: %S"
+                   args)
         (cl-return-from warp-redis--execute-pipelined
           (loom:rejected! (warp:error! :type 'warp-redis-error
-                                       :message "Redis client pipe is not running."))))
+                                       :message "Redis client pipe is not \
+                                                 running."))))
       ;; Add promise to the FIFO queue. Its position in the queue determines
       ;; when it gets resolved by the filter.
       (setf (warp-redis-service-pending-promises service)
-            (append (warp-redis-service-pending-promises service) (list promise)))
+            (append (warp-redis-service-pending-promises service)
+                    (list promise)))
       ;; Send the command string to the pipe process, followed by a newline.
       (process-send-string proc (s-join " " args))
       (process-send-string proc "\n")
@@ -369,63 +453,74 @@ Side Effects:
               (loom:resolved! t))
      (error
       (warp:log! :info (warp-redis-service-name service)
-                 "No running Redis server detected. Attempting to launch a new instance...")
+                 "No running Redis server detected. Attempting to launch a \
+                  new instance...")
       (let* ((config (warp-redis-service-config service))
-             (server-path (redis-service-config-redis-server-executable config)))
+             (server-path (redis-service-config-redis-server-executable
+                           config)))
         (if (and server-path (file-executable-p server-path))
             (let* ((conf-file (redis-service-config-config-file config))
-                   (port-arg (format "--port %d" (redis-service-config-port config)))
-                   (bind-arg (format "--bind %s" (redis-service-config-host config)))
-                   ;; Combine all launch arguments.
+                   (port-arg (format "--port %d"
+                                     (redis-service-config-port config)))
+                   (bind-arg (format "--bind %s"
+                                     (redis-service-config-host config)))
                    (launch-args (append (list server-path)
                                         (when conf-file (list conf-file))
                                         (list port-arg bind-arg))))
               (warp:log! :info (warp-redis-service-name service)
-                         "Launching Redis server with command: %S" launch-args)
+                         "Launching Redis server with command: %S"
+                         launch-args)
               ;; Launch the `redis-server` as a managed process.
               (setf (warp-redis-service-server-process-handle service)
                     (warp:process-launch
-                     `(:name ,(format "managed-redis-server-%s" (warp-redis-service-name service))
+                     `(:name ,(format "managed-redis-server-%s"
+                                      (warp-redis-service-name service))
                        :process-type :shell
                        :command-args ,launch-args)))
               ;; Give the server a moment to start up.
-              (loom:delay! 0.5 (loom:resolved! t))) ; Small delay for server bootstrap
+              (loom:delay! 0.5 (loom:resolved! t)))
           (progn
             (warp:log! :warn (warp-redis-service-name service)
-                       "Cannot launch Redis server: '%s' is not an executable file. Proceeding with external Redis assumed."
+                       "Cannot launch Redis server: '%s' is not an executable \
+                        file. Proceeding with external Redis assumed."
                        server-path)
-            (loom:resolved! t)))))) ; Resolve even if local server can't be launched, assuming external.
-
+            (loom:resolved! t))))))
    ;; Step 2: Start the pipelined client process for request/response commands.
    (:then (lambda (_)
             (let* ((config (warp-redis-service-config service))
-                   (cli-path (redis-service-config-redis-cli-executable config))
-                   (port-str (number-to-string (redis-service-config-port config)))
+                   (cli-path (redis-service-config-redis-cli-executable
+                              config))
+                   (port-str (number-to-string
+                              (redis-service-config-port config)))
                    (host-str (redis-service-config-host config))
                    (pipe-args (list "-p" port-str "-h" host-str "--pipe")))
               (warp:log! :info (warp-redis-service-name service)
-                         "Starting Redis pipe client: %S %S" cli-path pipe-args)
+                         "Starting Redis pipe client: %S %S"
+                         cli-path pipe-args)
               (let ((proc (apply #'start-process
-                                 (format "*%s-pipe*" (warp-redis-service-name service))
-                                 nil ; Use nil buffer to prevent Emacs from showing it
+                                 (format "*%s-pipe*"
+                                         (warp-redis-service-name service))
+                                 nil
                                  cli-path pipe-args)))
                 (set-process-filter proc #'warp-redis--pipe-filter)
                 (set-process-sentinel proc (lambda (p e)
-                                             (warp:log! :error (warp-redis-service-name service)
+                                             (warp:log! :error
+                                                        (warp-redis-service-name service)
                                                         "Redis pipe process died: %s" e)
-                                             ;; Clear process handle to indicate it's not running.
                                              (setf (warp-redis-service-client-pipe-process service) nil)))
-                (process-put proc 'service-handle service) ; Store handle to service on process
+                (process-put proc 'service-handle service)
                 (setf (warp-redis-service-client-pipe-process service) proc)
                 (warp:log! :info (warp-redis-service-name service)
                            "Redis pipe client connected.")))))
-   (:then (lambda (_) service)) ; Resolve with the service instance.
+   (:then (lambda (_) service))
    (:catch (lambda (err)
              (warp:log! :error (warp-redis-service-name service)
                         "Failed to start Redis service: %S" err)
              ;; Ensure any launched server is terminated on startup failure.
-             (when-let (handle (warp-redis-service-server-process-handle service))
-               (warp:log! :warn (warp-redis-service-name service) "Terminating partially started Redis server.")
+             (when-let (handle (warp-redis-service-server-process-handle
+                                service))
+               (warp:log! :warn (warp-redis-service-name service)
+                          "Terminating partially started Redis server.")
                (warp:process-terminate handle))
              (loom:rejected! err)))))
 
@@ -445,19 +540,23 @@ Returns:
    ;; Stop the main client pipe process first.
    (when-let (pipe-proc (warp-redis-service-client-pipe-process service))
      (when (process-live-p pipe-proc)
-       (warp:log! :info (warp-redis-service-name service) "Stopping Redis pipe client process.")
+       (warp:log! :info (warp-redis-service-name service)
+                  "Stopping Redis pipe client process.")
        (kill-process pipe-proc))
      (setf (warp-redis-service-client-pipe-process service) nil))
    ;; Stop the dedicated Pub/Sub subscriber process.
    (:then (lambda (_)
-            (when-let (sub-proc (warp-redis-service-subscriber-process service))
+            (when-let (sub-proc (warp-redis-service-subscriber-process
+                                 service))
               (when (process-live-p sub-proc)
-                (warp:log! :info (warp-redis-service-name service) "Stopping Redis subscriber process.")
+                (warp:log! :info (warp-redis-service-name service)
+                           "Stopping Redis subscriber process.")
                 (kill-process sub-proc))
               (setf (warp-redis-service-subscriber-process service) nil))))
    ;; Stop the managed Redis server process.
    (:then (lambda (_)
-            (if-let (handle (warp-redis-service-server-process-handle service))
+            (if-let (handle (warp-redis-service-server-process-handle
+                             service))
                 (progn
                   (warp:log! :info (warp-redis-service-name service)
                              "Stopping managed Redis server process.")
@@ -478,7 +577,8 @@ Arguments:
 
 Returns:
 - (loom-promise): A promise that resolves with the string `\"PONG\"`
-  on success, or rejects if the server is unreachable or responds with an error."
+  on success, or rejects if the server is unreachable or responds with
+  an error."
   (warp-redis--execute-pipelined service "PING"))
 
 ;;;###autoload
@@ -490,7 +590,8 @@ Arguments:
 - `KEY` (string): The key string to delete.
 
 Returns:
-- (loom-promise): A promise resolving with the number of keys removed (0 or 1)."
+- (loom-promise): A promise resolving with the number of keys removed
+  (0 or 1)."
   (warp-redis--execute-pipelined service "DEL" key))
 
 ;;;###autoload
@@ -524,11 +625,11 @@ Returns:
   `(list-name element)` on success, or `nil` if the timeout is reached
   and no element is popped."
   (braid! (apply #'warp-redis--execute-pipelined service "BLPOP"
-                 (mapcar #'s-lex-format keys-and-timeout)) ; Format keys as strings
+                 keys-and-timeout)
     (:then (lambda (result)
-             (if (listp result) ; BLPOP returns an array (list) on success
+             (if (listp result)
                  result
-               nil))))) ; It returns a nil bulk string (parsed as nil) on timeout
+               nil)))))
 
 ;;;###autoload
 (defun warp:redis-lrange (service key start stop)
@@ -595,7 +696,8 @@ Arguments:
 
 Returns:
 - (loom-promise): A promise resolving with the number of elements removed."
-  (warp-redis--execute-pipelined service "LREM" key (number-to-string count) value))
+  (warp-redis--execute-pipelined service "LREM" key (number-to-string count)
+                                 value))
 
 ;;;###autoload
 (defun warp:redis-zadd (service key score member)
@@ -612,7 +714,8 @@ Arguments:
 Returns:
 - (loom-promise): A promise resolving with `1` if `MEMBER` is new,
   `0` if `MEMBER`'s score was updated."
-  (warp-redis--execute-pipelined service "ZADD" key (number-to-string score) member))
+  (warp-redis--execute-pipelined service "ZADD" key (number-to-string score)
+                                 member))
 
 ;;;###autoload
 (defun warp:redis-zrangebyscore (service key min max)
@@ -689,33 +792,41 @@ Side Effects:
 - Adds `CALLBACK-FN` to `subscription-handlers` registry."
   (loom:with-mutex! (warp-redis-service-lock service)
     ;; Store the callback function keyed by the channel pattern.
-    (puthash channel-pattern callback-fn (warp-redis-service-subscription-handlers service))
-    ;; Lazily start the dedicated subscriber process if it's not already running.
+    (puthash channel-pattern callback-fn
+             (warp-redis-service-subscription-handlers service))
+    ;; Lazily start the dedicated subscriber process if it's not
+    ;; already running.
     (unless (and (warp-redis-service-subscriber-process service)
-                 (process-live-p (warp-redis-service-subscriber-process service)))
+                 (process-live-p (warp-redis-service-subscriber-process
+                                  service)))
       (let* ((config (warp-redis-service-config service))
              (cli-path (redis-service-config-redis-cli-executable config))
-             (port-str (number-to-string (redis-service-config-port config)))
+             (port-str (number-to-string
+                        (redis-service-config-port config)))
              (host-str (redis-service-config-host config))
-             (sub-args (list "-p" port-str "-h" host-str "--csv" ; Use --csv for easier parsing of array responses
-                             "PSUBSCRIBE" "*"))) ; Subscribe to all patterns via `*`
+             (sub-args (list "-p" port-str "-h" host-str "--csv"
+                             "PSUBSCRIBE" "*")))
         (warp:log! :info (warp-redis-service-name service)
-                   "Starting Redis subscriber client: %S %S" cli-path sub-args)
+                   "Starting Redis subscriber client: %S %S"
+                   cli-path sub-args)
         (let ((proc (apply #'start-process
-                           (format "*%s-sub*" (warp-redis-service-name service))
-                           (generate-new-buffer ; Use a dedicated buffer for subscriber output
-                            (format "*%s-sub-out*" (warp-redis-service-name service)))
+                           (format "*%s-sub*"
+                                   (warp-redis-service-name service))
+                           (generate-new-buffer
+                            (format "*%s-sub-out*"
+                                    (warp-redis-service-name service)))
                            cli-path sub-args)))
           (set-process-filter proc #'warp-redis--subscriber-filter)
           (set-process-sentinel proc (lambda (p e)
-                                       (warp:log! :error (warp-redis-service-name service)
+                                       (warp:log! :error
+                                                  (warp-redis-service-name service)
                                                   "Redis subscriber process died: %s" e)
-                                       ;; Clear process handle on death.
                                        (setf (warp-redis-service-subscriber-process service) nil)))
-          (process-put proc 'service-handle service) ; Store handle to service
+          (process-put proc 'service-handle service)
           (setf (warp-redis-service-subscriber-process service) proc)
-          (warp:log! :info (warp-redis-service-name service) "Redis subscriber client started."))))
-    (loom:resolved! t))) ; Subscription is active once handler is registered and process is started/live.
+          (warp:log! :info (warp-redis-service-name service)
+                     "Redis subscriber client started."))))
+    (loom:resolved! t)))
 
 ;;;###autoload
 (defun warp:redis-unsubscribe (service channel-pattern)
@@ -734,10 +845,11 @@ Arguments:
 Returns:
 - (loom-promise): A promise that resolves to `t`."
   (loom:with-mutex! (warp-redis-service-lock service)
-    (remhash channel-pattern (warp-redis-service-subscription-handlers service))
+    (remhash channel-pattern
+             (warp-redis-service-subscription-handlers service))
     (warp:log! :debug (warp-redis-service-name service)
                "Unsubscribed local handler for pattern '%s'." channel-pattern))
   (loom:resolved! t))
 
 (provide 'warp-redis)
-;;; warp-redis.el ends here
+;;; warp-redis.el ends here ;;;

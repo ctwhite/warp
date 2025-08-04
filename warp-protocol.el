@@ -84,23 +84,28 @@ binary serialization."
 (warp:defschema warp-worker-heartbeat-payload
     ((:constructor make-warp-worker-heartbeat-payload))
   "Payload for the periodic `:heartbeat` RPC to the control plane leader.
+Note: The worker's public key is NOT sent with every heartbeat; it's
+typically exchanged during the initial `:worker-ready` handshake.
 
 Fields:
 - `worker-id` (string): ID of the worker sending the heartbeat.
 - `status` (symbol): Current operational status (e.g., `:running`).
 - `timestamp` (float): `float-time` when the heartbeat was created.
-- `services` (list): Lisp objects describing services on the worker."
+- `services` (list): Lisp objects describing services on the worker.
+- `metrics` (bytes): Serialized metrics hash-table (e.g., `warp-worker-metrics`)."
   (worker-id nil :type string)
   (status nil :type symbol)
   (timestamp (float-time) :type float)
-  (services nil :type list))
+  (services nil :type list)
+  (metrics nil :type bytes)) ;; Added metrics field to schema and docstring
 
 (warp:defprotobuf-mapping warp-worker-heartbeat-payload
   "Protobuf mapping for `warp-worker-heartbeat-payload`."
   `((worker-id 1 :string)
     (status 2 :string)
     (timestamp 3 :double)
-    (services 4 :bytes)))
+    (services 4 :bytes) ;; Services (list of plists) are marshaled to bytes
+    (metrics 5 :bytes))) ;; Metrics (hash-table) are marshaled to bytes
 
 (warp:defschema warp-get-init-payload-args
     ((:constructor make-warp-get-init-payload-args))
@@ -150,8 +155,8 @@ Fields:
 
 (warp:defprotobuf-mapping warp-cluster-map-payload
   "Protobuf mapping for `warp-cluster-map-payload`."
-  `((function-form 1 :bytes)
-    (chunk-data 2 :bytes)))
+  `((function-form 1 :bytes) ;; Lisp form marshaled to bytes
+    (chunk-data 2 :bytes)))  ;; List data marshaled to bytes
 
 (warp:defschema warp-cluster-map-result
     ((:constructor make-warp-cluster-map-result))
@@ -163,7 +168,7 @@ Fields:
 
 (warp:defprotobuf-mapping warp-cluster-map-result
   "Protobuf mapping for `warp-cluster-map-result`."
-  `((results 1 :bytes)))
+  `((results 1 :bytes))) ;; List of results marshaled to bytes
 
 ;;----------------------------------------------------------------------
 ;;; Provisioning RPC Payloads
@@ -200,7 +205,7 @@ Fields:
 (warp:defprotobuf-mapping warp-provision-response-payload
   "Protobuf mapping for `warp-provision-response-payload`."
   `((version 1 :string)
-    (provision 2 :bytes)))
+    (provision 2 :bytes))) ;; Provision data (arbitrary Lisp object) marshaled to bytes
 
 (warp:defschema warp-provision-update-payload
     ((:constructor make-warp-provision-update-payload))
@@ -219,9 +224,9 @@ Fields:
 (warp:defprotobuf-mapping warp-provision-update-payload
   "Protobuf mapping for `warp-provision-update-payload`."
   `((version 1 :string)
-    (provision 2 :bytes)
+    (provision 2 :bytes) ;; Provision data marshaled to bytes
     (provision-type 3 :string)
-    (target-ids 4 :bytes)))
+    (target-ids 4 :bytes))) ;; List of strings marshaled to bytes
 
 (warp:defschema warp-provision-jwt-keys-payload
     ((:constructor make-warp-provision-jwt-keys-payload))
@@ -234,7 +239,7 @@ Fields:
 
 (warp:defprotobuf-mapping warp-provision-jwt-keys-payload
   "Protobuf mapping for `warp-provision-jwt-keys-payload`."
-  `((trusted-keys 1 :bytes)))
+  `((trusted-keys 1 :bytes))) ;; List of (key . value) pairs marshaled to bytes
 
 ;;----------------------------------------------------------------------
 ;;; Coordination RPC Payloads
@@ -250,7 +255,25 @@ Fields:
 
 (warp:defprotobuf-mapping warp-propagate-event-payload
   "Protobuf mapping for `warp-propagate-event-payload`."
-  `((event 1 :bytes)))
+  `((event 1 :bytes))) ;; Event struct marshaled to bytes
+
+;; ADDED: New schema for getting leader address from coordinator peer
+(warp:defschema warp-coordinator-get-leader-response
+    ((:constructor make-warp-coordinator-get-leader-response))
+  "Response payload for `:get-coordinator-leader` RPC.
+This allows a node to query a coordinator peer for the current leader's
+advertised address.
+
+Fields:
+- `leader-id` (string): The ID of the currently elected leader.
+- `leader-address` (string): The public contact address of the leader."
+  (leader-id nil :type (or null string))
+  (leader-address nil :type (or null string)))
+
+(warp:defprotobuf-mapping warp-coordinator-get-leader-response
+  "Protobuf mapping for `warp-coordinator-get-leader-response`."
+  `((leader-id 1 :string)
+    (leader-address 2 :string)))
 
 (warp:defschema warp-coordinator-request-vote-payload
     ((:constructor make-warp-coordinator-request-vote-payload))
@@ -425,8 +448,8 @@ Fields:
 
 (warp:defprotobuf-mapping warp-coordinator-propose-change-payload
   "Protobuf mapping for `warp-coordinator-propose-change-payload`."
-  `((key 1 :bytes) ; Key (path) is a list, marshaled as bytes.
-    (value 2 :bytes))) ; Value (arbitrary Lisp data), marshaled as bytes.
+  `((key 1 :bytes) ; Key (path list) marshaled as bytes.
+    (value 2 :bytes))) ; Value (arbitrary Lisp data) marshaled as bytes.
 
 (warp:defschema warp-coordinator-propose-change-response-payload
     ((:constructor make-warp-coordinator-propose-change-response-payload))
@@ -575,7 +598,7 @@ Returns:
 ;;;###autoload
 (cl-defun warp:protocol-send-heartbeat
     (rpc-system connection worker-id status services leader-id
-                &key (expect-response nil) origin-instance-id)
+                &key metrics (expect-response nil) origin-instance-id) ;; Added metrics, public-key was removed.
   "Sends a periodic `:heartbeat` from a worker to the leader.
 Heartbeats are used to report the worker's liveness and current metrics.
 
@@ -586,6 +609,7 @@ Arguments:
 - `STATUS` (keyword): The worker's current operational status.
 - `SERVICES` (list): A list describing services hosted by the worker.
 - `LEADER-ID` (string): The ID of the leader node to send the message to.
+- `:metrics` (bytes): Serialized `warp-worker-metrics` data.
 - `:expect-response` (boolean, optional): Whether a response is expected.
 - `:origin-instance-id` (string, optional): ID of the component system instance.
 
@@ -594,7 +618,7 @@ Returns:
   is `t`, otherwise `nil`."
   (let ((cmd (warp-protocol--make-command
               :heartbeat #'make-warp-worker-heartbeat-payload
-              :worker-id worker-id :status status :services services)))
+              :worker-id worker-id :status status :services services :metrics metrics)))
     (warp:rpc-request rpc-system connection worker-id leader-id cmd
                       :expect-response expect-response
                       :origin-instance-id origin-instance-id)))
@@ -757,6 +781,31 @@ Returns:
               :event event)))
     (warp:rpc-request rpc-system connection sender-id recipient-id cmd
                       :expect-response nil
+                      :origin-instance-id origin-instance-id)))
+
+;;;###autoload
+(cl-defun warp:protocol-get-coordinator-leader (rpc-system 
+                                                connection 
+                                                sender-id 
+                                                recipient-id 
+                                                &key origin-instance-id)
+  "Requests the current leader's address from a coordinator peer.
+This RPC is used by workers to dynamically discover the active leader
+for the control plane.
+
+Arguments:
+- `RPC-SYSTEM` (warp-rpc-system): The RPC system.
+- `CONNECTION` (t): The `warp-transport` connection to the coordinator peer.
+- `SENDER-ID` (string): The ID of the requesting node (e.g., worker ID).
+- `RECIPIENT-ID` (string): The ID of the coordinator peer to query.
+- `:origin-instance-id` (string, optional): ID of the component system instance.
+
+Returns:
+- (loom-promise): A promise that resolves with a `warp-coordinator-get-leader-response`
+  containing the leader's ID and address, or rejects on error."
+  (let ((cmd (make-warp-rpc-command :name :get-coordinator-leader))) ;; No args needed for this request
+    (warp:rpc-request rpc-system connection sender-id recipient-id cmd
+                      :expect-response t
                       :origin-instance-id origin-instance-id)))
 
 ;;;###autoload

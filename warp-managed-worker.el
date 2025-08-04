@@ -28,11 +28,21 @@
 
 (require 'cl-lib)
 (require 'loom)
+(require 'braid) 
 
 (require 'warp-log)
 (require 'warp-rpc)
 (require 'warp-circuit-breaker)
 (require 'warp-transport)
+(require 'warp-worker) 
+(require 'warp-security-policy) 
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Error Definitions
+
+(define-error 'warp-managed-worker-error
+  "A generic error related to managed worker operations."
+  'warp-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definitions
@@ -57,8 +67,8 @@ Fields:
   (e.g., `:healthy`, `:degraded`, `:unhealthy`), as determined by the
   master based on various observations.
 - `last-reported-metrics` (hash-table or nil): A hash table containing
-  the last full metrics report received from this worker's
-  `warp-metrics-pipeline`. This is the worker's self-reported state.
+  the latest metrics report received from this worker. This is the
+  worker's self-reported state.
 - `active-rpcs` (integer): The current count of master-initiated RPCs
   that are in-flight (sent but awaiting response) to this worker.
 - `observed-avg-rpc-latency` (float): The master's observed running
@@ -86,7 +96,31 @@ Fields:
 ;;; Public API
 
 ;;;###autoload
-(defun warp:managed-worker-update-from-metrics (m-worker metrics-hash)
+(cl-defun warp:managed-worker-create (&key worker-id (pool-name "default") rank connection inbox-address) 
+  "Creates a new `warp-managed-worker` instance.
+This is typically called by the `warp-bridge` when a new worker
+connects and is registered.
+
+Arguments:
+- `:worker-id` (string): The unique ID of the worker.
+- `:pool-name` (string): The name of the pool this worker belongs to. Defaults to 'default'.
+- `:rank` (integer or nil): The worker's rank.
+- `:connection` (warp-transport-connection or nil): The network connection.
+- `:inbox-address` (string or nil): The RPC address for this worker.
+
+Returns:
+- (warp-managed-worker): A new managed worker instance."
+  (warp:log! :info 
+              "managed-worker" "Creating managed worker: %s (Pool: %s)" 
+              worker-id pool-name)
+  (%%make-managed-worker :worker-id worker-id
+                         :pool-name pool-name ;; `pool-name` is used here in the constructor
+                         :rank rank
+                         :connection connection
+                         :inbox-address inbox-address))
+
+;;;###autoload
+(defun warp:managed-worker-update-metrics (m-worker metrics-hash)
   "Update the managed worker's state from a metrics report hash table.
 This function is the primary way the master ingests state information
 *from* a worker's heartbeat and updates its own view. It is decoupled
@@ -96,8 +130,8 @@ makes it flexible to changes in the worker's metrics reporting.
 Arguments:
 - `M-WORKER` (warp-managed-worker): The managed worker instance to update.
 - `METRICS-HASH` (hash-table): The latest metrics report from the
-  worker's `warp-metrics-pipeline` (or other source). Expected to be
-  a hash table mapping string keys to values.
+  worker. Expected to be a hash table mapping string keys to values,
+  e.g., containing `:health-status` and other numeric/string metrics.
 
 Returns: `nil`.
 
@@ -115,9 +149,9 @@ Signals:
   (setf (warp-managed-worker-last-reported-metrics m-worker) metrics-hash)
 
   ;; Update health status from the worker-reported metrics. The key
-  ;; "health_status" is a standardized key expected from the pipeline.
+  ;; "health_status" is assumed to be present and holds a symbol.
   (setf (warp-managed-worker-health-status m-worker)
-        (gethash "health_status" metrics-hash :unknown))
+        (gethash :health-status metrics-hash :unknown)) ; Using :health-status as key
 
   ;; Update last heartbeat time.
   (setf (warp-managed-worker-last-heartbeat-time m-worker) (float-time)))
@@ -182,5 +216,41 @@ Returns:
   no latency has been observed yet."
   (warp-managed-worker-observed-avg-rpc-latency m-worker))
 
+;;---------------------------------------------------------------------
+;;; RPC Handlers (Worker-side logic for commands from Master)
+;;---------------------------------------------------------------------
+
+(defun warp-handler-execute-lisp-form (command context)
+  "Handles the `:execute-lisp-form` RPC.
+Evaluates a provided Lisp form string within the worker's environment.
+This RPC is intended for remote debugging or dynamic changes. It uses
+`warp-security-policy` for sandboxed execution.
+
+Arguments:
+- `command` (warp-rpc-command): The incoming command, with `:form-string` in args.
+- `context` (plist): The RPC context, containing worker and system references.
+
+Returns:
+- (loom-promise): A promise that resolves with the result of the Lisp form evaluation."
+  (let* ((worker (plist-get context :worker)) ; Get worker instance from context
+         (system (warp-worker-component-system worker))
+         (policy (warp:component-system-get system :security-policy))
+         (form-string (plist-get (warp-rpc-command-args command) :form-string)))
+    (warp:log! :warn (warp-worker-worker-id worker) 
+               "Executing remote Lisp form: '%s'" 
+               form-string)
+    (braid! (warp:security-policy-execute-form policy (read-from-string form-string))
+      (:then (lambda (result)
+               (warp:log! :info (warp-worker-worker-id worker) 
+                          "Remote Lisp form executed. Result: %S" result)
+               result))
+      (:catch (lambda (err)
+                (warp:log! :error (warp-worker-worker-id worker) 
+                           "Failed to execute remote Lisp form: %S" err)
+                (loom:rejected! (
+                  warp:error! :type 'warp-worker-error
+                              :message (format "Remote Lisp execution failed: %S" err)
+                              :cause err)))))))
+
 (provide 'warp-managed-worker)
-;;; warp-managed-worker.el ends here
+;;; warp-managed-worker.el ends here ;;;

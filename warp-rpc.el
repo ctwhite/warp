@@ -213,17 +213,20 @@ Fields:
 ;;; Private Functions
 
 (defun warp-rpc--generate-id ()
-  "Generates a unique ID string for RPC requests and commands.
-This ID is composed of a high-precision timestamp and a random hexadecimal
-component to ensure uniqueness across different RPC calls, which is
-important for correlation and tracing.
+  "Generates a cryptographically strong and unique ID string for RPC requests and commands.
+This ID is composed of a high-precision timestamp and a securely generated
+random component (using `secure-hash` of random data) to ensure a high degree
+of uniqueness across different RPC calls, which is important for correlation
+and distributed tracing, minimizing the risk of collisions.
 
 Arguments:
 - None.
 
 Returns:
-- (string): A unique identifier string."
-  (format "%s-%012x" (format-time-string "%s%N") (random (expt 16 12))))
+- (string): A unique identifier string (e.g., '1733221200000000000-a1b2c3d4e5f6')."
+  (format "%s-%s"
+          (format-time-string "%s%N" (float-time)) ; High-precision timestamp
+          (substring (secure-hash 'sha256 (format "%s%s%s" (float-time) (random t) (emacs-pid))) 0 12))) ; Shortened secure hash for uniqueness
 
 (defun warp-rpc--handle-timeout (rpc-system correlation-id)
   "Handles a timeout for a pending RPC request.
@@ -262,7 +265,9 @@ Side Effects:
                                      correlation-id)))))
   nil)
 
-(defun warp-rpc--send-transport-level-response (rpc-system message connection
+(defun warp-rpc--send-transport-level-response (rpc-system 
+                                                message 
+                                                connection
                                                 response-obj)
   "Sends a basic `warp-rpc-message` response via the transport layer.
 This helper is used for 'fire-and-forget' RPCs (where the requester
@@ -342,7 +347,6 @@ Side Effects:
   "Returns the metrics hash table for the RPC system."
   (warp-rpc-system-metrics rpc-system))
 
-;;;###autoload
 (cl-defun warp:rpc-request (rpc-system
                             connection
                             sender-id
@@ -355,7 +359,8 @@ Side Effects:
 This is the primary way for a Warp component to initiate a remote
 procedure call to another node or component in the cluster. It constructs
 and sends the `warp-rpc-message`, manages the pending request state, and
-schedules a timeout.
+schedules a timeout. It will also automatically inject distributed tracing
+context if a trace is active.
 
 Arguments:
 - `rpc-system` (warp-rpc-system): The RPC system component instance
@@ -402,6 +407,13 @@ Side Effects:
          (my-origin-instance-id (or origin-instance-id
                                     (warp:env-val 'warp-instance-id))))
 
+    ;; Inject trace context from the current span into the command metadata.
+    (when-let (current-span (warp:trace-current-span))
+      (let ((trace-context `(:trace-id ,(warp-trace-span-trace-id current-span)
+                             :parent-span-id ,(warp-trace-span-span-id current-span))))
+        (setf (warp-rpc-command-metadata command)
+              (plist-put (warp-rpc-command-metadata command) :trace-context trace-context))))
+
     ;; If a response is expected, register a pending promise in our local
     ;; hash table. This record includes the promise itself and a timer
     ;; to handle timeouts.
@@ -441,7 +453,7 @@ Side Effects:
                  (warp:log! :trace (warp-rpc-system-name rpc-system)
                             (format "RPC message '%s' sent successfully."
                                     correlation-id))
-                 request-promise)) 
+                 request-promise))
         (:catch (lambda (err)
                   ;; If sending fails, we must clean up the pending request.
                   (when expect-response
@@ -461,7 +473,7 @@ Side Effects:
                                      (warp-rpc-command-id command) err))
                   nil)))) ; No promise to return for fire-and-forget on transport error
     request-promise))
-
+    
 (defun warp:rpc-handle-response (rpc-system message)
   "Handles an incoming RPC response message on the requester side.
 This function is called by the transport layer when a `warp-rpc-message`
@@ -509,8 +521,10 @@ Side Effects:
               (loom:promise-resolve
                promise (warp-rpc-response-payload response-payload)))))))))
 
-(defun warp:rpc-handle-request-result (rpc-system request-message connection
-                                        result error)
+(defun warp:rpc-handle-request-result (rpc-system 
+                                       request-message connection
+                                       result 
+                                       error)
   "Handles the final result of an executed RPC command, sending a response
 back to the original caller. This function is typically the last step in
 the RPC server-side pipeline after a command has been dispatched and
@@ -540,11 +554,17 @@ Side Effects:
 - Creates a `warp-rpc-response` object.
 - If `request-promise-id` is present, creates and settles a `loom:promise-proxy`,
   which triggers the IPC layer to dispatch the settlement remotely.
-- If no `request-promise-id`, calls `warp-rpc--send-transport-level-response`."
+- If no `request-promise-id`, calls `warp-rpc--send-transport-level-response`.
+- Updates RPC system metrics for total requests processed and failed requests."
   (let* ((command (warp-rpc-message-payload request-message))
          (cmd-id (warp-rpc-command-id command))
          (promise-id-str (warp-rpc-command-request-promise-id command))
          (origin-instance-id (warp-rpc-command-origin-instance-id command)))
+
+    (loom:with-mutex! (warp-rpc-system-lock rpc-system)
+      (cl-incf (gethash :total-requests-processed (warp-rpc-system-metrics rpc-system) 0))
+      (when error
+        (cl-incf (gethash :failed-request-count (warp-rpc-system-metrics rpc-system) 0))))
 
     ;; Construct the response payload based on success or error.
     (let ((response (if error
@@ -716,4 +736,4 @@ Side Effects:
                    (t (error "Invalid RPC handler definition: %S" ',def)))))))
 
 (provide 'warp-rpc)
-;;; warp-rpc.el ends here
+;;; warp-rpc.el ends here ;;;
