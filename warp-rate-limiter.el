@@ -221,8 +221,9 @@ Returns:
 - (function): A middleware function with the signature
   `(lambda (command context next))`."
   (lambda (_command context next)
-    (let* ((rpc-payload (warp-request-pipeline-context-rpc-event-payload
-                         context))
+    "Rate limiting middleware generated from a `warp-rate-limiter` instance."
+    (let* ((rpc-payload
+            (warp-request-pipeline-context-rpc-event-payload context))
            (message (warp-protocol-rpc-event-payload-message rpc-payload))
            (client-id (warp-rpc-message-sender-id message)))
       (if (warp--rate-limiter-check limiter client-id)
@@ -239,4 +240,4 @@ Returns:
                              client-id))))))))
 
 (provide 'warp-rate-limiter)
-;;; warp-rate-limiter.el ends here
+;;; warp-rate-limiter.el ends here ;;;

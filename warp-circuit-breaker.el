@@ -201,7 +201,8 @@ Returns:
 This function is called by the `warp-state-machine` whenever the
 circuit breaker's internal state changes. It manages side effects like
 logging and triggering the `on-state-change` callback defined in the
-breaker's configuration, and emitting events if an event system is present.
+breaker's configuration, and emitting events if an event system is
+present.
 
 Arguments:
 - `CTX` (plist): The context from the state machine, containing `:breaker`.
@@ -219,24 +220,28 @@ Returns: (loom-promise): A promise that resolves to `t`."
 
     (warp:log! :info (warp--circuit-breaker-log-target service-id)
                "State changed: %S -> %S" old-state new-state)
-    (when on-state-change-fn
-      (funcall on-state-change-fn service-id new-state))
-
-    ;; Emit event if event system is present
-    (when event-system
-      (warp:emit-event-with-options
-       event-system
-       :circuit-breaker-state-changed
-       `(:service-id ,service-id :old-state ,old-state :new-state ,new-state)
-       :source-id (warp--circuit-breaker-log-target service-id)
-       :distribution-scope :local))
-    (loom:resolved! t)))
+    (braid! (loom:resolved! t) ; Start async chain
+      (:then (lambda (_) ; Call hook function if present
+               (when on-state-change-fn
+                 (loom:await ; Await hook execution
+                  (funcall on-state-change-fn service-id new-state)))))
+      (:then (lambda (_) ; Emit event if event system is present
+               (when event-system
+                 (warp:emit-event-with-options
+                  event-system
+                  :circuit-breaker-state-changed
+                  `(:service-id ,service-id
+                    :old-state ,old-state
+                    :new-state ,new-state)
+                  :source-id (warp--circuit-breaker-log-target service-id)
+                  :distribution-scope :local))))
+      (:then (lambda (_) t)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;###autoload
-(cl-defun warp:circuit-breaker-register-policy (policy-name 
+(cl-defun warp:circuit-breaker-register-policy (policy-name
                                                 config-options
                                                 &key description)
   "Register a circuit breaker policy template using the registry module.
@@ -282,16 +287,16 @@ Side Effects:
     (warp:registry-remove registry policy-name)))
 
 ;;;###autoload
-(cl-defun warp:circuit-breaker-get (service-id &key policy-name 
-                                                    config-options 
+(cl-defun warp:circuit-breaker-get (service-id &key policy-name
+                                                    config-options
                                                     event-system)
   "Retrieve an existing, or create a new, circuit breaker instance.
 This function acts as a thread-safe factory and registry, ensuring that
-only one circuit breaker instance exists for any given service identifier.
-If `POLICY-NAME` is provided, the circuit breaker will be configured
-using the parameters from that registered policy. Explicit `CONFIG-OPTIONS`
-will override policy settings if both are provided. If neither is provided,
-default configuration values are used.
+only one circuit breaker instance exists for any given service
+identifier. If `POLICY-NAME` is provided, the circuit breaker will be
+configured using the parameters from that registered policy. Explicit
+`CONFIG-OPTIONS` will override policy settings if both are provided. If
+neither is provided, default configuration values are used.
 
 Arguments:
 - `SERVICE-ID` (string): A unique ID for the service being protected.
@@ -299,9 +304,9 @@ Arguments:
 - `:config-options` (plist, optional): A property list of options for
   the `circuit-breaker-config` struct. These options override any values
   from `policy-name`.
-- `:event-system` (warp-event-system, optional): The event system instance
-  to associate with this circuit breaker for emitting events. If a breaker
-  already exists for `SERVICE-ID`, this argument is ignored.
+- `:event-system` (warp-event-system, optional): The event system
+  instance to associate with this circuit breaker for emitting events.
+  If a breaker already exists for `SERVICE-ID`, this argument is ignored.
 
 Returns: (warp-circuit-breaker): The circuit breaker for the service.
 
@@ -425,7 +430,8 @@ Side Effects:
              (warp:log! :debug (warp--circuit-breaker-log-target
                                 (warp-circuit-breaker-service-id breaker))
                         "Open timeout expired, transitioning to half-open.")
-             (warp:state-machine-emit sm :half-open)))
+             (loom:await ; Await state machine emit
+              (warp:state-machine-emit sm :half-open))))
          ;; Re-check state after potential transition to see if half-open
          ;; and acquire semaphore.
          (if (eq (warp:state-machine-current-state sm) :half-open)
@@ -471,7 +477,8 @@ Side Effects:
                              (warp-circuit-breaker-service-id breaker))
                       "Circuit CLOSED after %d successes."
                       (warp-circuit-breaker-success-count breaker))
-           (warp:state-machine-emit sm :closed))
+           (loom:await ; Await state machine emit
+            (warp:state-machine-emit sm :closed)))
          (loom:resolved! t))))))
 
 ;;;###autoload
@@ -500,7 +507,7 @@ Side Effects:
             (warp-circuit-breaker-config-failure-predicate config))
            (should-count-as-failure (if failure-predicate
                                         (funcall failure-predicate error-obj)
-                                      t))) ; Default: all errors count
+                                      t)))
 
       (if should-count-as-failure
           (progn
@@ -509,13 +516,15 @@ Side Effects:
                   (float-time))
             (pcase current-state
               (:half-open
-               (warp:state-machine-emit sm :open))
+               (loom:await ; Await state machine emit
+                (warp:state-machine-emit sm :open)))
               (:closed
                (cl-incf (warp-circuit-breaker-failure-count breaker))
                (when (>= (warp-circuit-breaker-failure-count breaker)
                          (warp-circuit-breaker-config-failure-threshold
                           config))
-                 (warp:state-machine-emit sm :open))))
+                 (loom:await ; Await state machine emit
+                  (warp:state-machine-emit sm :open)))))
             (loom:resolved! t))
         ;; If not counting as failure, just resolve
         (loom:resolved! t)))))
@@ -539,10 +548,10 @@ Returns:
     (if (warp:circuit-breaker-can-execute-p breaker)
         (braid! (apply protected-async-fn args)
           (:then (lambda (result)
-                   (warp:circuit-breaker-record-success breaker)
+                   (loom:await (warp:circuit-breaker-record-success breaker))
                    result))
           (:catch (lambda (err)
-                    (warp:circuit-breaker-record-failure breaker err)
+                    (loom:await (warp:circuit-breaker-record-failure breaker err))
                     (loom:rejected! err))))
       (loom:rejected!
        (warp:error! :type 'warp-circuit-breaker-open-error
@@ -592,7 +601,7 @@ Arguments:
 
 Returns: (loom-promise): A promise that resolves to `t` if the breaker
   was found and reset, or rejects if not found."
-  (let ((registry (warp-circuit-breaker--get-instance-registry)))
+  (let ((registry (warp-circuit-breaker--get-instance-registry())))
     (when-let ((breaker (warp:registry-get registry service-id)))
       (loom:with-mutex! (warp-circuit-breaker-lock breaker)
         (loom:await (warp:state-machine-emit
@@ -614,7 +623,7 @@ Returns: (loom-promise): A promise that resolves to `t` if the breaker
 Side Effects:
 - Transitions the specified circuit breaker's state to `:open`.
 - Updates `last-failure-time` to the current time."
-  (let ((registry (warp-circuit-breaker--get-instance-registry)))
+  (let ((registry (warp-circuit-breaker--get-instance-registry())))
     (when-let ((breaker (warp:registry-get registry service-id)))
       (loom:with-mutex! (warp-circuit-breaker-lock breaker)
         (setf (warp-circuit-breaker-last-failure-time breaker) (float-time))
@@ -639,7 +648,7 @@ circuit breakers.
 Returns:
 - (hash-table): A hash table mapping service IDs to their status plists."
   (let ((stats (make-hash-table :test 'equal))
-        (registry (warp-circuit-breaker--get-instance-registry)))
+        (registry (warp-circuit-breaker--get-instance-registry())))
     (dolist (id (warp:registry-list-keys registry))
       (puthash id (warp:circuit-breaker-status id) stats))
     stats))

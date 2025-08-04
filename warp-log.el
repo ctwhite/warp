@@ -9,9 +9,9 @@
 ;;
 ;; 1.  **`warp-log-server` (Master-side):** This component creates a core
 ;;     `loom-log-server` and binds a `warp-channel` to a specified
-;;     address. All incoming `warp-log-entry` objects on this channel are
-;;     converted back to `loom-log-entry` structs and pushed into the
-;;     `loom-log-server`'s internal queue for processing.
+;;     address. All incoming `warp-log-entry` objects on this channel
+;;     are converted back to `loom-log-entry` structs and pushed into
+;;     the `loom-log-server`'s internal queue for processing.
 ;;
 ;; 2.  **`warp-log-client` (Worker-side):** This component configures the
 ;;     default `loom-log-server` to act as a client. It intercepts
@@ -178,9 +178,11 @@ Side Effects:
           (setq extra-data (plist-put extra-data :worker-rank worker-rank)))
         (when current-span
           (setq extra-data (plist-put extra-data :trace-id
-                                      (warp-trace-span-trace-id current-span)))
+                                      (warp-trace-span-trace-id
+                                       current-span)))
           (setq extra-data (plist-put extra-data :span-id
-                                      (warp-trace-span-span-id current-span))))
+                                      (warp-trace-span-span-id
+                                       current-span))))
         (let ((warp-entry
                (make-warp-log-entry
                 :timestamp (loom-log-entry-timestamp log-entry)
@@ -188,6 +190,8 @@ Side Effects:
                 :target (loom-log-entry-target log-entry)
                 :message (loom-log-entry-message log-entry)
                 :extra-data extra-data)))
+          ;; Call warp:channel-send. This is a fire-and-forget;
+          ;; its promise is not awaited by this synchronous function.
           (warp:channel-send server-address warp-entry)
           t))
     (error
@@ -195,7 +199,7 @@ Side Effects:
      nil)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Public API
+;;; Public API - Service Management
 
 ;;;---------------------------------------------------------------------
 ;;; Log Server
@@ -271,7 +275,7 @@ Side Effects:
     (loom:log-shutdown-server server))
   (when-let (channel (warp-log-server-listener-channel
                       log-server-component))
-    (warp:channel-close channel))
+    (loom:await (warp:channel-close channel)))
   (setf (warp-log-server-loom-server log-server-component) nil)
   (setf (warp-log-server-listener-channel log-server-component) nil)
   (warp:log! :info "warp-log" "Log server stopped.")

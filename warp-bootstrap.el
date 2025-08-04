@@ -14,6 +14,23 @@
 ;;     and register all of its components. It is the standard, low-level
 ;;     tool for building the object graph of a `warp-worker` or `warp-cluster`.
 ;;
+;;; warp-bootstrap.el --- High-Level Bootstrapping for Warp Systems -*-
+;;; lexical-binding: t; -*-
+
+;;; Commentary:
+;;
+;; This module provides the primary, high-level entry points for the
+;; Warp framework. It serves as the central hub for both assembling
+;; component systems and managing the overall application lifecycle.
+;;
+;; It consolidates two key bootstrapping functions:
+;;
+;; 1.  **Component System Assembly (`warp:bootstrap-system`):** This macro
+;;     provides a declarative way to create a `warp-component-system`
+;;     and register all of its components. It is the standard, low-level
+;;     tool for building the object graph of a `warp-worker` or
+;;     `warp-cluster`.
+;;
 ;; 2.  **Application Lifecycle Management (`warp:init`, `warp:shutdown`):**
 ;;     These functions provide simple, top-level entry points for
 ;;     initializing and shutting down the underlying Loom library, which
@@ -52,8 +69,8 @@ Arguments:
 - `:context` (alist): An association list of static key-value pairs
   (e.g., `'((:config . config-object))`) that can be injected as
   dependencies into any component.
-- `:definitions` (list of plists): A list where each element is a plist
-  that defines one component, matching the format required by
+- `:definitions` (list of plists): A list where each element is a
+  plist that defines one component, matching the format required by
   `warp:defcomponent`.
 
 Returns:
@@ -63,7 +80,8 @@ Returns:
 
 Side Effects:
 - Creates a `warp-component-system` instance.
-- Populates the system with all provided component definitions at compile time."
+- Populates the system with all provided component definitions at
+  compile time."
   `(let ((system (warp:component-system-create :name ,name :context ,context)))
      ,@(cl-loop for def in definitions
                 collect `(warp:defcomponent system ,def))
@@ -90,7 +108,7 @@ Returns: `t`."
   "Shut down the core libraries (Loom) that Warp depends on.
 
 Returns: `nil`."
-  (warp:log! :info "warp" "Shutting down framework...")
+  (warp:log! :info "warp" "Shutting down Warp framework...")
   (loom:shutdown)
   (warp:log! :info "warp" "Warp framework shutdown complete.")
   nil)

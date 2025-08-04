@@ -37,15 +37,15 @@
 ;;     (id 2 :int32 :required)
 ;;     (phones 4 :string :repeated)
 ;;     (addresses 5 :map :optional :key-type :string
-;;                  :value-type :message :value-schema address-schema))
+;;                   :value-type :message :value-schema address-schema))
 ;;
 ;;   ;; Encode a message
 ;;   (setq encoded (warp:protobuf-encode person-schema
-;;                                     '(:name "John Doe"
-;;                                       :id 123
-;;                                       :phones ("555-1234" "555-5678")
-;;                                       :addresses (("home" (:street "123 Main"
-;;                                                                    :city "Boston"))))))
+;;                                       '(:name "John Doe"
+;;                                         :id 123
+;;                                         :phones ("555-1234" "555-5678")
+;;                                         :addresses (("home" (:street "123 Main"
+;;                                                                      :city "Boston"))))))
 
 ;;; Code:
 (require 'cl-lib)
@@ -58,32 +58,32 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
 
-(define-error 'warp-protobuf-error 
-  "Generic Protocol Buffers error" 
+(define-error 'warp-protobuf-error
+  "Generic Protocol Buffers error"
   'warp-error)
 
-(define-error 'warp-protobuf-decode-error 
-  "Protocol Buffers decode error" 
+(define-error 'warp-protobuf-decode-error
+  "Protocol Buffers decode error"
   'warp-protobuf-error)
 
-(define-error 'warp-protobuf-encode-error 
-  "Protocol Buffers encode error" 
+(define-error 'warp-protobuf-encode-error
+  "Protocol Buffers encode error"
   'warp-protobuf-error)
 
-(define-error 'warp-protobuf-schema-error 
-  "Protocol Buffers schema error" 
+(define-error 'warp-protobuf-schema-error
+  "Protocol Buffers schema error"
   'warp-protobuf-error)
 
-(define-error 'warp-protobuf-validation-error 
-  "Protocol Buffers validation error" 
+(define-error 'warp-protobuf-validation-error
+  "Protocol Buffers validation error"
   'warp-protobuf-error)
 
-(define-error 'warp-protobuf-oneof-error 
-  "Protocol Buffers oneof error" 
+(define-error 'warp-protobuf-oneof-error
+  "Protocol Buffers oneof error"
   'warp-protobuf-error)
 
-(define-error 'warp-protobuf-any-error 
-  "Protocol Buffers any error" 
+(define-error 'warp-protobuf-any-error
+  "Protocol Buffers any error"
   'warp-protobuf-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -136,8 +136,7 @@ Arguments:
 - `NAME` (symbol): The name of the schema.
 - `SCHEMA` (list): The schema definition list.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Modifies the global `warp-protobuf--schema-registry` hash table."
@@ -160,8 +159,7 @@ Arguments:
 - `NAME` (symbol): The name of the enum.
 - `ENUM-DEF` (alist): The enum definition (alist of `(symbol . number)`).
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Modifies the global `warp-protobuf--enum-registry` hash table."
@@ -182,8 +180,8 @@ Returns:
 
 (defun warp-protobuf--ensure-unibyte (str)
   "Ensure STR is a unibyte string, encoding if necessary.
-This function is crucial for handling binary data accurately with `bindat`
-and for ensuring consistent byte-level operations.
+This function is crucial for handling binary data accurately with
+`bindat` and for ensuring consistent byte-level operations.
 
 Arguments:
 - `str` (string): The input string.
@@ -300,7 +298,7 @@ Signals:
           (signal 'warp-protobuf-decode-error
                   (list (warp:error! :type 'warp-protobuf-decode-error
                                      :message "Varint is too long (exceeds 64 bits)"))))))
-    nil)) ; Reached end of data without completing varint
+    nil))
 
 (defun warp-protobuf-encode-zigzag32 (n)
   "Encode signed 32-bit integer N using ZigZag encoding.
@@ -635,7 +633,6 @@ Returns:
                     (warp-protobuf-encode-field-header
                      2 (cdr (assq value-type warp-protobuf--type-wire-map)))
                     (if (eq value-type :message)
-                        ;; Pass value-schema as extra-arg for message type
                         (warp-protobuf-encode-value
                          value-type value :schema value-schema)
                       (warp-protobuf-encode-value value-type value)))))
@@ -663,13 +660,13 @@ Returns:
         (let* ((field-number (caar header-result))
                (field-offset (cdr header-result)))
           (cond
-            ((= field-number 1) ; Key field
+            ((= field-number 1)
              (when-let ((key-result
                          (warp-protobuf-decode-value key-type data
                                                      field-offset)))
                (setq key (car key-result)
                      offset (cdr key-result))))
-            ((= field-number 2) ; Value field
+            ((= field-number 2)
              (when-let ((value-result
                          (if (eq value-type :message)
                              (let ((msg-result (warp-protobuf-decode-length-delimited
@@ -682,7 +679,7 @@ Returns:
                             value-type data field-offset))))
                (setq value (car value-result)
                      offset (cdr value-result))))
-            (t ; Unknown field in map entry, skip
+            (t
              (setq offset (length data)))))))
     (cons key value)))
 
@@ -729,8 +726,9 @@ Arguments:
 
 Returns:
 - (plist): A plist `(:type-url TYPE-URL :value VALUE)` where `TYPE-URL`
-  is the string type URL and `VALUE` is the raw binary content (unibyte string)
-  of the embedded message. Returns `nil` if decoding fails.
+  is the string type URL and `VALUE` is the raw binary content
+  (unibyte string) of the embedded message. Returns `nil` if decoding
+  fails.
 
 Signals:
 - `warp-protobuf-any-error`: If the decoded `Any` message is missing
@@ -757,11 +755,12 @@ Signals:
                (setq value (car value-result)
                      offset (cdr value-result))))
             (t ; Unknown field in Any message, skip
-             (setq offset (length data)))))))
+             (setq offset (cdr (warp-protobuf-skip-unknown-field wire-type data field-offset)))))))) ; Skip by wire-type
     (unless (and type-url value)
       (signal 'warp-protobuf-any-error
               (list (warp:error! :type 'warp-protobuf-any-error
-                                 :message "Malformed Any message: missing type_url or value"))))
+                                 :message "Malformed Any message: missing \
+                                           type_url or value"))))
     (list :type-url type-url :value value)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -777,8 +776,7 @@ Arguments:
   that belong to a single `oneof` group.
 - `message` (plist): The message as a plist.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Signals:
 - `warp-protobuf-oneof-error`: If more than one field in `oneof-fields`
@@ -806,8 +804,7 @@ names and numbers are unique, field types and labels are valid, and
 Arguments:
 - `schema` (list): The schema definition list.
 
-Returns:
-- `t` if the schema is valid.
+Returns: `t` if the schema is valid.
 
 Signals:
 - `warp-protobuf-schema-error`: If any part of the schema definition
@@ -855,24 +852,26 @@ Signals:
         (cond
           ((eq type :map)
            (unless (and (plist-get extra-props :key-type)
-                        (plist-get extra-props :value-type))
+                         (plist-get extra-props :value-type))
              (signal 'warp-protobuf-schema-error
                      (list (warp:error! :type 'warp-protobuf-schema-error
-                                        :message "Map field missing :key-type or :value-type"
+                                        :message "Map field missing :key-type \
+                                                  or :value-type"
                                         :details `(:field ,name))))))
           ((eq type :oneof)
            (unless (listp label) ; 'label' actually contains the oneof fields
              (signal 'warp-protobuf-schema-error
                      (list (warp:error! :type 'warp-protobuf-schema-error
-                                        :message "Oneof field requires a list of field names"
+                                        :message "Oneof field requires a list \
+                                                  of field names"
                                         :details `(:field ,name)))))
            (puthash name label oneof-groups))
-          ((eq type :any)) ; `any` type doesn't have a label or specific type validation
+          ((eq type :any))
           ((not (assq type warp-protobuf--type-wire-map))
            (signal 'warp-protobuf-schema-error
                    (list (warp:error! :type 'warp-protobuf-schema-error
                                       :message "Unknown field type"
-                                      :details `(:type ,type))))))
+                                      :details `(:type ,type)))))))
         ;; Labels are not present for map, oneof, any
         (unless (memq type '(:map :oneof :any))
           (unless (memq label '(:required :optional :repeated))
@@ -887,7 +886,8 @@ Signals:
                    (when (memq field all-oneof-fields)
                      (signal 'warp-protobuf-schema-error
                              (list (warp:error! :type 'warp-protobuf-schema-error
-                                                :message "Field appears in multiple oneof groups"
+                                                :message "Field appears in \
+                                                          multiple oneof groups"
                                                 :details `(:field ,field)))))
                    (push field all-oneof-fields)))
                oneof-groups)))
@@ -947,15 +947,14 @@ Signals:
     (:bytes (warp-protobuf-encode-length-delimited
              (warp-protobuf--ensure-unibyte value)))
     (:message
-     (let ((schema-name (plist-get extra-args :schema))
-           (schema (warp-protobuf-get-schema (plist-get extra-args :schema))))
-       (unless schema
+     (let ((schema-name (plist-get extra-args :schema)))
+       (unless (warp-protobuf-get-schema schema-name)
          (signal 'warp-protobuf-encode-error
                  (list (warp:error! :type 'warp-protobuf-schema-error
                                     :message "Nested message schema not found"
                                     :details `(:schema-name ,schema-name)))))
        (warp-protobuf-encode-length-delimited
-        (warp-protobuf-encode-message schema value))))
+        (warp-protobuf-encode-message (warp-protobuf-get-schema schema-name) value))))
     (:any
      (unless (and (plist-get value :type-url) (plist-get value :value))
        (signal 'warp-protobuf-any-error
@@ -1005,7 +1004,8 @@ Signals:
                (:int64 (warp-protobuf--clamp-int64 (car result)))
                (:uint32 (warp-protobuf--clamp-uint32 (car result)))
                (:uint64 (warp-protobuf--clamp-uint64 (car result)))
-               (:bool (not (zerop (car result)))))
+               (:bool (not (zerop (car result))))
+               (_ (car result))) ; Fallback for unexpected case, though types should match
              (cdr result))))
     (:sint32 (warp-protobuf-decode-zigzag32 data offset))
     (:sint64 (warp-protobuf-decode-zigzag64 data offset))
@@ -1032,14 +1032,13 @@ Signals:
     (:bytes (warp-protobuf-decode-length-delimited data offset))
     (:message
      (when-let ((result (warp-protobuf-decode-length-delimited data offset)))
-       (let* ((schema-name (plist-get extra-args :schema))
-              (schema (warp-protobuf-get-schema schema-name)))
-         (unless schema
+       (let* ((schema-name (plist-get extra-args :schema)))
+         (unless (warp-protobuf-get-schema schema-name)
            (signal 'warp-protobuf-decode-error
                    (list (warp:error! :type 'warp-protobuf-schema-error
                                       :message "Nested message schema not found"
                                       :details `(:schema-name ,schema-name)))))
-         (cons (warp-protobuf-decode-message schema (car result))
+         (cons (warp-protobuf-decode-message (warp-protobuf-get-schema schema-name) (car result))
                (cdr result)))))
     (:any
      (when-let ((result (warp-protobuf-decode-length-delimited data offset)))
@@ -1101,6 +1100,16 @@ Signals:
              (let ((key-type (plist-get extra-props :key-type))
                    (value-type (plist-get extra-props :value-type))
                    (value-schema (plist-get extra-props :value-schema)))
+               (unless (and key-type value-type)
+                 (signal 'warp-protobuf-schema-error
+                         (list (warp:error! :type 'warp-protobuf-schema-error
+                                            :message "Map field missing :key-type or :value-type in schema"
+                                            :details `(:field ,name)))))
+               (when (and (eq value-type :message) (not (warp-protobuf-get-schema value-schema)))
+                 (signal 'warp-protobuf-schema-error
+                         (list (warp:error! :type 'warp-protobuf-schema-error
+                                            :message "Map value schema not found"
+                                            :details `(:field ,name :value-schema ,value-schema)))))
                (dolist (entry value)
                  (let ((entry-data (warp-protobuf-encode-map-entry
                                     key-type value-type
@@ -1121,18 +1130,22 @@ Signals:
                        (list (warp:error! :type 'warp-protobuf-validation-error
                                           :message "Required field missing"
                                           :details `(:field ,name)))))
-             ;; Only encode if value is present (or it's required and has a default)
              (when value
                (let ((wire-type (cdr (assq type warp-protobuf--type-wire-map))))
+                 (unless wire-type
+                   (signal 'warp-protobuf-schema-error
+                           (list (warp:error! :type 'warp-protobuf-schema-error
+                                              :message "Unknown field type in schema"
+                                              :details `(:field ,name :type ,type)))))
                  (cond
                    ((eq label :repeated)
                     (when (listp value)
                       (let ((packed (plist-get extra-props :packed)))
                         (if (and packed
                                  (memq type '(:int32 :int64 :uint32 :uint64
-                                              :sint32 :sint64 :bool :enum
-                                              :fixed32 :fixed64 :sfixed32
-                                              :sfixed64 :float :double)))
+                                                     :sint32 :sint64 :bool :enum
+                                                     :fixed32 :fixed64 :sfixed32
+                                                     :sfixed64 :float :double)))
                             ;; Packed encoding: encode all values into a single
                             ;; length-delimited field.
                             (let ((packed-data ""))
@@ -1163,23 +1176,26 @@ Signals:
                                   (warp-protobuf-encode-field-header
                                    number wire-type)
                                   (apply #'warp-protobuf-encode-value
-                                         type value extra-props))))))))))))
+                                         type value extra-props)))))))))))
     result))
 
 (defun warp-protobuf-decode-message (schema data)
   "Decode MESSAGE from DATA according to SCHEMA.
-This function parses a binary Protobuf message, using the provided schema
-to interpret fields. It handles known fields (single, repeated, packed,
-map, oneof) and preserves unknown fields for forward compatibility.
+This function parses a binary Protobuf message, using the provided
+schema to interpret fields. It handles known fields (single, repeated,
+packed, map, oneof) and preserves unknown fields for forward
+compatibility.
 
 Arguments:
 - `schema` (list): The schema definition list for the message.
-- `data` (string): The unibyte string containing the encoded Protobuf message.
+- `data` (string): The unibyte string containing the encoded Protobuf
+  message.
 
 Returns:
 - (plist): The decoded message data as a plist. Repeated fields are
-  returned as lists. Unknown fields are collected under the `:unknown-fields`
-  key as a list of `(field-number wire-type raw-bytes)` tuples.
+  returned as lists. Unknown fields are collected under the
+  `:unknown-fields` key as a list of `(field-number wire-type raw-bytes)`
+  tuples.
 
 Signals:
 - `warp-protobuf-schema-error`: If the schema itself is invalid or for
@@ -1190,8 +1206,8 @@ Signals:
   (warp-protobuf-validate-schema schema)
   (let ((result '())
         (offset 0)
-        (field-map (make-hash-table :test 'eq)) ; Maps field number to def
-        (unknown-fields '())) ; For preserving unknown fields
+        (field-map (make-hash-table :test 'eq))
+        (unknown-fields '()))
     ;; Populate field-map for quick lookup by field number.
     (dolist (field schema)
       (puthash (nth 1 field) field field-map))
@@ -1209,26 +1225,38 @@ Signals:
                        (label (nth 3 field-def))
                        (value-result
                         (cond
-                         ;; Packed repeated fields are length-delimited.
-                         ((and (eq label :repeated)
-                               (plist-get (nthcdr 4 field-def) :packed)
-                               (= wire-type warp-protobuf--wire-length-delimited))
-                          (warp-protobuf--decode-packed-repeated-field
-                           field-def data field-offset))
-                         ;; All other fields are decoded based on their type.
-                         (t (apply #'warp-protobuf-decode-value
-                                   type data field-offset (nthcdr 4 field-def))))))
+                          ;; Packed repeated fields are length-delimited.
+                          ((and (eq label :repeated)
+                                (plist-get (nthcdr 4 field-def) :packed)
+                                (= wire-type warp-protobuf--wire-length-delimited))
+                           (warp-protobuf--decode-packed-repeated-field
+                            field-def data field-offset))
+                          ;; Map fields are length-delimited.
+                          ((eq type :map)
+                           (when-let ((entry-data-result
+                                       (warp-protobuf-decode-length-delimited
+                                        data field-offset)))
+                             (let* ((key-type (plist-get (nthcdr 4 field-def) :key-type))
+                                    (value-type (plist-get (nthcdr 4 field-def) :value-type))
+                                    (value-schema (plist-get (nthcdr 4 field-def) :value-schema))
+                                    (decoded-entry (warp-protobuf-decode-map-entry
+                                                    key-type value-type (car entry-data-result) value-schema)))
+                               (cons decoded-entry (cdr entry-data-result)))))
+                          ;; All other fields are decoded based on their type.
+                          (t (apply #'warp-protobuf-decode-value
+                                    type data field-offset (nthcdr 4 field-def))))))
                   (when value-result
                     (let ((keyword (intern (concat ":" (symbol-name (car field-def)))))
                           (value (car value-result)))
                       (if (eq label :repeated)
                           ;; Append to list for repeated fields.
                           (setq result (plist-put result keyword
-                                                  (append value (plist-get result keyword))))
+                                                  (append (plist-get result keyword) (list value)))) ; Fixed: append single value
                         ;; Set value for single fields.
                         (setq result (plist-put result keyword value)))
-                      (setq offset (cdr value-result)))))
-              ;; Unknown field: skip it and store raw bytes for forward compatibility.
+                      (setq offset (cdr value-result))))))
+              ;; Unknown field: skip it and store raw bytes for forward
+              ;; compatibility.
               (let ((skip-result (warp-protobuf-skip-unknown-field
                                   wire-type data field-offset)))
                 (when skip-result
@@ -1249,7 +1277,7 @@ Signals:
     ;; Add any preserved unknown fields to the final result.
     (when unknown-fields
       (setq result (plist-put result :unknown-fields
-                              (nreverse unknown-fields))))
+                               (nreverse unknown-fields))))
     result))
 
 (defun warp-protobuf--decode-packed-repeated-field (field-def data offset)
@@ -1300,7 +1328,7 @@ Returns:
     (2 (warp-protobuf-decode-length-delimited data offset)) ; Length-delimited
     (5 (when (>= (length data) (+ offset 4)) ; Fixed32
          (cons nil (+ offset 4))))
-    (_ nil))) ; Unknown wire type
+    (_ nil)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; JSON Serialization Support (for Protobuf messages)
@@ -1354,8 +1382,8 @@ Returns:
 
 (defun warp-protobuf-single-value-to-json (type value)
   "Convert single protobuf VALUE of TYPE to JSON.
-Handles type-specific JSON mapping rules (e.g., large integers as strings,
-boolean as true/false, enum as string, bytes as base64).
+Handles type-specific JSON mapping rules (e.g., large integers as
+strings, boolean as true/false, enum as string, bytes as base64).
 
 Arguments:
 - `type` (keyword): The Protobuf field type.
@@ -1377,7 +1405,7 @@ Returns:
     (:string value)
     (:bytes (base64-encode-string (warp-protobuf--ensure-unibyte value)))
     (:enum (if (symbolp value) (symbol-name value) value))
-    (:message (warp-protobuf-to-json (plist-get value :schema) value))
+    (:message (warp-protobuf-to-json (plist-get (nthcdr 4 (cl-find-if (lambda (f) (eq (nth 2 f) :message)) (list :dummy-field 0 :message :optional :schema (plist-get value :schema)))) :schema) value)) ; Nested message needs its schema
     (:any (list (cons "type_url" (plist-get value :type-url))
                 (cons "value" (base64-encode-string
                                (warp-protobuf--ensure-unibyte
@@ -1417,40 +1445,21 @@ Signals:
     result))
 
 (defun warp-protobuf-value-from-json (type json-value label)
-  "Convert JSON-VALUE to protobuf value of TYPE and LABEL.
+  "Convert JSON-VALUE to protobuf value of TYPE.
 This is a helper for `warp-protobuf-from-json` that handles individual
 JSON values, including lists for repeated fields, and converts them
 to appropriate Lisp types.
 
 Arguments:
 - `type` (keyword): The Protobuf field type.
-- `json-value` (any): The JSON value to convert.
+- `json-value` (any): The single JSON value.
 - `label` (keyword): The field label (`:optional`, `:required`,
   `:repeated`).
 
 Returns:
 - (any): The Lisp representation of the value."
-  (cond
-   ((eq label :repeated)
-    (mapcar (lambda (item)
-              (warp-protobuf-single-value-from-json type item))
-            json-value))
-   (t (warp-protobuf-single-value-from-json type json-value))))
-
-(defun warp-protobuf-single-value-from-json (type json-value)
-  "Convert single JSON-VALUE to protobuf value of TYPE.
-Handles type-specific JSON parsing rules (e.g., converting string
-numbers to integers, base64 decoding bytes, converting enum strings to
-symbols).
-
-Arguments:
-- `type` (keyword): The Protobuf field type.
-- `json-value` (any): The single JSON value.
-
-Returns:
-- (any): The Lisp representation of the single value."
   (pcase type
-    ((or :int32 :int64 :uint32 :uint32 :sint32 :sint64 :fixed32 :fixed64
+    ((or :int32 :int64 :uint32 :uint64 :sint32 :sint64 :fixed32 :fixed64
          :sfixed32 :sfixed64)
      (if (stringp json-value) (string-to-number json-value) json-value))
     (:bool json-value)
@@ -1458,7 +1467,7 @@ Returns:
     (:string json-value)
     (:bytes (base64-decode-string json-value))
     (:enum (if (stringp json-value) (intern json-value) json-value))
-    (:message json-value) ; Nested messages are recursively converted
+    (:message json-value) ; Nested message remains a plist, handled by higher level
     (:any (list :type-url (cdr (assoc "type_url" json-value))
                 :value (base64-decode-string
                         (cdr (assoc "value" json-value)))))
@@ -1528,8 +1537,7 @@ Arguments:
       encoding.
     - `:key-type`, `:value-type`, `:value-schema`: For `:map` type.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Defines a global variable `NAME` holding the schema definition.
@@ -1549,8 +1557,7 @@ Arguments:
   - `symbol`: Assigns the next sequential integer value, starting from 0.
   - `(symbol . integer)`: Explicitly assigns an integer value.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Defines a global variable `NAME` holding the enum definition alist.

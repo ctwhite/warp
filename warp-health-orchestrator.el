@@ -375,13 +375,13 @@ Side Effects:
 
 ;;;###autoload
 (defun warp:health-orchestrator-start (orchestrator)
-  "Start all registered health checks in the orchestrator.
+  "Starts the health orchestrator, beginning scheduled checks.
 This function is intended to be used as the `:start` lifecycle hook for
 the orchestrator component. It is idempotent and starts the background
 poller that executes the checks according to their configured intervals.
 
 Arguments:
-- `ORCHESTRATOR` (warp-health-orchestrator): The orchestrator instance
+- `orchestrator` (warp-health-orchestrator): The orchestrator instance
   to start.
 
 Returns:
@@ -460,12 +460,6 @@ Arguments:
 
 Returns:
 - (loom-promise): A promise that resolves to `t` on successful registration.
-
-Side Effects:
-- Adds a new check and its initial state to the orchestrator's
-  internal hash tables.
-- If the orchestrator is running, registers a new periodic task with
-  the `loom-poll` instance to start executing the check.
 
 Signals:
 - `(error)`: If a check for the same `target-id` is already registered,
@@ -612,6 +606,46 @@ Returns:
           :unknown-count ,unknown
           :total-count ,total
           :critical-unhealthy-count ,critical-unhealthy)))))
+
+(defun warp:health-orchestrator-get-worker-health-details (orchestrator worker-id)
+  "Retrieves the detailed health check results for a specific worker.
+This function gathers the `warp-health-state` for all checks whose
+`target-id` matches the given `worker-id`, providing a granular view
+of its health.
+
+Arguments:
+- `ORCHESTRATOR` (warp-health-orchestrator): The orchestrator instance.
+- `WORKER-ID` (string): The ID of the worker to query.
+
+Returns:
+- (list): A list of plists, each representing a single health check
+  result for the worker. Each plist will contain:
+  - `:check-name` (string): The name of the check.
+  - `:status` (symbol): `:healthy`, `:degraded`, `:unhealthy`, etc.
+  - `:last-check-time` (float): Timestamp of last check.
+  - `:last-error` (string or nil): Error message if check failed.
+  - `:response-time` (float): Duration of the check.
+  - `:critical-p` (boolean): Whether this check is critical.
+  - `:consecutive-failures` (integer): Number of recent failures.
+  - `:consecutive-successes` (integer): Number of recent successes.
+  Example: `((:check-name \"cpu-check\" :status :healthy ...) (...))`"
+  (loom:with-mutex! (warp-health-orchestrator-lock orchestrator)
+    (let (details)
+      (maphash (lambda (target-id state)
+                 (when (string= target-id worker-id) ; Filter by target-id
+                   (let ((spec (gethash target-id (warp-health-orchestrator-checks orchestrator))))
+                     (push `(:check-name ,(health-check-spec-name spec)
+                             :status ,(warp-health-state-status state)
+                             :last-check-time ,(warp-health-state-last-check-time state)
+                             :last-error ,(warp-health-state-last-error state)
+                             :response-time ,(warp-health-state-response-time state)
+                             :critical-p ,(health-check-spec-critical-p spec)
+                             :consecutive-failures ,(warp-health-state-consecutive-failures state)
+                             :consecutive-successes ,(warp-health-state-consecutive-successes state)
+                             :metadata ,(warp-health-state-metadata state)) 
+                           details))))
+               (warp-health-orchestrator-states orchestrator))
+      (nreverse details))))
 
 (provide 'warp-health-orchestrator)
 ;; warp-health-orchestrator.el ends here

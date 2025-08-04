@@ -66,7 +66,7 @@ containing the generated functions and schema metadata.")
 
 (defvar warp--marshal-type-converters (make-hash-table :test 'eq)
   "A global registry for non-schema type converters.
-The key is a type symbol (e.g., 'keyword', 'list'), and the value
+The key is a type symbol (e.g., 'keyword'), and the value
 is a plist containing `:serialize` and `:deserialize` functions.
 This allows handling of standard Lisp types like lists and hash-tables.")
 
@@ -115,7 +115,8 @@ Returns:
            l))
  (lambda (arr &key protocol target-type)
    "Deserialize a JSON/Protobuf array into a Lisp list recursively.
-   `target-type` is crucial here (e.g., `(list 'integer)`) for elements."
+   `target-type` is crucial here (e.g., `(list 'integer)`) to provide
+   type hints for the elements within the list."
    (let ((element-type (cadr target-type))) ; e.g., (list ELEMENT-TYPE)
      (mapcar (lambda (elem)
                (warp--marshal-recursive-deserialize
@@ -128,7 +129,8 @@ Returns:
  'hash-table
  (lambda (h &key protocol)
    "Serialize a hash-table into a plist.
-   Note: Keys are serialized, so `:test` is not preserved in JSON/Protobuf."
+   Note: Keys are serialized, so `:test` is not preserved in JSON/Protobuf.
+   This conversion creates a flat list of alternating keys and values."
    (let ((plist nil))
      (maphash (lambda (k v)
                 (push (warp--marshal-recursive-serialize v :protocol protocol)
@@ -139,10 +141,11 @@ Returns:
      plist))
  (lambda (json-or-pb-plist &key protocol target-type)
    "Deserialize a JSON/Protobuf map (plist) into a hash-table.
-   `target-type` is `(hash-table KEY-TYPE VAL-TYPE)` for element hints."
-   (let ((key-type (cadr target-type))  ; e.g., (hash-table KEY VAL)
+   `target-type` is `(hash-table KEY-TYPE VAL-TYPE)` for element hints
+   to guide recursive deserialization of keys and values.
+   Default to 'equal test, as original hash-table test is unknown."
+   (let ((key-type (cadr target-type))
          (val-type (caddr target-type))
-         ;; Default to 'equal test, as original hash-table test is unknown.
          (ht (make-hash-table :test 'equal)))
      (cl-loop for (key val) on json-or-pb-plist by #'cddr
               do (puthash (warp--marshal-recursive-deserialize
@@ -181,7 +184,7 @@ Returns:
                (signal 'warp-marshal-schema-error
                        (list (warp:error!
                               :type 'warp-marshal-schema-error
-                              :message "Missing Protobuf conversion"
+                              :message "Missing Protobuf conversion for type"
                               :details `(:type ,type)))))
              (funcall to-pb-fn val)))
           (:json
@@ -189,7 +192,7 @@ Returns:
           (_ (signal 'warp-marshal-error
                      (list (warp:error!
                             :type 'warp-marshal-error
-                            :message "Unsupported protocol"
+                            :message "Unsupported protocol for schema serialization"
                             :details `(:protocol ,protocol))))))))
      ;; Other registered Lisp types (e.g., keyword, list, hash-table).
      ((gethash type warp--marshal-type-converters)
@@ -245,7 +248,7 @@ Returns:
    ;; explicit type hint if `_type` is present.
    ((and (listp wire-data) (plist-get wire-data :_type))
     (let* ((type-name-str (plist-get wire-data :_type))
-           (type-name (intern-soft type-name-str)) ; Safely convert string to symbol.
+           (type-name (intern-soft type-name-str))
            (converter (and type-name (gethash type-name
                                               warp--marshal-converter-registry))))
       (unless converter
@@ -260,7 +263,8 @@ Returns:
         (_ (signal 'warp-marshal-error
                    (list (warp:error!
                           :type 'warp-marshal-error
-                          :message "Unsupported polymorphic deserialization"
+                          :message "Unsupported polymorphic deserialization \
+                                    for non-JSON protocol"
                           :details `(:protocol ,protocol))))))))
    ;; Deserialization using an explicit `:target-type` hint.
    ;; This handles deserialization for standard Lisp types like lists,
@@ -563,21 +567,31 @@ Signals:
 
 ;;;###autoload
 (cl-defun warp:serialize (instance &key omit-nil-fields (protocol :json))
-  "Serialize a `warp:defschema` struct into JSON or Protobuf.
+  "Serialize a `warp:defschema` struct or a compatible Lisp object.
 This is the high-level entry point for serializing Lisp data. It
-uses pre-generated conversion functions and recursively handles
-nested types.
+uses pre-generated conversion functions for schemas and recursively
+handles other serializable types (lists, hash-tables, primitives).
 
 Arguments:
 - `INSTANCE` (any): An instance of a `warp:defschema` struct or another
-  serializable Lisp object.
+  serializable Lisp object (e.g., list, hash-table, string, number).
 - `:omit-nil-fields` (boolean): If non-nil, omit `nil` fields from JSON
-  output. Overrides the schema default.
+  output. Overrides the schema default. Only applies to JSON output
+  of `warp:defschema` instances.
 - `:PROTOCOL` (keyword): The target protocol: `:json` (default) or
   `:protobuf`.
 
 Returns:
-- (string): A JSON string or a Protobuf binary (unibyte) string."
+- (string or unibyte-string): A JSON string (UTF-8) or a Protobuf
+  binary (unibyte) string.
+
+Signals:
+- `warp-marshal-unknown-type`: If the instance type is not supported
+  for serialization by the chosen protocol.
+- `warp-marshal-schema-error`: If a `warp:defschema` type lacks a
+  `warp:defprotobuf-mapping` for Protobuf serialization.
+- `warp-marshal-error`: For unsupported protocols or general marshaling
+  failures."
   (if (symbolp (type-of instance)) ; Check if it's a struct defined by `warp:defschema`.
       (let* ((type (type-of instance))
              (converter (gethash type warp--marshal-converter-registry)))
@@ -620,7 +634,8 @@ Returns:
        (signal 'warp-marshal-error
                (list (warp:error!
                       :type 'warp-marshal-error
-                      :message "Cannot serialize arbitrary types to Protobuf without a schema.")))))))
+                      :message "Cannot serialize arbitrary types to Protobuf \
+                                without a schema. Provide a :type argument.")))))))
 
 ;;;###autoload
 (cl-defun warp:deserialize (byte-string &key type strict (protocol :json)
@@ -636,10 +651,19 @@ Arguments:
 - `:strict` (boolean): For JSON, error if data has unknown keys.
 - `:PROTOCOL` (keyword): Protocol of the input: `:json` or `:protobuf`.
 - `:target-type` (symbol or list): Hint for deserializing non-schema
-  types (e.g., `keyword`, `(list string)`).
+  types (e.g., `keyword`, `(list string)`). If `type` is provided,
+  `target-type` acts as an override for the schema's field type.
 
 Returns:
-- (any): A `warp:defschema` struct instance or a plain Lisp value."
+- (any): A `warp:defschema` struct instance or a plain Lisp value.
+
+Signals:
+- `warp-marshal-error`: For general deserialization failures or
+  unsupported protocols.
+- `warp-marshal-unknown-type`: If the target type or `_type` is unknown.
+- `warp-marshal-schema-error`: If a `warp:defschema` type lacks a
+  `warp:defprotobuf-mapping` for Protobuf deserialization.
+- `json-parse-error`: If the JSON is malformed."
   (pcase protocol
     (:json
      (condition-case err
@@ -663,7 +687,7 @@ Returns:
                                               (error-message-string err))
                              :cause err))))))
     (:protobuf
-     (let* ((final-type (or type target-type)) ; Explicit type is always needed for Protobuf.
+     (let* ((final-type (or type target-type))
             (converter (and (symbolp final-type)
                             (gethash final-type
                                      warp--marshal-converter-registry)))
@@ -682,9 +706,11 @@ Returns:
          (let ((pb-plist (warp:protobuf-decode pb-schema byte-string)))
            (funcall from-pb-fn pb-plist)))
         (t ; Fallback for primitive types (e.g., string, number)
-         ;; NOTE: Direct Protobuf deserialization of arbitrary primitives
+         ;; Direct Protobuf deserialization of arbitrary primitives
          ;; is not fully robust here. `warp:protobuf-decode` expects a schema.
-         ;; This path likely needs refinement or strict type enforcement.
+         ;; This path currently assumes `byte-string` itself is the primitive
+         ;; value or can be directly converted by `target-type` if that is a
+         ;; primitive (e.g., string, number).
          (warp--marshal-recursive-deserialize
           byte-string :protocol :protobuf
           :target-type target-type)))))

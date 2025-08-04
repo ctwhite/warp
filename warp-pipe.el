@@ -195,7 +195,7 @@ Returns:
       ;; Step 1: Extract path from address and create the FIFO file system object.
       (:let ((extracted-path (warp-pipe--path-from-address <>)))
         (setq path extracted-path)
-        (warp-pipe--create-fifo path))
+        (loom:await (warp-pipe--create-fifo path))) ; Await mkfifo
 
       ;; Step 2: Start the two underlying `cat` processes. One process reads
       ;; from the pipe and writes to its stdout (which Emacs captures). The
@@ -227,7 +227,8 @@ Returns:
                               :type 'warp-pipe-process-error
                               :message (format "Process %s died."
                                                (process-name proc)))))
-                    (warp-transport--handle-error connection err)))))
+                    (loom:await ; Await error handling
+                     (warp-transport--handle-error connection err)))))
            (set-process-sentinel read-proc sentinel)
            (set-process-sentinel write-proc sentinel))
 

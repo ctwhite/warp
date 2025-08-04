@@ -70,9 +70,12 @@ Fields:
 
 Fields:
 - `total-cpu-utilization` (float): Sum of all process CPU percentages.
-- `total-memory-utilization` (float): Sum of all process memory percentages.
-- `cumulative-user-cpu-seconds` (float): Total user CPU time for all processes.
-- `cumulative-system-cpu-seconds` (float): Total system CPU time for all procs.
+- `total-memory-utilization` (float): Sum of all process memory
+  percentages.
+- `cumulative-user-cpu-seconds` (float): Total user CPU time for all
+  processes.
+- `cumulative-system-cpu-seconds` (float): Total system CPU time for
+  all processes.
 - `total-cumulative-minor-page-faults` (integer): Sum of minor page faults.
 - `total-cumulative-major-page-faults` (integer): Sum of major page faults.
 - `total-virtual-memory-kb` (integer): Sum of all virtual memory usage.
@@ -293,8 +296,9 @@ Returns:
                    (when-let (attrs (cl-find-if (lambda (a)
                                                  (= (plist-get a 'pid) pid))
                                                all-attrs))
-                     (puthash pid (warp-system-monitor--extract-process-metrics
-                                   attrs current-time)
+                     (puthash pid
+                              (warp-system-monitor--extract-process-metrics
+                               attrs current-time)
                               new-proc-reg)))
                  (loom:with-mutex! monitor-lock
                    (setf (warp-system-monitor-system-metrics monitor)
@@ -338,7 +342,9 @@ Returns:
     (loom:poll-register-periodic-task
      (warp-system-monitor-poll-instance monitor)
      'collect-metrics
-     (lambda () (warp-system-monitor--collect-metrics-task monitor))
+     (lambda ()
+       (loom:await ; Await collection task
+        (warp-system-monitor--collect-metrics-task monitor)))
      :interval (system-monitor-config-collection-interval config)
      :immediate t)
     (loom:poll-start (warp-system-monitor-poll-instance monitor))
@@ -449,4 +455,4 @@ Returns: `t`."
   t)
 
 (provide 'warp-system-monitor)
-;;; warp-system-monitor.el ends here
+;;; warp-system-monitor.el ends here ;;;

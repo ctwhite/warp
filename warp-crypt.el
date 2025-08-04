@@ -7,11 +7,11 @@
 ;; and JSON Web Token (JWT) handling.
 ;;
 ;; This module also now incorporates a **Secure Key Management Pattern**
-;; through the `warp-key-manager` component. This centralizes the lifecycle
-;; management of cryptographic keys, from loading and decryption to
-;; secure in-memory storage and eventual cleanup. It abstracts away
-;; complex file operations and integrates various key provisioning
-;; strategies.
+;; through the `warp-key-manager` component. This centralizes the
+;; lifecycle management of cryptographic keys, from loading and
+;; decryption to secure in-memory storage and eventual cleanup. It
+;; abstracts away complex file operations and integrates various key
+;; provisioning strategies.
 ;;
 ;; ## Key Features:
 ;;
@@ -102,9 +102,10 @@ Fields:
 This is a stateful component managed by the `warp-component` system.
 
 Fields:
-- `config` (key-manager-config): The static configuration for this manager.
-- `decrypted-private-key-path` (string): Path to the temporary decrypted
-  private key file.
+- `config` (key-manager-config): The static configuration for this
+  manager.
+- `decrypted-private-key-path` (string): Path to the temporary
+  decrypted private key file.
 - `public-key-material` (string): In-memory copy of the public key.
 - `lock` (loom-lock): Mutex for thread-safe operations."
   (config (cl-assert nil) :type key-manager-config)
@@ -160,27 +161,33 @@ Signals:
            (manager-name (key-manager-config-name config)))
       (unless encrypted-path
         (error 'warp-crypt-key-error "No private key path defined."))
-      (condition-case err
-          (let* ((decrypted-content
-                  (if passphrase
-                      (warp:crypt-decrypt-gpg-file encrypted-path passphrase)
-                    (warp:crypto-read-file-contents encrypted-path)))
-                 (temp-file (make-temp-file
-                             (format "warp-%s-pk-" manager-name)
-                             nil ".dec")))
-            (with-temp-file temp-file (insert decrypted-content))
-            (setf (warp-key-manager-decrypted-private-key-path manager)
-                  temp-file)
-            (warp:log! :info manager-name
-                       "Private key decrypted to temporary file: %s."
-                       temp-file)
-            (loom:resolved! t))
-        (error
-         (loom:rejected!
-          (warp:error! :type 'warp-crypt-key-error
-                       :message (format "Failed to decrypt private key for %s: %S"
+      (braid! (loom:resolved! nil) ; Start a braid for async operations
+        (:then (lambda (_)
+                 (let* ((decrypted-content
+                         (if passphrase
+                             (loom:await ; Await decryption
+                              (warp:crypt-decrypt-gpg-file
+                               encrypted-path passphrase))
+                           (warp:crypto-read-file-contents
+                            encrypted-path))) ; Read is sync, no await
+                        (temp-file (make-temp-file
+                                    (format "warp-%s-pk-" manager-name)
+                                    nil ".dec")))
+                   (with-temp-file temp-file (insert decrypted-content))
+                   (setf (warp-key-manager-decrypted-private-key-path manager)
+                         temp-file)
+                   (warp:log! :info manager-name
+                              "Private key decrypted to temporary file: %s."
+                              temp-file)
+                   t)))
+        (:catch (lambda (err)
+                  (loom:rejected!
+                   (warp:error! :type 'warp-crypt-key-error
+                                :message
+                                (format "Failed to decrypt private key for \
+                                         %s: %S"
                                         manager-name err)
-                       :cause err)))))))
+                                :cause err))))))))
 
 (defun warp--crypto-jwt-decode-part (encoded-part context-name)
   "Decode and parse a single Base64URL-encoded JSON part of a JWT.
@@ -273,8 +280,9 @@ Signals:
                         :worker-id manager-name)))
                   (warp:crypt-provision-passphrase provisioner)))
         (:then (lambda (actual-passphrase)
-                 (warp--key-manager-decrypt-private-key
-                  manager actual-passphrase)))
+                 (loom:await ; Await decryption promise
+                  (warp--key-manager-decrypt-private-key
+                   manager actual-passphrase)))
         (:then (lambda (_)
                  (warp:log! :info manager-name
                             "Cryptographic keys loaded successfully.")
@@ -297,10 +305,11 @@ Arguments:
 
 Returns: (loom-promise): A promise that resolves to `t` on completion."
   (loom:with-mutex! (warp-key-manager-lock manager)
-    (let ((decrypted-path (warp-key-manager-decrypted-private-key-path manager))
+    (let ((decrypted-path (warp-key-manager-decrypted-private-key-path
+                           manager))
           (manager-name (key-manager-config-name
                          (warp-key-manager-config manager))))
-      (braid! t
+      (braid! (loom:resolved! nil)
         (:then (lambda (_)
                  (when (and decrypted-path (file-exists-p decrypted-path))
                    (condition-case err
@@ -312,7 +321,7 @@ Returns: (loom-promise): A promise that resolves to `t` on completion."
                       (warp:log! :error manager-name
                                  "Failed to delete decrypted key file: %S"
                                  err)
-                      (unless force
+                      (unless force ; Only reject if not forced cleanup
                         (loom:rejected! (loom:error-wrap err))))))))
         (:then (lambda (_)
                  (setf (warp-key-manager-decrypted-private-key-path manager)
@@ -376,13 +385,13 @@ Arguments:
 - `p` (warp-offline-key-provisioner): The provisioner instance.
 
 Returns: (loom-promise): A promise resolving to the passphrase or `nil`."
-  (let ((passphrase-file (getenv
-                          (warp:env 'worker-passphrase-file-path))))
+  (let ((passphrase-file
+         (getenv (warp:env 'worker-passphrase-file-path))))
     (if passphrase-file
         (condition-case err
-            (let ((passphrase (s-trim
-                               (warp:crypto-read-file-contents
-                                passphrase-file))))
+            (let ((passphrase
+                   (s-trim (warp:crypto-read-file-contents
+                            passphrase-file))))
               (delete-file passphrase-file)
               (warp:log! :info (warp-key-provisioner-worker-id p)
                          "Passphrase file deleted after read.")
@@ -524,8 +533,8 @@ Signals:
          (output-buffer (generate-new-buffer " *gpg-decrypt-output*")))
 
     (unless (file-readable-p encrypted-file-path)
-      (error 'warp-crypt-key-error (format "Encrypted file not readable: %s"
-                                           encrypted-file-path)))
+      (error 'warp-crypt-key-error
+             (format "Encrypted file not readable: %s" encrypted-file-path)))
     (condition-case err
         (unwind-protect
             (progn
@@ -573,8 +582,8 @@ Signals:
 - `warp-crypt-key-error`: If the key file is not readable.
 - `warp-crypt-signing-failed`: If the `epg` signing operation fails."
   (unless (file-readable-p private-key-path)
-    (error 'warp-crypt-key-error (format "Private key file not readable: %s"
-                                         private-key-path)))
+    (error 'warp-crypt-key-error
+           (format "Private key file not readable: %s" private-key-path)))
   (condition-case err
       (let ((epg-context (epg-context-create)))
         (unwind-protect
@@ -590,7 +599,8 @@ Signals:
 ;;;###autoload
 (defun warp:crypto-verify-signature (data-string signature-binary
                                                  public-key-material)
-  "Verify a digital signature against `DATA-STRING` using a public key.
+  "Verifies the signature of `DATA-STRING` against `SIGNATURE-BINARY`
+using `PUBLIC-KEY-MATERIAL`.
 
 Arguments:
 - `data-string` (string): The original data that was signed.
@@ -602,7 +612,7 @@ Returns:
 
 Signals:
 - `warp-crypt-verification-failed`: If the verification process
-  encounters a cryptographic error (e.g., malformed inputs)."
+  encounters an unrecoverable cryptographic error."
   (condition-case err
       (let ((epg-context (epg-context-create)))
         (unwind-protect
@@ -671,9 +681,7 @@ Arguments:
 Returns:
 - (string): The Base64URL encoded string."
   (let* ((standard-b64 (base64-encode-string data-binary t))
-         ;; Remove padding characters (=) from the end.
          (no-padding (s-replace-regexp "=*$" "" standard-b64)))
-    ;; Replace standard characters with URL-safe alternatives.
     (s-replace "/" "_" (s-replace "+" "-" no-padding))))
 
 ;;;###autoload
@@ -688,7 +696,6 @@ Arguments:
 Returns:
 - (string): The decoded binary string."
   (let* ((standard-b64 (s-replace "-" "+" (s-replace "_" "/" base64url-string)))
-         ;; Re-add padding. Base64 strings must have a length divisible by 4.
          (padded (concat standard-b64
                          (make-string (% (- 4 (% (length standard-b64) 4)) 4)
                                       ?=))))

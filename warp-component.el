@@ -76,11 +76,14 @@ Fields:
   that creates and returns the component's actual value or object.
 - `dependencies` (list): A list of keywords representing the names of
   other components this component depends on.
-- `start-fn` (function or nil): An optional hook `(lambda (component system))`
-  called during the system's startup phase.
-- `stop-fn` (function or nil): An optional hook `(lambda (component system))`
-  called during the system's shutdown phase.
+- `start-fn` (function or nil): An optional hook
+  `(lambda (component system))` called during the system's startup phase.
+  It should return a `loom-promise` or `t`.
+- `stop-fn` (function or nil): An optional hook
+  `(lambda (component system))` called during the system's shutdown phase.
+  It should return a `loom-promise` or `t`.
 - `destroy-fn` (function or nil): An optional hook for final cleanup.
+  It should return a `loom-promise` or `t`.
 - `priority` (integer): An integer used to influence startup order.
   Components with a higher priority are started earlier among those at
   the same dependency level.
@@ -216,11 +219,16 @@ Signals:
             (warp:log! :debug (warp-component-system-name system)
                        "Creating component: %S" name)
             (condition-case err
-                (let* ((deps (cl-loop for dep in (warp-component-definition-dependencies def)
+                (let* ((deps (cl-loop for dep in
+                                      (warp-component-definition-dependencies
+                                       def)
                                       collect (warp-component--resolve-one
-                                               system dep (cons name visiting))))
-                       (instance (apply (warp-component-definition-factory-fn def) deps)))
-                  (puthash name instance (warp-component-system-instances system))
+                                               system dep
+                                               (cons name visiting))))
+                       (instance (apply (warp-component-definition-factory-fn def)
+                                        deps)))
+                  (puthash name instance
+                           (warp-component-system-instances system))
                   instance)
               (error
                (signal 'warp-component-lifecycle-error
@@ -244,7 +252,7 @@ Arguments:
   dependencies into any component.
 - `:definitions` (list of plists, optional): A list of raw component
   definition plists to initialize the system with. Each plist must
-  conform to the structure expected by `warp:defcomponent`.
+  conforming to the structure expected by `warp:defcomponent`.
 
 Returns:
 - (warp-component-system): A new, configured component system instance.
@@ -264,8 +272,8 @@ Side Effects:
             (stop (plist-get def-plist :stop))
             (destroy (plist-get def-plist :destroy))
             (priority (or (plist-get def-plist :priority) 0))
-            (metadata (cl-copy-list def-plist))) ; Capture all properties as metadata
-        (cl-remf metadata :name) ; Remove known keys from generic metadata
+            (metadata (cl-copy-list def-plist)))
+        (cl-remf metadata :name)
         (cl-remf metadata :deps)
         (cl-remf metadata :factory)
         (cl-remf metadata :start)
@@ -283,7 +291,7 @@ Side Effects:
                   :stop-fn stop
                   :destroy-fn destroy
                   :priority priority
-                  :metadata metadata) ; Store the remaining plist as metadata
+                  :metadata metadata)
                  (warp-component-system-definitions system))))
     system))
 
@@ -325,7 +333,9 @@ Signals:
     (cl-block start-specific-components
       (warp:log! :info (warp-component-system-name system)
                  "Starting selected components: %S" component-names)
-      (let ((ordered-names (cl-loop for name in (warp-component--get-dependency-order system)
+      (let ((ordered-names (cl-loop for name in
+                                    (warp-component--get-dependency-order
+                                     system)
                                     when (member name component-names)
                                     collect name)))
         (dolist (name ordered-names)
@@ -334,11 +344,14 @@ Signals:
 
         ;; Call start hooks for the selected components
         (dolist (name ordered-names)
-          (when-let* ((def (gethash name (warp-component-system-definitions system)))
+          (when-let* ((def (gethash name
+                                     (warp-component-system-definitions system)))
                       (start-fn (warp-component-definition-start-fn def)))
             (warp:log! :debug (warp-component-system-name system)
                        "Starting component (selected): %S" name)
-            (loom:await (funcall start-fn (gethash name (warp-component-system-instances system))
+            (loom:await (funcall start-fn (gethash name
+                                                     (warp-component-system-instances
+                                                      system))
                                  system))))
         (warp:log! :info (warp-component-system-name system)
                    "Selected components started successfully.")
@@ -371,17 +384,27 @@ Signals:
       (warp:log! :info (warp-component-system-name system)
                  "Stopping selected components: %S" component-names)
       ;; Stop in reverse order of startup (dependencies first).
-      (let ((ordered-names (nreverse (cl-loop for name in (warp-component--get-dependency-order system)
-                                              when (member name component-names)
-                                              collect name))))
+      (let ((ordered-names (nreverse
+                            (cl-loop for name in
+                                     (warp-component--get-dependency-order
+                                      system)
+                                     when (member name component-names)
+                                     collect name))))
         (dolist (name ordered-names)
-          (when-let* ((def (gethash name (warp-component-system-definitions system)))
+          (when-let* ((def (gethash name
+                                     (warp-component-system-definitions system)))
                       (stop-fn (warp-component-definition-stop-fn def)))
-            (when-let ((instance (gethash name (warp-component-system-instances system))))
+            (when-let ((instance (gethash name
+                                          (warp-component-system-instances
+                                           system))))
               (warp:log! :debug (warp-component-system-name system)
                          "Stopping component (selected): %S" name)
-              (loom:await (funcall stop-fn instance system))
-              (remhash name (warp-component-system-instances system)))))) ; Remove from cache
+              ;; Pass `force` argument if the stop function supports it.
+              (if (cl-funcallable-with-arglist-p stop-fn
+                                                  '(component system force))
+                  (loom:await (funcall stop-fn instance system force))
+                (loom:await (funcall stop-fn instance system)))
+              (remhash name (warp-component-system-instances system))))))
       (warp:log! :info (warp-component-system-name system)
                  "Selected components stopped successfully.")
       t)))
@@ -411,10 +434,11 @@ Signals:
     (cl-block warp:component-system-start-all
       (when (eq (warp-component-system-state system) :running)
         (warp:log! :warn (warp-component-system-name system)
-                  "System is already running.")
+                   "System is already running.")
         (cl-return-from warp:component-system-start-all t))
 
-      (warp:log! :info (warp-component-system-name system) "Starting all components...")
+      (warp:log! :info (warp-component-system-name system)
+                 "Starting all components...")
       (let ((order (warp-component--get-dependency-order system)))
         ;; First pass: ensure all instances are created.
         (dolist (name order)
@@ -422,16 +446,19 @@ Signals:
 
         ;; Second pass: call start hooks.
         (dolist (name order)
-          (when-let* ((def (gethash name (warp-component-system-definitions system)))
+          (when-let* ((def (gethash name
+                                     (warp-component-system-definitions system)))
                       (start-fn (warp-component-definition-start-fn def)))
             (warp:log! :debug (warp-component-system-name system)
-                      "Starting component: %S" name)
-            (loom:await (funcall start-fn (gethash name (warp-component-system-instances
-                                                         system))
+                       "Starting component: %S" name)
+            (loom:await (funcall start-fn (gethash name
+                                                     (warp-component-system-instances
+                                                      system))
                                  system))))
 
       (setf (warp-component-system-state system) :running)
-      (warp:log! :info (warp-component-system-name system) "System is running.")
+      (warp:log! :info (warp-component-system-name system)
+                 "System is running.")
       t)))
 
 ;;;###autoload
@@ -463,15 +490,21 @@ Signals:
                  "System is not running.")
       (cl-return-from warp:component-system-stop t))
 
-    (warp:log! :info (warp-component-system-name system) "Stopping all components...")
+    (warp:log! :info (warp-component-system-name system)
+               "Stopping all components...")
     ;; Stop in reverse order of startup.
-    (let ((order (nreverse (warp-component--get-dependency-order system))))
-      (dolist (name order)
-        (when-let* ((def (gethash name (warp-component-system-definitions
-                                        system)))
+    (let ((ordered-names (nreverse
+                          (cl-loop for name in
+                                   (warp-component--get-dependency-order
+                                    system)
+                                   collect name))))
+      (dolist (name ordered-names)
+        (when-let* ((def (gethash name
+                                   (warp-component-system-definitions system)))
                     (stop-fn (warp-component-definition-stop-fn def)))
-          (when-let ((instance (gethash name (warp-component-system-instances
-                                              system))))
+          (when-let ((instance (gethash name
+                                        (warp-component-system-instances
+                                         system))))
             (warp:log! :debug (warp-component-system-name system)
                        "Stopping component: %S" name)
             ;; Pass `force` argument if the stop function supports it.
@@ -482,7 +515,8 @@ Signals:
 
     (clrhash (warp-component-system-instances system))
     (setf (warp-component-system-state system) :stopped)
-    (warp:log! :info (warp-component-system-name system) "System stopped.")
+    (warp:log! :info (warp-component-system-name system)
+               "System stopped.")
     t))
 
 ;;;###autoload
@@ -507,23 +541,27 @@ Side Effects:
       (warp:log! :warn (warp-component-system-name system)
                  "System must be stopped before destroying."))
 
-    (warp:log! :info (warp-component-system-name system) "Destroying system...")
-    (let ((order (nreverse (warp-component--get-dependency-order system))))
+    (warp:log! :info (warp-component-system-name system)
+               "Destroying system...")
+    (let ((order (nreverse
+                  (warp-component--get-dependency-order system))))
       (dolist (name order)
-        (when-let* ((def (gethash name (warp-component-system-definitions
-                                        system)))
+        (when-let* ((def (gethash name
+                                   (warp-component-system-definitions system)))
                     (destroy-fn (warp-component-definition-destroy-fn
                                  def)))
           ;; Note: Instances are cleared in `stop`, so we re-resolve them
           ;; one last time if needed for the destroy hook.
-          (let ((instance (warp-component--resolve-one system name)))
+          (when-let ((instance (gethash name
+                                        (warp-component-system-instances system))))
             (warp:log! :debug (warp-component-system-name system)
                        "Destroying component: %S" name)
             (loom:await (funcall destroy-fn instance system))))))
 
     (clrhash (warp-component-system-instances system))
     (setf (warp-component-system-state system) :destroyed)
-    (warp:log! :info (warp-component-system-name system) "System destroyed.")
+    (warp:log! :info (warp-component-system-name system)
+               "System destroyed.")
     t))
 
 ;;;###autoload
@@ -554,7 +592,8 @@ Signals:
 (defun warp:component-system-get-definition (system name)
   "Retrieves a raw component definition from the system.
 This is useful for introspecting component metadata or properties
-(e.g., `:leader-only`) that are not part of the component instance itself.
+(e.g., `:leader-only`) that are not part of the component instance
+itself.
 
 Arguments:
 - `SYSTEM` (warp-component-system): The component system instance.
@@ -581,13 +620,15 @@ Arguments:
   - `:factory` (function): Required. A lambda that takes the resolved
     dependencies as arguments and returns the component instance.
   - `:start` (function, optional): A lambda `(lambda (component system))`
-    to run during system startup.
+    to run during system startup. Should return a `loom-promise` or `t`.
   - `:stop` (function, optional): A lambda `(lambda (component system))`
-    to run during system shutdown.
+    to run during system shutdown. Should return a `loom-promise` or `t`.
   - `:destroy` (function, optional): A lambda for final cleanup.
+    Should return a `loom-promise` or `t`.
   - `:priority` (integer, optional): Startup priority (higher is first).
-  - Any other key-value pairs will be stored in the component's `:metadata`
-    field, allowing for extensible properties (e.g., `:leader-only t`).
+  - Any other key-value pairs will be stored in the component's
+    `:metadata` field, allowing for extensible properties (e.g.,
+    `:leader-only t`).
 
 Returns:
 - `nil`.
@@ -607,8 +648,7 @@ Signals:
                        (stop (plist-get p :stop))
                        (destroy (plist-get p :destroy))
                        (priority (or (plist-get p :priority) 0))
-                       (metadata (cl-copy-list p))) ; Copy original plist for metadata
-                  ;; Remove standard keys from the metadata plist
+                       (metadata (cl-copy-list p)))
                   (cl-remf metadata :name)
                   (cl-remf metadata :deps)
                   (cl-remf metadata :factory)
@@ -627,7 +667,7 @@ Signals:
                              :stop-fn ,stop
                              :destroy-fn ,destroy
                              :priority ,priority
-                             :metadata ,metadata) ; Store extracted metadata
+                             :metadata ,metadata)
                             (warp-component-system-definitions ,system))))
      nil))
 

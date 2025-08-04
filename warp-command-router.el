@@ -28,6 +28,7 @@
 (require 'warp-error)
 (require 'warp-rpc)
 (require 'warp-event)
+(require 'warp-marshal)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -144,6 +145,8 @@ builds a chain of nested lambdas, where each middleware is given a `next`
 function that invokes the next middleware in the sequence. The final
 `next` function in the chain invokes the actual command handler.
 
+Middleware functions are expected to return a promise.
+
 Arguments:
 - `MIDDLEWARE-FNS` (list): A list of middleware functions.
 - `FINAL-HANDLER` (function): The main command handler to execute after
@@ -156,7 +159,16 @@ Returns:
   handler or rejects if any middleware fails."
   (let ((chain (cl-reduce (lambda (next-fn middleware-fn)
                             (lambda ()
-                              (funcall middleware-fn command context next-fn)))
+                              (braid! ; Wrap middleware execution in braid for async
+                               (funcall middleware-fn command context next-fn)
+                               (:catch (lambda (err)
+                                         (loom:rejected!
+                                          (warp:error!
+                                           :type 'warp-command-middleware-error
+                                           :message
+                                           (format "Middleware failed: %S"
+                                                   (function-name middleware-fn))
+                                           :cause err))))))))
                           middleware-fns
                           :from-end t
                           :initial-value (lambda ()
@@ -167,7 +179,6 @@ Returns:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
-;;;###autoload
 (cl-defun warp:command-router-create (&key (name "default-router")
                                            fallback-handler
                                            error-handler
@@ -181,7 +192,7 @@ Arguments:
 - `:name` (string, optional): A unique name for the router, used in logs.
 - `:fallback-handler` (function, optional): A function `(lambda (command
   context))` to execute if no route matches. Defaults to a function
-  that signals a `warp-command-route-not-found` error.
+  that signals a `warp-command-router-not-found` error.
 - `:error-handler` (function, optional): A function `(lambda (error
   command context))` to handle errors. Defaults to a function that
   logs the error.
@@ -214,9 +225,9 @@ Returns:
 
 ;;;###autoload
 (cl-defun warp:command-router-add-route (router name
-                                                &key pattern 
+                                                &key pattern
                                                      handler-fn
-                                                     middleware 
+                                                     middleware
                                                      schema)
   "Add a new route to the command router.
 Routes are matched in the order they are added. The first matching

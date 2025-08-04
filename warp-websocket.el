@@ -155,8 +155,7 @@ Returns:
 - (string): The raw unibyte string of the encoded WebSocket frame."
   (let* ((opcode-val (pcase opcode
                        (:continuation 0) (:text 1) (:binary 2)
-                       (:close 8) (:ping 9) (:pong 10)))
-         ;; Byte 1: FIN bit and opcode.
+                       (:close 8) (:ping 9) (:pong 10) (_ 0))) ; Default to 0 for unknown
          (byte1 (logior (if fin #x80 0) opcode-val))
          (len (length payload))
          (mask-bit (if mask #x80 0))
@@ -199,16 +198,20 @@ Returns:
       ;; Determine the actual payload length from the length indicator.
       (cond
        ((<= len-ind 125) (setq payload-len len-ind))
-       ((= len-ind 126)  ; 16-bit extended length
-        (when (< (length byte-string) 4) (cl-return-from nil))
+       ((= len-ind 126)
+        (when (< (length byte-string) (+ offset 2)) (cl-return-from nil))
         (setq payload-len (bindat-get-field
-                           (bindat-unpack '((v u16)) (substring byte-string 2 4))
+                           (bindat-unpack '((v u16)) (substring byte-string
+                                                                offset
+                                                                (+ offset 2)))
                            'v))
         (cl-incf offset 2))
-       (t ; 64-bit extended length
-        (when (< (length byte-string) 10) (cl-return-from nil))
+       (t
+        (when (< (length byte-string) (+ offset 8)) (cl-return-from nil))
         (setq payload-len (bindat-get-field
-                           (bindat-unpack '((v u64)) (substring byte-string 2 10))
+                           (bindat-unpack '((v u64)) (substring byte-string
+                                                                offset
+                                                                (+ offset 8)))
                            'v))
         (cl-incf offset 8)))
       ;; Extract the masking key if present.
@@ -247,7 +250,8 @@ Returns: `nil`."
   (when warp-websocket--frame-processor-pool
     (warp:log! :info "warp-websocket"
                "Shutting down WS frame processor pool.")
-    (warp:thread-pool-shutdown warp-websocket--frame-processor-pool)
+    (loom:await ; Await pool shutdown
+     (warp:thread-pool-shutdown warp-websocket--frame-processor-pool))
     (setq warp-websocket--frame-processor-pool nil)))
 
 (defun warp-websocket--setup-server-side-client (server-connection client-proc)
@@ -270,8 +274,7 @@ Returns:
            :websocket client-addr
            (cl-struct-to-plist
             (warp-transport-connection-config server-connection)))))
-    ;; The "raw connection" for a server-side client is a plist
-    ;; containing its process handle and its own state information.
+    ;; Associate the raw process with the new connection object.
     (setf (warp-transport-connection-raw-connection client-conn)
           `(:process ,client-proc
             :state-ref (:state :handshake :inflight-buffer "")))
@@ -281,9 +284,11 @@ Returns:
     (set-process-sentinel
      client-proc
      (lambda (_p _e)
-       (warp-transport--handle-error
-        client-conn (warp:error! :type 'warp-websocket-error
-                                 :message "Client disconnected."))))
+       (loom:await ; Await error handling
+        (warp-transport--handle-error
+         client-conn
+         (warp:error! :type 'warp-websocket-error
+                      :message "Client disconnected."))))))
     (warp:log! :info "warp-websocket" "Accepted client %s on server %s"
                (warp-transport-connection-id client-conn)
                (warp-transport-connection-id server-connection))
@@ -326,12 +331,14 @@ Arguments:
                    (process-send-string proc response)
                    (setf (plist-put state-ref :state) :open)
                    (setf (plist-put state-ref :inflight-buffer) rest)
-                   (warp:state-machine-emit
-                    (warp-transport-connection-state-machine connection)
-                    :success))
+                   (loom:await ; Await state machine emit
+                    (warp:state-machine-emit
+                     (warp-transport-connection-state-machine connection)
+                     :success)))
                ;; Handshake is invalid, reject and close.
                (process-send-string proc "HTTP/1.1 400 Bad Request\r\n\r\n")
-               (warp:transport-close connection t)))))))
+               (loom:await ; Await close and error handling
+                (warp:transport-close connection t)))))))
       ;; State 2: Connection is open, process incoming frames.
       (:open
        ;; Delegate frame processing to a thread pool to avoid blocking
@@ -366,8 +373,9 @@ Arguments:
               ((or 1 2)
                (if (plist-get frame :fin)
                    ;; Final frame: process the payload immediately.
-                   (warp-transport--process-incoming-raw-data
-                    connection (plist-get frame :payload))
+                   (loom:await ; Await data processing
+                    (warp-transport--process-incoming-raw-data
+                     connection (plist-get frame :payload)))
                  ;; Initial frame of a fragmented message: start reassembly.
                  (setf (plist-put state-ref :reassembly-buffer)
                        (plist-get frame :payload))))
@@ -378,11 +386,12 @@ Arguments:
                              (plist-get frame :payload)))
                (when (plist-get frame :fin)
                  ;; Final continuation frame: process reassembled message.
-                 (warp-transport--process-incoming-raw-data
-                  connection (plist-get state-ref :reassembly-buffer))
+                 (loom:await ; Await reassembled data processing
+                  (warp-transport--process-incoming-raw-data
+                   connection (plist-get state-ref :reassembly-buffer)))
                  (setf (plist-put state-ref :reassembly-buffer) "")))
               ;; Control frames
-              (8 (warp:transport-close connection)) ; Close
+              (8 (loom:await (warp:transport-close connection))) ; Close
               (9 (process-send-string ; Ping: send Pong back
                   (plist-get raw-conn :process)
                   (warp-websocket--encode-frame
@@ -417,8 +426,10 @@ Returns:
              (expected-accept (warp-websocket--calculate-accept key))
              (proc-name (format "ws-client-%s:%d" host port))
              (process (make-network-process
-                       :name proc-name :host host :service port
-                       :coding 'no-conversion :noquery t))
+                       :name proc-name
+                       :host host :service port
+                       :coding 'no-conversion
+                       :noquery t))
              (state-ref `(:state :handshake :inflight-buffer ""
                           :reassembly-buffer "")))
         ;; The sentinel handles unexpected process death.
@@ -430,7 +441,8 @@ Returns:
              (loom:promise-reject handshake-promise err)
              (when-let (timer (plist-get state-ref :heartbeat-timer))
                (cancel-timer timer))
-             (warp-transport--handle-error connection err))))
+             (loom:await ; Await error handling
+              (warp-transport--handle-error connection err)))))
 
         ;; The filter manages handshake and subsequent frame decoding.
         (set-process-filter
@@ -460,7 +472,10 @@ Returns:
                        :type 'warp-websocket-handshake-error
                        :message "Invalid server handshake.")))))))
            (when (eq (plist-get state-ref :state) :open)
-             (warp-websocket--process-open-state-frames connection))))
+             (warp:thread-pool-submit ; Offload frame processing
+              (warp-websocket--get-frame-processor-pool)
+              (lambda ()
+                (warp-websocket--process-open-state-frames connection)))))))
 
         ;; Send the initial HTTP Upgrade request to start the handshake.
         (process-send-string
@@ -517,9 +532,9 @@ Returns:
                :sentinel
                (lambda (proc _event)
                  (when (eq (process-status proc) 'connect)
-                   (let ((client-proc (process-get proc 'new-connection)))
-                     (warp-websocket--setup-server-side-client
-                      server-connection client-proc)))))))
+                   (loom:await ; Await client setup
+                    (warp-websocket--setup-server-side-client
+                     server-connection (process-get proc 'new-connection)))))))
         ;; The "raw connection" for a server is a plist containing its
         ;; listener process and the hash table that will store clients.
         `(:process ,server-proc :clients ,client-registry))
@@ -545,7 +560,8 @@ Returns:
         ;; --- This is a server listener ---
         (let ((clients (plist-get raw-conn :clients)))
           (maphash (lambda (_id client-conn)
-                     (warp:transport-close client-conn))
+                     (loom:await ; Await client close
+                      (warp:transport-close client-conn)))
                    clients)
           (clrhash clients))
       ;; --- This is a client connection or server-side client ---
@@ -633,7 +649,7 @@ Called on Emacs exit to shut down the global frame processor pool.
 Returns: `nil`."
   (warp:log! :info "warp-websocket"
              "Running global WebSocket cleanup on exit.")
-  (warp-websocket--shutdown-frame-processor-pool)
+  (loom:await (warp-websocket--shutdown-frame-processor-pool))
   nil)
 
 (defun warp-websocket-protocol--address-generator-fn (&key id host)

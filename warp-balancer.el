@@ -233,8 +233,8 @@ Side Effects:
               :smooth-weighted-round-robin)
       (when-let (fn (plist-get config :dynamic-effective-weight-fn))
         (setf (warp-balancer--internal-node-state-swrr-effective-weight state)
-              (funcall fn raw-node))))
-
+              (or (funcall fn raw-node)
+                  (warp-balancer--internal-node-state-initial-weight state)))))
     (setf (warp-balancer--internal-node-state-last-access-time state) time)
     state))
 
@@ -318,10 +318,6 @@ Returns:
     (unless healthy-nodes
       (cl-return-from warp--balancer-select-weighted-round-robin nil))
 
-    ;; Simple implementation: pick a random point within the total
-    ;; weight and find the corresponding node. For better distribution
-    ;; over short periods, Smooth Weighted Round Robin (SWRR) is
-    ;; preferred.
     (let ((total-weight (apply #'+ (mapcar
                                      #'warp-balancer--internal-node-state-initial-weight
                                      healthy-nodes)))
@@ -332,8 +328,8 @@ Returns:
               (cl-incf current-sum
                         (warp-balancer--internal-node-state-initial-weight node))
               (when (>= current-sum target-weight)
-                (cl-return-from warp--balancer-select-weighted-round-robin
-                  node))))
+                (cl-return-from
+                    warp--balancer-select-weighted-round-robin node))))
     ;; Fallback to first if no node selected (shouldn't happen in a
     ;; well-formed list, but good for robustness).
     (car healthy-nodes)))
@@ -363,10 +359,15 @@ Returns:
                         #'warp-balancer--internal-node-state-swrr-effective-weight
                         healthy-nodes))))
 
-      (unless (> total-effective-weight 0) ; Avoid division by zero
+      (unless (> total-effective-weight 0)
         ;; If all weights are zero, fallback to simple round-robin or first.
+        ;; This prevents division by zero below.
+        (warp:log! :warn "balancer"
+                   "All effective weights are zero in SWRR, falling back to \
+                    first healthy node.")
         (cl-return-from
-            warp--balancer-select-smooth-weighted-round-robin (car healthy-nodes)))
+            warp--balancer-select-smooth-weighted-round-robin
+          (car healthy-nodes)))
 
       ;; Lock global node states as `swrr-current-weight` is modified.
       (loom:with-mutex! warp-balancer--node-states-lock
@@ -475,7 +476,7 @@ Returns:
     (let* ((session-hash (funcall hash-fn session-id))
            ;; Find the first node on the ring whose hash is >= session-hash.
            (entry (cl-find-if (lambda (e) (>= (car e) session-hash)) ring)))
-      (cdr (or entry (car ring)))))) ; Wrap around the ring if no entry found.
+      (cdr (or entry (car ring))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
@@ -696,9 +697,8 @@ Returns: `nil`.
 Side Effects:
 - Defines a `defconst` variable `NAME` holding the strategy object."
   `(defconst ,name
-     ,docstring
      (apply #'warp:balancer-strategy-create ,plist)
-     "Defined via `warp:defbalancer-strategy`."))
+     ,docstring))
 
 (provide 'warp-balancer)
 

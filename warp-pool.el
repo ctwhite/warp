@@ -47,7 +47,7 @@
 (require 'warp-circuit-breaker)
 (require 'warp-stream)
 (require 'warp-config)
-(require 'warp-marshal) 
+(require 'warp-marshal)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -93,8 +93,8 @@ resource restart policies and internal management intervals.
 Fields:
 - `max-resource-restarts` (integer): Max restarts before a resource is
   permanently failed.
-- `management-interval` (float): Interval for periodic internal management
-  cycles.
+- `management-interval` (float): Interval for periodic internal
+  management cycles.
 - `metrics-ring-size` (integer): Size of ring buffers for metrics."
   (max-resource-restarts 3
                          :type integer
@@ -126,7 +126,8 @@ Fields:
 - `retries` (integer): Number of times this task has been retried.
 - `resource` (warp-pool-resource or nil): The resource currently
   executing this task.
-- `cancel-token` (loom-cancel-token or nil): Token to request cancellation.
+- `cancel-token` (loom-cancel-token or nil): Token to request
+  cancellation.
 - `start-time` (float or nil): Timestamp when execution began.
 - `timeout` (number or nil): Maximum allowed execution time in seconds."
   (promise nil :type (or null loom-promise) :serializable-p nil)
@@ -147,9 +148,9 @@ Fields:
 
 Fields:
 - `enabled` (boolean): If non-nil, health checks are enabled.
-- `check-fn` (function or nil): A function `(lambda (resource pool))` that
-  returns a `loom-promise` resolving to `t` for healthy, rejecting for
-  unhealthy.
+- `check-fn` (function or nil): A function `(lambda (resource pool))`
+  that returns a `loom-promise` resolving to `t` for healthy, rejecting
+  for unhealthy.
 - `interval` (float): The interval in seconds between checks.
 - `failure-threshold` (integer): Number of consecutive failures before
   a resource is considered failed.
@@ -162,7 +163,7 @@ Fields:
   (consecutive-failures 0 :type integer))
 
 (cl-defstruct (warp-pool-resource (:constructor make-warp-pool-resource)
-                                  (:copier nil))
+                                   (:copier nil))
   "Represents a single generic resource managed within a pool.
 This struct is a handle for an underlying resource, typically a
 background process or thread, and tracks its status and health.
@@ -212,7 +213,8 @@ Fields:
 - `execution-times` (ring or nil): A ring buffer of recent task
   execution times (not serialized).
 - `peak-queue-length` (integer): The maximum observed queue length.
-- `peak-resource-count` (integer): The maximum observed number of resources.
+- `peak-resource-count` (integer): The maximum observed number of
+  resources.
 - `created-at` (float): Timestamp when the pool was created.
 - `last-task-at` (float or nil): Timestamp of the last task completion."
   (tasks-submitted 0 :type integer :json-key "tasksSubmitted")
@@ -241,13 +243,14 @@ Fields:
   batch.
 - `max-wait-time` (float): Maximum time in seconds to wait before
   processing an complete batch.
-- `batch-processor-fn` (function or nil): A function `(lambda (tasks pool))`
-  that processes a batch of tasks. Must be provided if batching is enabled."
+- `batch-processor-fn` (function or nil): A function
+  `(lambda (tasks pool))` that processes a batch of tasks. Must be
+  provided if batching is enabled."
   (enabled nil :type boolean :json-key "enabled")
   (max-batch-size 10 :type integer :json-key "maxBatchSize"
                   :validate (>= $ 1))
   (max-wait-time 0.1 :type float :json-key "maxWaitTime"
-                 :validate (>= $ 0.01))
+                  :validate (>= $ 0.01))
   (batch-processor-fn nil :type (or null function) :serializable-p nil))
 
 (cl-defstruct (warp-pool (:constructor %%make-pool) (:copier nil))
@@ -464,7 +467,7 @@ Side Effects:
   or re-enqueues the task."
   (cl-incf (warp-task-retries task))
   (let ((max-restarts (warp-pool-internal-config-max-resource-restarts
-                       (warp-pool-internal-config pool))))
+                        (warp-pool-internal-config pool))))
     (if (> (warp-task-retries task) max-restarts)
         ;; Task has failed too many times; reject it as a poison pill.
         (progn
@@ -536,7 +539,7 @@ Side Effects:
                      (warp-pool-internal-config-max-resource-restarts
                       (warp-pool-internal-config pool)))
           (loom:await (warp--pool-start-resource resource pool))))))
-  (loom:await (warp--pool-dispatch-next-task pool)) 
+  (loom:await (warp--pool-dispatch-next-task pool))
   (loom:resolved! t))
 
 (defun warp--pool-start-resource (resource pool)
@@ -651,7 +654,7 @@ Side Effects:
               (loom:with-mutex! (warp-pool-lock pool)
                 (setf (warp-pool-resources pool)
                       (delete resource (warp-pool-resources pool))))
-              (loom:rejected! err)))))
+              (loom:rejected! err))))))
 
 ;;----------------------------------------------------------------------
 ;;; Task Dispatching and Cancellation
@@ -682,7 +685,8 @@ Side Effects:
   (setf (warp-pool-resource-current-task resource) task)
   (setf (warp-task-resource task) resource)
   (setf (warp-task-start-time task) (float-time))
-  (warp:log! :debug (warp-pool-name pool) "Dispatching task %s to resource %s."
+  (warp:log! :debug (warp-pool-name pool)
+             "Dispatching task %s to resource %s."
              (warp-task-id task) (warp-pool-resource-id resource))
   (let ((executor-fn
          (lambda () (funcall (warp-pool-task-executor-fn pool)
@@ -851,7 +855,7 @@ Side Effects:
                                  (warp:log! :warn (warp-pool-name pool)
                                             "Task %s on resource %s timed out after %.2fs."
                                             (warp-task-id task) (warp-pool-resource-id resource) timeout)
-                                 (warp--update-task-metrics pool task :timeout)
+                                 (warp--update-task-metrics pool task :timed-out)
                                  (loom:promise-reject (warp-task-promise task)
                                                       (warp:error! :type 'warp-pool-task-timeout
                                                                    :message (format "Task %s timed out"
@@ -908,7 +912,7 @@ Side Effects:
            (pending-batch (warp-pool-pending-batch pool))
            (batch-size (length pending-batch))
            (process-batch-p (or explicit-flush-p
-                               (>= batch-size (warp-pool-batch-config-max-batch-size
+                                (>= batch-size (warp-pool-batch-config-max-batch-size
                                                 batch-cfg)))))
       (when process-batch-p
         (when (warp-pool-batch-timer pool)
@@ -1012,7 +1016,7 @@ Side Effects:
                       :max-queue-size max-queue-size
                       :name name
                       :internal-config resolved-internal-config
-                      :metrics metrics-obj 
+                      :metrics metrics-obj
                       args))
          (batch-cfg (when batch-config-options
                       (apply #'make-warp-pool-batch-config
@@ -1125,33 +1129,33 @@ Signals:
       (let ((queue (warp-pool-task-queue pool))
             (batch-cfg (warp-pool-batch-config pool)))
         (cond
-         ;; If the pool is shutting down, reject the task immediately.
-         ((warp-pool-shutdown-p pool)
-          (loom:promise-reject promise (warp:error! :type 'warp-pool-shutdown)))
-         ;; If batching is enabled, add task to pending batch.
-         ((and batch-cfg (warp-pool-batch-config-enabled batch-cfg))
-          (push task (warp-pool-pending-batch pool))
-          ;; Start a batch timer if one isn't already running.
-          (unless (warp-pool-batch-timer pool)
-            (setf (warp-pool-batch-timer pool)
-                  (run-at-time (warp-pool-batch-config-max-wait-time batch-cfg)
-                               nil #'warp--maybe-process-batch pool t)))
-          ;; Try to process the batch immediately if conditions are met.
-          (loom:await (warp--maybe-process-batch pool nil)))
-         ;; Otherwise, add task to queue and try to dispatch.
-         (t
-          (cl-incf (warp-pool-metrics-tasks-submitted
-                    (warp-pool-metrics pool)))
-          ;; Update peak queue length metric.
-          (setf (warp-pool-metrics-peak-queue-length
-                 (warp-pool-metrics pool))
-                (max (warp-pool-metrics-peak-queue-length
-                      (warp-pool-metrics pool))
-                     (if (loom:pqueue-p queue)
-                         (loom:pqueue-length queue)
-                       (plist-get (warp:stream-status queue) :buffer-length))))
-          (loom:await (warp--pool-queue-enqueue pool task))
-          (loom:await (warp--pool-dispatch-next-task pool))))))
+          ;; If the pool is shutting down, reject the task immediately.
+          ((warp-pool-shutdown-p pool)
+           (loom:promise-reject promise (warp:error! :type 'warp-pool-shutdown)))
+          ;; If batching is enabled, add task to pending batch.
+          ((and batch-cfg (warp-pool-batch-config-enabled batch-cfg))
+           (push task (warp-pool-pending-batch pool))
+           ;; Start a batch timer if one isn't already running.
+           (unless (warp-pool-batch-timer pool)
+             (setf (warp-pool-batch-timer pool)
+                   (run-at-time (warp-pool-batch-config-max-wait-time batch-cfg)
+                                nil #'warp--maybe-process-batch pool t)))
+           ;; Try to process the batch immediately if conditions are met.
+           (loom:await (warp--maybe-process-batch pool nil)))
+          ;; Otherwise, add task to queue and try to dispatch.
+          (t
+           (cl-incf (warp-pool-metrics-tasks-submitted
+                     (warp-pool-metrics pool)))
+           ;; Update peak queue length metric.
+           (setf (warp-pool-metrics-peak-queue-length
+                  (warp-pool-metrics pool))
+                 (max (warp-pool-metrics-peak-queue-length
+                       (warp-pool-metrics pool))
+                      (if (loom:pqueue-p queue)
+                          (loom:pqueue-length queue)
+                        (plist-get (warp:stream-status queue) :buffer-length))))
+           (loom:await (warp--pool-queue-enqueue pool task))
+           (loom:await (warp--pool-dispatch-next-task pool))))))
     promise))
 
 ;;;###autoload
@@ -1180,7 +1184,7 @@ Signals:
   ;; Example priority levels. In a real system, these might be global or
   ;; configurable. Define locally for now.
   (let ((warp-pool-priority-levels
-         '((:critical . 100) (:high . 75) (:normal . 50) (:low . 25) (:lowest . 0))))
+          '((:critical . 100) (:high . 75) (:normal . 50) (:low . 25) (:lowest . 0))))
     (let ((priority-value (cdr (assq priority-name warp-pool-priority-levels))))
       (unless priority-value
         (error "Unknown priority level: %s" priority-name))
@@ -1214,13 +1218,12 @@ Side Effects:
       (let ((err (warp:error! :type 'warp-pool-shutdown))
             (queue (warp-pool-task-queue pool))
             (all-promises '()))
-        ;; Handle tasks and resources:
         ;; Reject in-flight tasks
         (cl-loop for resource in (copy-sequence (warp-pool-resources pool)) do
                  (when-let ((task (warp-pool-resource-current-task resource)))
                    (push (loom:promise-reject (warp-task-promise task) err) all-promises))
                  ;; Remove and destroy resource
-                 (push (warp--pool-remove-resource-internal resource pool) all-promises))
+                 (push (loom:await (warp--pool-remove-resource-internal resource pool)) all-promises))
 
         ;; Reject any tasks remaining in the queue or pending batch.
         (when (warp-pool-batch-config pool)
@@ -1242,9 +1245,9 @@ Side Effects:
                    (warp:log! :info (warp-pool-name pool) "Shutdown complete.")
                    t))
           (:catch (lambda (error-val)
-                    (warp:log! :error (warp-pool-name pool) 
-                      "Shutdown failed with error: %S" 
-                      error-val)
+                    (warp:log! :error (warp-pool-name pool)
+                               "Shutdown failed with error: %S"
+                               error-val)
                     (loom:rejected! error-val)))))))
   (loom:resolved! t))
 
@@ -1277,9 +1280,7 @@ Signals:
                     :stopping ,(cl-count :stopping statii))
         :queue-length ,(if (loom:pqueue-p (warp-pool-task-queue pool))
                            (loom:pqueue-length (warp-pool-task-queue pool))
-                         (plist-get 
-                          (warp:stream-status (warp-pool-task-queue pool)) 
-                          :buffer-length))))))
+                         (plist-get (warp:stream-status (warp-pool-task-queue pool)) :buffer-length))))))
 
 ;;;###autoload
 (defun warp:pool-metrics (pool)
@@ -1303,10 +1304,10 @@ Signals:
            (uptime (- (float-time) (warp-pool-metrics-created-at metrics))))
       `(:uptime ,uptime
         :tasks (:submitted ,(warp-pool-metrics-tasks-submitted metrics)
-                :completed ,(warp-pool-metrics-tasks-completed metrics)
-                :failed ,(warp-pool-metrics-tasks-failed metrics)
-                :cancelled ,(warp-pool-metrics-tasks-cancelled metrics)
-                :timed-out ,(warp-pool-metrics-tasks-timed-out metrics))
+                  :completed ,(warp-pool-metrics-tasks-completed metrics)
+                  :failed ,(warp-pool-metrics-tasks-failed metrics)
+                  :cancelled ,(warp-pool-metrics-tasks-cancelled metrics)
+                  :timed-out ,(warp-pool-metrics-tasks-timed-out metrics))
         :performance (:avg-execution-time
                       ,(if (not (null exec-times))
                            (/ (apply #'+ exec-times) (length exec-times)) 0.0)
@@ -1316,7 +1317,7 @@ Signals:
                       :total-execution-time
                       ,(warp-pool-metrics-total-execution-time metrics))
         :resources (:restarts ,(warp-pool-metrics-resource-restarts metrics)
-                  :peak-count ,(warp-pool-metrics-peak-resource-count metrics))
+                    :peak-count ,(warp-pool-metrics-peak-resource-count metrics))
         :queue (:peak-length ,(warp-pool-metrics-peak-queue-length metrics))
         :health (:success-rate
                  ,(let ((completed (warp-pool-metrics-tasks-completed
@@ -1373,11 +1374,10 @@ Side Effects:
                     :created-at (float-time)
                     :queue-wait-times (make-ring
                                        (warp-pool-internal-config-metrics-ring-size
-                                        (warp-pool-internal-config pool)))
+                                        final-internal-config)) ; Use final-internal-config
                     :execution-times (make-ring
                                       (warp-pool-internal-config-metrics-ring-size
-                                       (warp-pool-internal-config pool)))))
-             ;; Additional metrics configuration can be merged here if needed
+                                       final-internal-config)))) ; Use final-internal-config
              ))
        ;; Configure circuit breaker if specified.
        ,(when circuit-breaker-opts

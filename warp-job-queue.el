@@ -245,7 +245,7 @@ Fields:
   `((id 1 :string)
     (status 2 :string)
     (priority 3 :string)
-    (payload 4 :bytes) ; Serialized Lisp data (e.g., via `warp-marshal`)
+    (payload 4 :bytes) 
     (timeout 5 :int32)
     (max-retries 6 :int32)
     (retry-count 7 :int32)
@@ -254,13 +254,13 @@ Fields:
     (started-at 10 :double)
     (completed-at 11 :double)
     (worker-id 12 :string)
-    (result 13 :bytes) ; Serialized Lisp data
+    (result 13 :bytes) 
     (error 14 :string)
-    (dependencies 15 :bytes) ; FIX: List of strings marshaled to bytes
-    (dependents 16 :bytes)   ; FIX: List of strings marshaled to bytes
+    (dependencies 15 :bytes) 
+    (dependents 16 :bytes)   
     (batch-id 17 :string)
-    (tags 18 :bytes)         ; FIX: List of strings marshaled to bytes
-    (metadata 19 :bytes)))    ; Serialized plist
+    (tags 18 :bytes)         
+    (metadata 19 :bytes)))    
 
 (warp:defschema warp-job-batch
     ((:constructor make-warp-job-batch)
@@ -289,11 +289,11 @@ Fields:
 
 (warp:defprotobuf-mapping warp-job-batch
   `((id 1 :string)
-    (jobs 2 :bytes)   ; FIX: List of strings marshaled to bytes
+    (jobs 2 :bytes)   
     (status 3 :string)
     (submitted-at 4 :double)
     (completed-at 5 :double)
-    (metadata 6 :bytes))) ; Serialized plist
+    (metadata 6 :bytes))) 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definitions
@@ -646,7 +646,7 @@ Returns:
                               (warp-job--emit-job-event manager :job-pending
                                                         dependent-job)
                               (warp:log! :info log-target
-                                         "Job %s dependencies satisfied, \
+                                         "Job %s dependencies satisfied,
                                           moved to pending queue."
                                          (warp-job-id dependent-job))))))))))))))
     (:catch (err) ; Catch errors in processing a single dependent job
@@ -991,7 +991,7 @@ Returns:
           (unless (numberp (warp-job-scheduled-at job))
             (loom:rejected! (warp:error! :type 'warp-job-queue-error
                                          :message
-                                         (format "Scheduled job %s missing \
+                                         (format "Scheduled job %s missing
                                                   scheduled-at timestamp."
                                                   job-id))))
           (warp:redis-zadd redis (warp-job--key manager "zset" "scheduled")
@@ -1149,7 +1149,7 @@ Returns:
                        (warp-job-payload job))))
                  (:catch (err)
                    (warp:log! :error log-target
-                              "Failed to process fetched job %s: %S. \
+                              "Failed to process fetched job %s: %S.
                                Re-queuing."
                               job-id err)
                    ;; If an error occurs after fetch but before full
@@ -1157,7 +1157,7 @@ Returns:
                    (setf (warp-job-status job) :pending)
                    (loom:await (warp:job-queue-worker--queue-job manager job))
                    (loom:rejected! (warp:error! :type 'warp-job-queue-error
-                                                :message "Failed to process \
+                                                :message "Failed to process
                                                           fetched job"
                                                 :cause err)))))
          (progn
@@ -1277,7 +1277,7 @@ Returns:
           ;; Max retries exhausted: move to Dead Letter Queue
           (progn
             (warp:log! :error log-target
-                       "Job %s exhausted retries (%d/%d). \
+                       "Job %s exhausted retries (%d/%d).
                         Moving to Dead Letter Queue."
                        job-id (warp-job-retry-count job)
                        (warp-job-max-retries job))

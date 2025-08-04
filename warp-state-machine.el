@@ -1,5 +1,4 @@
-;;; warp-state-machine.el --- Reusable Event-Driven State Machine -*-
-;;; lexical-binding: t; -*-
+;;; warp-state-machine.el --- Reusable Event-Driven State Machine -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
@@ -54,10 +53,11 @@ Fields:
 - `states` (hash-table): Maps a state name (keyword) to its definition,
   which is an alist of `(EVENT . NEXT-STATE)` transitions.
 - `on-transition` (function): A hook `(lambda (context old new event))`
-  called after every successful state transition.
+  called after every successful state transition. It should return a
+  `loom-promise` or `t`.
 - `context` (plist): A mutable property list of contextual data.
-- `lock` (loom-lock): A mutex protecting the state machine from concurrent
-  modification."
+- `lock` (loom-lock): A mutex protecting the state machine from
+  concurrent modification."
   (name nil :type string)
   (current-state :initialized :type keyword)
   (states (make-hash-table :test 'eq) :type hash-table)
@@ -82,30 +82,43 @@ Arguments:
 
 Returns:
 - (loom-promise): A promise that resolves with the `NEW-STATE` when the
-  transition and its hooks complete."
+  transition and its hooks complete.
+
+Side Effects:
+- Atomically updates `sm`'s `current-state`.
+- Calls `on-transition` hook if defined.
+
+Signals:
+- `warp-state-machine-hook-error`: If the `on-transition` hook fails."
   (braid! (loom:resolved! t)
     ;; First, update the internal state.
     (:then (lambda (_)
              (setf (warp-state-machine-current-state sm) new-state)
              ;; Then, execute the user-provided hook, if any.
              (when-let (hook (warp-state-machine-on-transition sm))
-               (funcall hook (warp-state-machine-context sm)
-                        old-state new-state event-data))))
+               (loom:await ; Await the hook's promise
+                (funcall hook (warp-state-machine-context sm)
+                         old-state new-state event-data)))))
     (:then (lambda (_) new-state))
     (:catch (lambda (err)
               (warp:log! :error (warp-state-machine-name sm)
                          "Error in transition hook from %S to %S: %S"
                          old-state new-state err)
-              (loom:rejected! err)))))
+              (loom:rejected!
+               (warp:error!
+                :type 'warp-state-machine-hook-error
+                :message (format "Transition hook failed for %S to %S"
+                                 old-state new-state)
+                :cause err))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;###autoload
-(cl-defun warp:state-machine-create (&key name 
-                                          initial-state 
+(cl-defun warp:state-machine-create (&key name
+                                          initial-state
                                           states-list
-                                          context 
+                                          context
                                           on-transition)
   "Create a new event-driven state machine.
 This factory function takes a declarative definition of all states and
@@ -119,7 +132,8 @@ Arguments:
   `'((:state1 ((:eventA . :state2))) (:state2 ((:eventB . :state1))))`.
 - `:context` (plist, optional): An initial context property list.
 - `:on-transition` (function, optional): A function `(lambda (context
-  old new event))` called after a successful transition.
+  old new event))` called after a successful transition. It should
+  return a `loom-promise` or `t`.
 
 Returns:
 - (warp-state-machine): A new, configured state machine instance."
@@ -147,7 +161,7 @@ transition. The entire operation is thread-safe.
 Arguments:
 - `SM` (warp-state-machine): The state machine instance.
 - `EVENT` (keyword): The event to emit.
-- `EVENT-DATA` (any, optional): Data related to the event, passed to hooks.
+- `EVENT-DATA` (any, optional): Data related to the transition event.
 
 Returns:
 - (loom-promise): A promise that resolves with the new state on

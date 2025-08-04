@@ -14,13 +14,15 @@
 ;; ## Key Features:
 ;;
 ;; - **Declarative Assembly**: Pipelines are created by providing a simple
-;;   list of named processing stages using the `warp:request-pipeline-stage` macro.
+;;   list of named processing stages using the `warp:request-pipeline-stage`
+;;   macro.
 ;; - **Phased Processing**: Requests flow through ordered steps like
 ;;   validation, backpressure, and execution.
 ;; - **Centralized Error Handling**: Errors at any stage are caught
 ;;   and handled uniformly by the caller.
 ;; - **Contextual Data**: A request-specific context object flows
-;;   through the pipeline, accumulating state and tracking the current stage.
+;;   through the pipeline, accumulating state and tracking the current
+;;   stage.
 ;; - **Asynchronous Steps**: Steps are non-blocking and return promises.
 
 ;;; Code:
@@ -131,7 +133,9 @@ Signals:
     (unless (warp-rpc-command-p command)
       (warp:log! :warn (warp-worker-worker-id worker)
                  "Invalid RPC command received.")
-      (error 'warp-invalid-request "Payload is not a valid RPC command.")))
+      (loom:rejected! (warp:error! :type 'warp-invalid-request
+                                   :message "Payload is not a valid \
+                                             RPC command."))))
   (loom:resolved! t))
 
 (defun warp-request-pipeline--step-execute-command (context)
@@ -164,7 +168,8 @@ Side Effects:
 Arguments:
 - `NAME` (keyword): The symbolic name for this stage.
 - `HANDLER-FN` (function): The function that implements the stage's logic.
-  It must accept a single argument: the pipeline context.
+  It must accept a single argument: the pipeline context. It should return
+  a `loom-promise`.
 
 Returns:
 - A form that creates a `make-warp-pipeline-stage` instance."
@@ -187,8 +192,11 @@ Returns:
    :name (or name "default-request-pipeline")
    :steps (or steps
               ;; Provide a default set of production-ready stages.
-              (list (warp:request-pipeline-stage :validate #'warp-request-pipeline--step-validate)
-                    (warp:request-pipeline-stage :execute #'warp-request-pipeline--step-execute-command)))))
+              (list
+               (warp:request-pipeline-stage :validate
+                                            #'warp-request-pipeline--step-validate)
+               (warp:request-pipeline-stage :execute
+                                            #'warp-request-pipeline--step-execute-command)))))
 
 ;;;###autoload
 (defun warp:request-pipeline-run (pipeline message connection)
@@ -219,21 +227,25 @@ Returns:
      (cl-reduce (lambda (promise-chain stage)
                   (braid! promise-chain
                     (:then (lambda (_)
-                             (setf (warp-request-pipeline-context-stage context)
+                             (setf (warp-request-pipeline-context-stage
+                                    context)
                                    (warp-pipeline-stage-name stage))
-                             (funcall (warp-pipeline-stage-handler-fn stage) context)))))
+                             (funcall (warp-pipeline-stage-handler-fn stage)
+                                      context)))))
                 (warp-request-pipeline-steps pipeline)
                 :initial-value (loom:resolved! t))
 
      (:then (lambda (result)
               (setf (warp-request-pipeline-context-result context) result)
               (warp:trace-end-span
-               (warp-request-pipeline-context-current-span context) :status :ok)
+               (warp-request-pipeline-context-current-span context)
+               :status :ok)
               result))
      (:catch (lambda (err)
                (setf (warp-request-pipeline-context-result context) err)
                (warp:trace-end-span
-                (warp-request-pipeline-context-current-span context) :error err)
+                (warp-request-pipeline-context-current-span context)
+                :error err)
                (loom:rejected! err))))))
 
 (provide 'warp-request-pipeline)

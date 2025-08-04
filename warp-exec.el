@@ -80,9 +80,10 @@ Fields:
 - `max-allocation-count` (integer): Maximum object allocations.
 - `require-signatures-strict` (boolean): If `t`, the `:strict` policy
   requires a valid digital signature on a `warp-secure-form`.
-- `enable-cache` (boolean): If `t`, cache validated forms.
+- `enable-cache` (boolean): If `t`, enable caching of validated forms.
 - `cache-max-size` (integer): Maximum number of forms to cache.
-- `enable-metrics` (boolean): If `t`, collect execution metrics.
+- `enable-metrics` (boolean): If `t`, enable collection of execution
+  metrics.
 - `audit-level` (keyword): Level of audit logging (`:minimal`,
   `:normal`, `:verbose`, or `:debug`)."
   (max-execution-time 30.0 :type float :validate (> $ 0.0))
@@ -212,7 +213,8 @@ security policy, acting as a deliberate declaration of trust.
 
 Fields:
 - `form` (t): The Lisp S-expression to be evaluated.
-- `context` (string): Optional string about the form's origin or purpose.
+- `context` (string): Optional string about the form's origin or
+  purpose.
 - `trusted-source` (string): A string identifying the trusted source."
   (form nil :type t :json-key "form")
   (context nil :type (or null string) :json-key "context")
@@ -301,8 +303,7 @@ Arguments:
 - `VALIDATION-RESULT` (any): The result of the validation to store.
 - `CONFIG` (exec-config): The current execution configuration.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Puts the result into `warp-exec--validation-cache`.
@@ -323,8 +324,7 @@ Side Effects:
 Arguments:
 - None.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Removes up to 100 of the oldest entries from the cache."
@@ -528,8 +528,7 @@ Arguments:
 - `CONTEXT` (warp-execution-context): The context being monitored.
 - `CONFIG` (exec-config): The current execution configuration.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - May signal a `warp-exec-resource-limit-exceeded` error."
@@ -541,14 +540,15 @@ Side Effects:
               (list
                (warp:error!
                 :type 'warp-exec-resource-limit-exceeded
-                :message (format "Memory limit exceeded (%.1fMB/%.1fMB)"
-                                 (/ (float memory-diff) 1024 1024)
-                                 (/ (float (exec-config-max-memory-usage
-                                            config)) 1024 1024))
+                :message
+                (format "Memory limit exceeded (%.1fMB/%.1fMB)"
+                        (/ (float memory-diff) 1024 1024)
+                        (/ (float (exec-config-max-memory-usage config))
+                           1024 1024))
                 :context `(:limit ,(exec-config-max-memory-usage config)
                            :used ,memory-diff
-                           :audit-id ,(warp-execution-context-audit-id
-                                       context))))))
+                           :audit-id
+                           ,(warp-execution-context-audit-id context))))))
     (setf (warp-execution-context-allocation-count context)
           (1+ (warp-execution-context-allocation-count context)))
     (when (> (warp-execution-context-allocation-count context)
@@ -559,8 +559,8 @@ Side Effects:
                 :type 'warp-exec-resource-limit-exceeded
                 :message "Allocation limit exceeded"
                 :context `(:limit ,(exec-config-max-allocation-count config)
-                           :audit-id ,(warp-execution-context-audit-id
-                                       context))))))))
+                           :audit-id
+                           ,(warp-execution-context-audit-id context))))))))
 
 (defmacro warp-exec--with-resource-monitoring (seconds context config &rest body)
   "Execute `BODY` with resource monitoring and an overall timeout.
@@ -663,8 +663,8 @@ Returns:
         (eval lisp-form t)))))
 
 (defun warp-exec--handle-execution-result (result context config validation-data
-                                                  security-violation-p
-                                                  initial-err)
+                                           security-violation-p
+                                           initial-err)
   "Process the outcome of a code execution, update metrics, and
 settle the final promise.
 
@@ -756,15 +756,13 @@ Returns:
                                   "High complexity form detected: %s"
                                   (plist-get complexity :complexity-score)))
                      (when (plist-get scan-result :violations)
-                       (signal 'warp-exec-security-violation
-                               (list
-                                (warp:error!
-                                 :type 'warp-exec-security-violation
-                                 :message "Security violations detected"
-                                 :context
-                                 `(:violations
-                                   ,(plist-get scan-result
-                                               :violations))))))
+                       (signal (warp:error!
+                                :type 'warp-exec-security-violation
+                                :message "Security violations detected"
+                                :context
+                                `(:violations
+                                  ,(plist-get scan-result
+                                              :violations)))))
                      `(:valid t :complexity ,complexity
                        :functions ,(plist-get scan-result :called-functions)
                        :cache-hit ,cache-hit-p))))
@@ -794,7 +792,8 @@ Returns:
              (unless (warp-secure-form-p form)
                (signal (warp:error!
                         :type 'warp-exec-security-violation
-                        :message "Ultra-strict policy requires `warp-secure-form`.")))
+                        :message
+                        "Ultra-strict policy requires `warp-secure-form`.")))
              ;; Perform static validation: hash, signature, whitelist.
              (let ((validation-result (warp-exec--validate-form form config)))
                (unless (plist-get validation-result :valid)
@@ -806,20 +805,22 @@ Returns:
                        (warp-secure-form-required-capabilities form) config)))
                  (warp:log! :info "warp-exec"
                             "Executing with :ultra-strict. Audit ID: %s"
-                            (warp-execution-context-audit-id execution-context))
+                            (warp-execution-context-audit-id
+                             execution-context))
                  (braid! (warp-exec--execute-in-sandbox
-                          (warp-secure-form-form form) execution-context config)
+                          (warp-secure-form-form form)
+                          execution-context config)
                    (:then (lambda (result)
                             (loom:await
                              (warp-exec--handle-execution-result
-                              result execution-context config validation-result
-                              nil nil))))
+                              result execution-context config
+                              validation-result nil nil)))) ; No initial error
                    (:catch (lambda (err)
                              (loom:await
                               (warp-exec--handle-execution-result
-                               nil execution-context config validation-result
-                               t err)))
-                           (loom:rejected! err)))))))))
+                               nil execution-context config
+                               validation-result t err))) ; Security violation
+                           (loom:rejected! err))))))))))
 
 (defun warp-exec--strict-strategy-fn (form config public-key-getter-fn)
   "Execute a form using the `:strict` policy.
@@ -850,20 +851,22 @@ Returns:
                        (warp-secure-form-required-capabilities form) config)))
                  (warp:log! :info "warp-exec"
                             "Executing with :strict. Audit ID: %s"
-                            (warp-execution-context-audit-id execution-context))
+                            (warp-execution-context-audit-id
+                             execution-context))
                  (braid! (warp-exec--execute-in-sandbox
-                          (warp-secure-form-form form) execution-context config)
+                          (warp-secure-form-form form)
+                          execution-context config)
                    (:then (lambda (result)
                             (loom:await
                              (warp-exec--handle-execution-result
-                              result execution-context config validation-result
-                              nil nil))))
+                              result execution-context config
+                              validation-result nil nil))))
                    (:catch (lambda (err)
                              (loom:await
                               (warp-exec--handle-execution-result
-                               nil execution-context config validation-result
-                               t err)))
-                           (loom:rejected! err)))))))))
+                               nil execution-context config
+                               validation-result t err)))
+                           (loom:rejected! err))))))))))
 
 (defun warp-exec--moderate-strategy-fn (form config)
   "Execute a form using the `:moderate` policy.
@@ -955,15 +958,15 @@ Returns:
                            (loom:await (warp-exec--handle-execution-result
                                         nil execution-context config
                                         nil t err)))
-                         (loom:rejected! err)))))))))
+                         (loom:rejected! err))))))))))
 
 ;;----------------------------------------------------------------------
 ;;; Metrics and Monitoring
 ;;----------------------------------------------------------------------
 
 (defun warp-exec--update-global-metrics (execution-time success-p
-                                                      security-violation-p
-                                                      _metrics-detail)
+                                         security-violation-p
+                                         _metrics-detail)
   "Update global execution statistics.
 
 Arguments:
@@ -972,15 +975,15 @@ Arguments:
 - `SECURITY-VIOLATION-P` (boolean): Whether a violation occurred.
 - `_METRICS-DETAIL` (warp-execution-metrics): Detailed metrics (unused).
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Modifies the `warp-exec--global-metrics` plist."
   (when (exec-config-enable-metrics (make-exec-config))
     (cl-incf (plist-get warp-exec--global-metrics :total-executions))
     (if success-p
-        (cl-incf (plist-get warp-exec--global-metrics :successful-executions))
+        (cl-incf (plist-get warp-exec--global-metrics
+                            :successful-executions))
       (cl-incf (plist-get warp-exec--global-metrics :failed-executions)))
 
     (when security-violation-p
@@ -991,7 +994,8 @@ Side Effects:
            (current-avg (plist-get warp-exec--global-metrics
                                    :average-execution-time))
            (new-avg (if (> total 0)
-                        (/ (+ (* current-avg (1- total)) execution-time) total)
+                        (/ (+ (* current-avg (1- total)) execution-time)
+                           total)
                       execution-time)))
       (setf (plist-get warp-exec--global-metrics :average-execution-time)
             new-avg))
@@ -1069,8 +1073,7 @@ Returns:
 Arguments:
 - None.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Clears `warp-exec--validation-cache` and `warp-exec--cache-stats`."
@@ -1086,8 +1089,7 @@ Side Effects:
 Arguments:
 - None.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Clears the table of active execution contexts."

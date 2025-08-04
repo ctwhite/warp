@@ -140,10 +140,11 @@ Returns:
            process
            (lambda (proc event)
              (when (warp-pool-resource-p resource)
-               (warp:log! :warn "warp-compress" "Python process '%s' died: %s"
-                          (process-name proc) event)
-               (loom:await (warp-pool-handle-resource-death
-                            resource event pool)))))
+               (loom:await ; Await resource death handling
+                (warp:log! :warn "warp-compress" "Python process '%s' died: %s"
+                           (process-name proc) event)
+                (warp-pool-handle-resource-death
+                 resource event pool)))))
           (loom:resolved! process))
       (loom:rejected! "Failed to start Python process"))))
 
@@ -262,13 +263,18 @@ Returns:
                   (result (cdr (assoc 'result response))))
              (if error-msg
                  (loom:promise-reject response-promise
-                                      (format "Python error: %s" error-msg))
+                                      (warp:error!
+                                       :type 'warp-compression-error
+                                       :message
+                                       (format "Python error: %s" error-msg)))
                (loom:promise-resolve response-promise
                                      (base64-decode-string result))))
          (error
           (loom:promise-reject
            response-promise
-           (format "Failed to parse Python response: %S" err))))))
+           (warp:error!
+            :type 'warp-compression-error
+            :message (format "Failed to parse Python response: %S" err)))))))
     (process-send-string process request-json)
     response-promise))
 
@@ -446,7 +452,8 @@ Side Effects:
   (let ((pools (warp-compression-system-pools system)))
     (loom:all
      (cl-loop for pool being the hash-values of pools
-              collect (warp:pool-shutdown pool t)))
+              collect (loom:await ; Await pool shutdown
+                        (warp:pool-shutdown pool t)))) ; Force shutdown
     (clrhash pools)))
 
 ;;;###autoload
@@ -479,7 +486,8 @@ Arguments:
 - `SYSTEM` (warp-compression-system): The component instance.
 - `DATA` (string): The raw binary string to compress.
 - `&rest OPTIONS` (plist): A plist of options:
-  - `:algorithm` (keyword): The compression algorithm to use. Defaults to `:gzip`.
+  - `:algorithm` (keyword): The compression algorithm to use. Defaults
+    to `:gzip`.
   - `:level` (integer): The compression level (1-9).
   - `:timeout` (integer): Timeout in seconds for the operation.
 
@@ -500,7 +508,8 @@ Signals:
     (unless (stringp data)
       (signal 'warp-compression-error (list "Data must be a string")))
     (unless (memq algorithm '(gzip zlib deflate brotli lz4))
-      (signal 'warp-compression-error (list "Unsupported algorithm" algorithm)))
+      (signal 'warp-compression-error (list "Unsupported algorithm"
+                                            algorithm)))
 
     (braid! (warp:pool-submit
              pool

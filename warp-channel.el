@@ -41,9 +41,10 @@
 ;;   `:error`) prevent the channel from being overwhelmed by fast
 ;;   producers and manage resource consumption gracefully.
 ;;
-;; - **Observability**: Comprehensive runtime statistics (`warp-channel-stats`)
-;;   and structured logging provide deep visibility into the channel's
-;;   operational health, message flow, and error rates.
+;; - **Observability**: Comprehensive runtime statistics
+;;   (`warp-channel-stats`) and structured logging provide deep
+;;   visibility into the channel's operational health, message flow,
+;;   and error rates.
 
 ;;; Code:
 
@@ -120,8 +121,8 @@ Fields:
 - `max-subscribers` (integer): Maximum number of concurrent subscribers
   allowed per channel. Prevents resource exhaustion from too many
   consumers.
-- `send-queue-capacity` (integer): Capacity of the outbound message queue
-  for a transport-backed channel. When this limit is hit, the
+- `send-queue-capacity` (integer): Capacity of the outbound message
+  queue for a transport-backed channel. When this limit is hit, the
   `on-backpressure` policy is triggered. Not used for in-memory channels.
 - `on-backpressure` (symbol): Policy for a full `send-queue`:
   - `:drop-head`: Discard the oldest message(s) to make room.
@@ -129,16 +130,17 @@ Fields:
   - `:error`: Reject the `warp:channel-send` operation with an error.
 - `enable-health-checks` (boolean): If non-nil, run periodic health
   checks for transport-backed channels to monitor connectivity.
-- `health-check-interval` (integer): Interval in seconds between periodic
-  health checks. These checks apply to transport-backed channels and
-  contribute to the associated circuit breaker's state.
+- `health-check-interval` (integer): Interval in seconds between
+  periodic health checks. These checks apply to transport-backed
+  channels and contribute to the associated circuit breaker's state.
 - `thread-pool` (warp-thread-pool or nil): Optional `warp-thread-pool`
   for the background sender thread (`background-sender-thread`).
   If `nil`, `warp:thread-pool-default` is used. This is not used for
   in-memory channels.
 - `transport-options` (plist): Options passed directly to
-  `warp:transport-connect` or `warp:transport-listen` for transport-backed
-  channels (e.g., `:on-connect-fn`, `:on-close-fn`, `:serializer`).
+  `warp:transport-connect` or `warp:transport-listen` for
+  transport-backed channels (e.g., `:on-connect-fn`, `:on-close-fn`,
+  `:serializer`).
 - `circuit-breaker-config` (plist or nil): Configuration options for the
   channel's circuit breaker (e.g., `:failure-threshold`,
   `:recovery-timeout`). If `nil`, default circuit breaker config is used.
@@ -181,8 +183,8 @@ Fields:
 - `errors-count` (integer): Total errors encountered by this channel,
   including transport errors and internal processing issues.
 - `last-activity` (list): Timestamp of the last significant message
-  activity (send, receive, or drop). Represented as an Emacs `(SEC . MSEC)`
-  timestamp list."
+  activity (send, receive, or drop). Represented as an Emacs
+  `(SEC . MSEC)` timestamp list."
   (messages-sent 0 :type integer :json-key "messagesSent")
   (messages-received 0 :type integer :json-key "messagesReceived")
   (messages-dropped 0 :type integer :json-key "messagesDropped")
@@ -223,8 +225,8 @@ Fields:
 - `error` (loom-error or nil): Stores the last critical error if the
   channel enters an `:error` state.
 - `transport-conn` (warp-transport-connection or nil): The underlying
-  `warp-transport-connection` (for transport-backed channels) that handles
-  the actual network communication.
+  `warp-transport-connection` (for transport-backed channels) that
+  handles the actual network communication.
 - `circuit-breaker-id` (string or nil): The service ID for the circuit
   breaker instance associated with this channel's transport. Used to
   get its state and record failures/successes.
@@ -289,7 +291,8 @@ Side Effects:
   (loom:with-mutex! (warp-channel-lock channel)
     (let ((name (warp-channel-name channel)))
       (warp:log! :fatal name
-                 "CRITICAL CHANNEL ERROR [%S]: %s (Context: %S, Details: %S, Cause: %S)"
+                 "CRITICAL CHANNEL ERROR [%S]: %s (Context: %S, Details: %S, \
+                  Cause: %S)"
                  error-type message context details cause)
       (setf (warp-channel-error channel)
             (warp:error! :type error-type
@@ -298,7 +301,8 @@ Side Effects:
                          :details (append details `(:context ,context))))
       ;; Transition to error state, preventing further operations and
       ;; signaling to connected components that this channel is unusable.
-      (warp:state-machine-emit (warp-channel-state-machine channel) :error)
+      (warp:state-machine-emit (warp-channel-state-machine channel)
+                               :error)
       (warp-channel--update-stats channel 'errors-count)
       (loom:rejected! (warp-channel-error channel)))))
 
@@ -364,11 +368,13 @@ Side Effects:
       (braid! (warp:stream-write sub message)
                  ;; On successful write, do nothing further.
                  (:then nil)
-                 ;; On failure (e.g., stream's queue is full), log and mark for removal.
+                 ;; On failure (e.g., stream's queue is full), log and mark
+                 ;; for removal.
                  (:catch (lambda (err)
                            (push sub defunct-subscribers)
                            (warp:log! :warn channel-name
-                                      "Removing defunct subscriber '%s' due to write error: %S"
+                                      "Removing defunct subscriber '%s' due to \
+                                       write error: %S"
                                       (warp-stream-name sub) err)))))
     ;; Atomically remove all identified defunct subscribers.
     (when defunct-subscribers
@@ -380,15 +386,16 @@ Side Effects:
          channel 'subscribers-connected (- (length defunct-subscribers)))))))
 
 (defun warp-channel--put (channel message)
-  "Internal function to place a `MESSAGE` into a channel for local distribution.
-This is the unified entry point for messages, whether they are
-received from the underlying transport layer or directly injected
-into the channel (for in-memory channels). The message is then
-broadcast to all local subscribers.
+  "Internal function to place a `MESSAGE` into a channel for local
+distribution. This is the unified entry point for messages, whether
+they are received from the underlying transport layer or directly
+injected into the channel (for in-memory channels). The message is
+then broadcast to all local subscribers.
 
 Arguments:
 - `channel` (`warp-channel`): The channel to put the message into.
-- `message` (any): The message to be distributed.
+- `message` (any): The message to be distributed (already deserialized
+  Lisp object).
 
 Returns: `nil`.
 
@@ -400,14 +407,15 @@ Side Effects:
   nil)
 
 (defun warp-channel--sender-loop (channel)
-  "Continuous loop to send messages from the channel's `send-queue` to the transport.
-This function runs in a dedicated background thread (`background-sender-thread`).
-It continuously reads messages from the channel's `send-queue` and
-attempts to send them asynchronously via the underlying `warp-transport`
-connection. It respects the channel's circuit breaker if configured,
-pausing sending when the circuit is open. The loop gracefully exits
-if the channel's state transitions to `:closing`, `:closed`, or `:error`,
-or if the underlying `send-queue` stream is closed.
+  "Continuous loop to send messages from the channel's `send-queue` to
+the transport. This function runs in a dedicated background thread
+(`background-sender-thread`). It continuously reads messages from the
+channel's `send-queue` and attempts to send them asynchronously via the
+underlying `warp-transport` connection. It respects the channel's
+circuit breaker if configured, pausing sending when the circuit is open.
+The loop gracefully exits if the channel's state transitions to
+`:closing`, `:closed`, or `:error`, or if the underlying `send-queue`
+stream is closed.
 
 Arguments:
 - `channel` (`warp-channel`): The channel instance whose messages to send.
@@ -426,7 +434,8 @@ Side Effects:
          (processor-fn
           ;; This function is executed for each message read from the stream.
           (lambda (message)
-            (let ((sender-fn (lambda () (warp:transport-send conn message))))
+            (let ((sender-fn (lambda ()
+                               (warp:transport-send conn message))))
               (braid! (if cb-id
                           ;; Use circuit breaker if enabled for this channel.
                           (warp:circuit-breaker-execute cb-id sender-fn)
@@ -438,14 +447,19 @@ Side Effects:
                           (warp:log! :error name
                                      "Sender loop error sending message: %S"
                                      err)
-                          (warp-channel--update-stats channel 'errors-count))))))))
+                          (warp-channel--update-stats channel 'errors-count)
+                          ;; Important: resolve to nil so the stream-for-each
+                          ;; does not stop on individual send errors.
+                          (loom:resolved! nil))))))))
 
     (warp:log! :debug name "Sender loop for channel '%s' starting." name)
     ;; `warp:stream-for-each` continuously reads from the stream and applies
     ;; the `processor-fn` until the stream is closed.
     (braid! (warp:stream-for-each send-stream processor-fn)
       (:finally (lambda ()
-                  (warp:log! :debug name "Sender loop for channel '%s' has terminated." name))))
+                  (warp:log! :debug name
+                             "Sender loop for channel '%s' has terminated."
+                             name))))
     nil))
 
 (defun warp-channel--setup-transport (channel mode)
@@ -461,7 +475,8 @@ Arguments:
   or `:connect` (as a client).
 
 Returns: (loom-promise): A promise that resolves with the established
-  `warp-transport-connection` on success, or rejects if transport setup fails.
+  `warp-transport-connection` on success, or rejects if transport setup
+  fails.
 
 Side Effects:
 - Calls `warp:transport-listen` or `warp:transport-connect`.
@@ -472,23 +487,27 @@ Side Effects:
   (let* ((name (warp-channel-name channel))
          (config (warp-channel-config channel))
          (transport-options (warp-channel-config-transport-options config)))
-    (warp:log! :info name "Setting up transport in %S mode for channel." mode)
+    (warp:log! :info name "Setting up transport in %S mode for channel."
+               mode)
     (braid! (if (eq mode :listen)
-                ;; Start listening for incoming connections on the channel's address.
+                ;; Start listening for incoming connections on the channel's
+                ;; address.
                 (apply #'warp:transport-listen name transport-options)
               ;; Connect to a remote endpoint at the channel's address.
               (apply #'warp:transport-connect name transport-options))
       (:then (lambda (transport-conn)
                ;; Store the established connection in the channel struct.
                (loom:with-mutex! (warp-channel-lock channel)
-                 (setf (warp-channel-transport-conn channel) transport-conn))
+                 (setf (warp-channel-transport-conn channel)
+                       transport-conn))
                ;; Bridge incoming messages from the transport layer directly
                ;; to the channel's internal `put` function. `warp-transport`
                ;; already handles deserialization at this point.
-               (warp:transport-bridge-connection-to-channel
-                transport-conn
-                (lambda (message)
-                  (warp-channel--put channel message)))
+               (loom:await ; Await bridging setup
+                (warp:transport-bridge-connection-to-channel
+                 transport-conn
+                 (lambda (message)
+                   (warp-channel--put channel message))))
                transport-conn))
       (:catch (lambda (err)
                 (warp-channel--handle-critical-error
@@ -532,7 +551,8 @@ Side Effects:
                                       "Health check: Transport unhealthy."))))))
           (:catch (lambda (err)
                     (warp:log! :warn (warp-channel-name channel)
-                               "Health check task failed unexpectedly: %S" err)
+                               "Health check task failed unexpectedly: %S"
+                               err)
                     (when-let (cb-id (warp-channel-circuit-breaker-id channel))
                       (warp:circuit-breaker-record-failure
                        (warp:circuit-breaker-get cb-id))))))
@@ -571,24 +591,26 @@ Side Effects:
                           (warp-channel-config channel))))
         (apply #'warp:circuit-breaker-get
                (warp-channel-circuit-breaker-id channel)
-               (or cb-options '()))) ; Ensure cb-options is a list
+               (or cb-options '())))
       (warp:log! :debug (warp-channel-name channel)
                  "Circuit breaker '%s' initialized."
                  (warp-channel-circuit-breaker-id channel))
 
       ;; Create a dedicated `loom-poll` for periodic health checks.
-      (let* ((poller-name (format "%s-health-poller" (warp-channel-name channel)))
+      (let* ((poller-name (format "%s-health-poller"
+                                  (warp-channel-name channel)))
              (poller (loom:poll :name poller-name)))
         (setf (warp-channel-health-check-poller channel) poller)
 
         ;; Register the periodic health check task.
         (loom:poll-register-periodic-task
          poller
-         (intern (format "%s-health-check-task" (warp-channel-name channel)))
+         (intern (format "%s-health-check-task"
+                         (warp-channel-name channel)))
          (lambda () (warp-channel--health-check-task channel))
          :interval (warp-channel-config-health-check-interval
                     (warp-channel-config channel))
-         :immediate t) ; Run the first check immediately
+         :immediate t)
         (warp:log! :debug (warp-channel-name channel)
                    "Health check poller '%s' started." poller-name)))))
 
@@ -601,13 +623,15 @@ is called during channel shutdown.
 Arguments:
 - `channel` (`warp-channel`): The channel to clean up.
 
-Returns: (loom-promise): A promise that resolves when the poller is shut down.
+Returns: (loom-promise): A promise that resolves when the poller is
+  shut down.
 
 Side Effects:
 - Shuts down `warp-channel-health-check-poller` gracefully.
 - Clears the `health-check-poller` slot in the channel struct."
   (when-let (poller (warp-channel-health-check-poller channel))
-    (warp:log! :debug (warp-channel-name channel) "Shutting down health check poller.")
+    (warp:log! :debug (warp-channel-name channel)
+               "Shutting down health check poller.")
     (braid! (loom:poll-shutdown poller)
       (:then (lambda (_)
                (setf (warp-channel-health-check-poller channel) nil)
@@ -615,7 +639,8 @@ Side Effects:
                           "Health check poller shut down successfully.")))
       (:catch (lambda (err)
                 (warp:log! :error (warp-channel-name channel)
-                           "Error shutting down health check poller: %S" err)
+                           "Error shutting down health check poller: %S"
+                           err)
                 (loom:rejected! err))))))
 
 (defun warp-channel--cleanup-sender-thread (channel)
@@ -628,7 +653,8 @@ Arguments:
 - `channel` (`warp-channel`): The channel to clean up.
 
 Returns: (loom-promise): A promise that resolves when the sender thread
-  is confirmed terminated (or after a short delay if direct join isn't used).
+  is confirmed terminated (or after a short delay if direct join isn't
+  used).
 
 Side Effects:
 - Stops the background sender thread.
@@ -637,11 +663,12 @@ Side Effects:
     (warp:log! :debug (warp-channel-name channel)
                "Signaling sender thread to terminate.")
     ;; The `warp:stream-close` on `send-queue` (in `handle-fsm-transition`)
-    ;; will cause `warp:stream-for-each` in `warp-channel--sender-loop` to exit.
-    ;; We might need a short delay or explicit thread-join if we want to await its exit.
-    ;; For now, rely on `warp-thread-pool`'s shutdown to clean up, or natural exit.
+    ;; will cause `warp:stream-for-each` in `warp-channel--sender-loop`
+    ;; to exit. We might need a short delay or explicit thread-join if
+    ;; we want to await its exit. For now, rely on `warp-thread-pool`'s
+    ;; shutdown to clean up, or natural exit.
     (setf (warp-channel-background-sender-thread channel) nil)
-    (loom:resolved! t))) ; Return a resolved promise immediately.
+    (loom:resolved! t)))
 
 (defun warp-channel--handle-fsm-transition (channel old-state new-state event-data)
   "Hook for the channel's state machine transitions.
@@ -670,12 +697,13 @@ Side Effects:
     (warp:log! :info name "Channel state: %S -> %S (Event: %S)"
                old-state new-state event-data)
     ;; Use braid! to chain asynchronous side effects cleanly.
-    (braid! (loom:resolved! nil) ; Start with a resolved promise
+    (braid! (loom:resolved! nil)
       (:then (lambda (_)
                (pcase new-state
                  (:open
                   (warp:log! :info name "Channel is now OPEN and operational.")
-                  ;; For transport-backed channels, start the background sender loop.
+                  ;; For transport-backed channels, start the background
+                  ;; sender loop.
                   (when (warp-channel-transport-conn channel)
                     (let ((thread-pool (warp-channel-config-thread-pool
                                         (warp-channel-config channel))))
@@ -686,20 +714,21 @@ Side Effects:
                              #'warp-channel--sender-loop channel
                              nil :name (format "%s-sender-loop" name))))))
                  (:closing
-                  (warp:log! :info name "Channel is transitioning to CLOSING state. Initiating cleanup.")
+                  (warp:log! :info name "Channel is transitioning to CLOSING \
+                                       state. Initiating cleanup.")
                   ;; Clean up background threads and monitoring.
                   (braid! (warp-channel--cleanup-sender-thread channel)
                     (:then (warp-channel--cleanup-monitoring channel)))
                   ;; Close the underlying transport connection.
                   (braid-when! (warp-channel-transport-conn channel)
-                    (:then (conn) (warp:transport-close conn)))
+                    (:then (conn) (loom:await (warp:transport-close conn t)))) ; Force close here
                   ;; Close the send queue to stop the sender loop naturally.
                   (braid-when! (warp-channel-send-queue channel)
-                    (:then (send-q) (warp:stream-close send-q)))
+                    (:then (send-q) (loom:await (warp:stream-close send-q))))
                   ;; Close all subscriber streams.
                   (loom:with-mutex! (warp-channel-lock channel)
                     (dolist (sub-stream (warp-channel-subscribers channel))
-                      (warp:stream-close sub-stream))
+                      (loom:await (warp:stream-close sub-stream)))
                     (setf (warp-channel-subscribers channel) nil)))
                  (:closed
                   (warp:log! :info name "Channel is now CLOSED. Resources released.")
@@ -707,7 +736,9 @@ Side Effects:
                   (loom:with-mutex! warp-channel--registry-lock
                     (remhash name warp-channel--registry)))
                  (:error
-                  (warp:log! :fatal name "Channel entered CRITICAL ERROR state. Check logs for details.")))
+                  (warp:log! :fatal name
+                             "Channel entered CRITICAL ERROR state. \
+                              Check logs for details.")))
                t)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -739,7 +770,8 @@ Arguments:
     - `:in-memory`: For local, in-process message distribution.
     - `:listen`: For transport-backed channels acting as a server.
     - `:connect`: For transport-backed channels acting as a client.
-    If omitted, inferred from `NAME` (e.g., `\"tcp://\"` implies `:connect`).
+    If omitted, inferred from `NAME` (e.g., `\"tcp://\"` implies
+    `:connect`).
   - `:config-options` (plist, optional): A plist of options to configure
     the `channel-config` struct (e.g., `:max-subscribers`,
     `:on-backpressure`).
@@ -761,7 +793,8 @@ Side Effects:
                    (if (string-match-p "://" name)
                        :connect
                      :in-memory)))
-         (config (apply #'make-channel-config (plist-get options :config-options)))
+         (config (apply #'make-channel-config
+                        (plist-get options :config-options)))
          (channel-lock (loom:lock (format "channel-lock-%s" name)))
          (channel (%%make-channel
                    :name name
@@ -780,19 +813,22 @@ Side Effects:
           (warp:state-machine-create
            :name (format "%s-fsm" name)
            :initial-state :initialized
-           :context `(:channel ,channel) ; Pass channel instance to FSM handlers.
+           :context `(:channel ,channel)
            ;; `on-transition` hook handles side effects for state changes.
            :on-transition (lambda (ctx old-s new-s event-data)
-                            (warp-channel--handle-fsm-transition
-                             (plist-get ctx :channel) old-s new-s event-data))
+                            (loom:await ; Await transition handler promises
+                             (warp-channel--handle-fsm-transition
+                              (plist-get ctx :channel)
+                              old-s new-s event-data)))
            :states-list
            '(;; Define allowed state transitions.
-             (:initialized ((:open . :open) (:error . :error) (:close . :closing)))
+             (:initialized ((:open . :open) (:error . :error)
+                            (:close . :closing)))
              (:open ((:close . :closing) (:error . :error)))
              (:closing ((:closed . :closed) (:error . :error)))
-             (:closed nil) ; Closed state has no outgoing transitions.
-             ;; Allow a channel in `:error` state to be retried (re-initialized)
-             ;; or explicitly closed.
+             (:closed nil)
+             ;; Allow a channel in `:error` state to be retried
+             ;; (re-initialized) or explicitly closed.
              (:error ((:close . :closing) (:reconnect . :initialized))))))
 
     (cl-case mode
@@ -800,8 +836,9 @@ Side Effects:
        ;; For in-memory channels, simply transition to `:open` state.
        ;; No transport or background sender is needed.
        (warp:log! :info name "Creating in-memory channel '%s'." name)
-       (braid! (warp:state-machine-emit (warp-channel-state-machine channel) :open)
-         (:then (lambda (_) channel)) ; Return the channel instance.
+       (braid! (warp:state-machine-emit (warp-channel-state-machine channel)
+                                        :open)
+         (:then (lambda (_) channel))
          (:catch (lambda (err)
                    (warp-channel--handle-critical-error
                     channel :internal-error
@@ -815,20 +852,24 @@ Side Effects:
                 :name (format "%s-send-q" name)
                 :max-buffer-size
                 (warp-channel-config-send-queue-capacity config)
-                :overflow-policy (warp-channel-config-on-backpressure config))))
+                :overflow-policy (warp-channel-config-on-backpressure
+                                  config))))
 
-       (warp:log! :info name "Creating transport-backed channel '%s' in %S mode." name mode)
-       (braid! (warp-channel--setup-transport channel mode) ; Establish transport connection.
+       (warp:log! :info name "Creating transport-backed channel '%s' \
+                              in %S mode." name mode)
+       (braid! (warp-channel--setup-transport channel mode)
          (:then (lambda (_transport-conn)
-                  (warp-channel--setup-monitoring channel) ; Setup health checks and CB.
+                  (warp-channel--setup-monitoring channel)
                   ;; Transition to `:open` state after transport is ready.
-                  (warp:state-machine-emit (warp-channel-state-machine channel) :open)))
-         (:then (lambda (_) channel)) ; Return channel on successful open.
+                  (warp:state-machine-emit
+                   (warp-channel-state-machine channel) :open)))
+         (:then (lambda (_) channel))
          (:catch (lambda (err)
                    ;; Handle transport setup failure as a critical error.
                    (warp-channel--handle-critical-error
                     channel :transport-setup-failure
-                    (format "Failed to set up transport for channel '%s'." name)
+                    (format "Failed to set up transport for channel '%s'."
+                            name)
                     :cause err :context :setup-transport))))))))
 
 ;;;###autoload
@@ -856,13 +897,14 @@ Signals:
   (if-let (channel (gethash channel-name warp-channel--registry))
       (loom:with-mutex! (warp-channel-lock channel)
         ;; Check if the channel is in an `:open` state before sending.
-        (if (eq (warp:state-machine-current-state (warp-channel-state-machine channel)) :open)
+        (if (eq (warp:state-machine-current-state
+                 (warp-channel-state-machine channel)) :open)
             ;; If it's a transport-backed channel with an outbound send queue.
             (if-let (send-q (warp-channel-send-queue channel))
-                (braid! (warp:stream-write send-q message) ; Write message to send queue.
+                (braid! (warp:stream-write send-q message)
                   (:then (lambda (_result)
                            (warp-channel--update-stats channel 'messages-sent)
-                           t)) ; Resolve with true on success.
+                           t))
                   (:catch (lambda (err)
                             ;; Handle failure to write to send queue (backpressure).
                             (warp-channel--update-stats
@@ -870,24 +912,29 @@ Signals:
                             (loom:rejected!
                              (warp:error!
                               :type 'warp-channel-backpressure-error
-                              :message (format "Channel '%s' send queue is full." channel-name)
+                              :message
+                              (format "Channel '%s' send queue is full."
+                                      channel-name)
                               :cause err)))))
-              ;; If no `send-queue`, it's an in-memory channel, distribute directly.
+              ;; If no `send-queue`, it's an in-memory channel,
+              ;; distribute directly.
               (progn
                 (warp-channel--put channel message)
                 (loom:resolved! t)))
           ;; Channel is not open, reject the send operation immediately.
           (loom:rejected! (warp:error!
                            :type 'warp-channel-closed-error
-                           :message (format "Channel '%s' is %s. Cannot send."
-                                            channel-name
-                                            (warp:state-machine-current-state
-                                             (warp-channel-state-machine channel)))))))
+                           :message
+                           (format "Channel '%s' is %s. Cannot send."
+                                   channel-name
+                                   (warp:state-machine-current-state
+                                    (warp-channel-state-machine channel)))))))
     ;; Channel not found in the global registry.
     (loom:rejected! (warp:error!
                      :type 'warp-invalid-channel-error
-                     :message (format "Channel '%s' not found in registry."
-                                      channel-name)))))
+                     :message
+                     (format "Channel '%s' not found in registry."
+                             channel-name)))))
 
 ;;;###autoload
 (defun warp:channel-close (channel)
@@ -926,10 +973,12 @@ Side Effects:
                (loom:with-mutex! (warp-channel-lock channel)
                  (unless (memq current-state '(:closing :closed))
                    (warp:log! :info channel-name "Initiating channel closure.")
-                   (warp:state-machine-emit sm :close))))) ; Emit close event to FSM
-      (:then (lambda (_) t)) ; Resolve to `t` after event is emitted.
+                   (warp:state-machine-emit sm :close)))))
+      (:then (lambda (_) t))
       (:catch (lambda (err)
-                (warp:log! :error channel-name "Error initiating channel close: %S" err)
+                (warp:log! :error channel-name
+                           "Error initiating channel close: %S"
+                           err)
                 (loom:rejected! err))))))
 
 ;;;###autoload
@@ -958,31 +1007,37 @@ Signals:
   (unless (warp-channel-p channel)
     (signal (warp:error!
              :type 'warp-invalid-channel-error
-             :message "Invalid channel object provided to warp:channel-subscribe"
+             :message
+             "Invalid channel object provided to warp:channel-subscribe"
              :details `(:object ,channel))))
 
   (loom:with-mutex! (warp-channel-lock channel)
     ;; Ensure channel is in an `:open` state before allowing subscription.
-    (unless (eq (warp:state-machine-current-state (warp-channel-state-machine channel)) :open)
+    (unless (eq (warp:state-machine-current-state
+                 (warp-channel-state-machine channel)) :open)
       (signal (warp:error!
                :type 'warp-channel-closed-error
-               :message (format "Cannot subscribe to channel '%s': it is not open (current state: %S)."
-                                (warp-channel-name channel)
-                                (warp:state-machine-current-state
-                                 (warp-channel-state-machine channel))))))
+               :message
+               (format "Cannot subscribe to channel '%s': it is not open \
+                        (current state: %S)."
+                       (warp-channel-name channel)
+                       (warp:state-machine-current-state
+                        (warp-channel-state-machine channel))))))
     ;; Check if the maximum subscriber limit has been reached.
     (when (>= (length (warp-channel-subscribers channel))
               (warp-channel-config-max-subscribers
                (warp-channel-config channel)))
       (signal (warp:error!
                :type 'warp-channel-backpressure-error
-               :message (format "Maximum subscribers (%d) reached for channel '%s'."
-                                (warp-channel-config-max-subscribers
-                                 (warp-channel-config channel))
-                                (warp-channel-name channel))
+               :message
+               (format "Maximum subscribers (%d) reached for channel '%s'."
+                       (warp-channel-config-max-subscribers
+                        (warp-channel-config channel))
+                       (warp-channel-name channel))
                :details `(:channel-name ,(warp-channel-name channel)
-                          :max-subscribers ,(warp-channel-config-max-subscribers
-                                              (warp-channel-config channel))))))
+                          :max-subscribers
+                          ,(warp-channel-config-max-subscribers
+                            (warp-channel-config channel))))))
     ;; Create a new `warp-stream` for the subscriber.
     (let ((stream
            (warp:stream
@@ -1005,8 +1060,8 @@ Signals:
   "Execute `BODY` with `VAR` bound to a `warp-channel` instance, ensuring
 proper creation and graceful closure.
 This macro provides a robust way to use channels by abstracting away the
-asynchronous setup and guaranteeing resource release even if errors occur
-within the `BODY` or during channel creation.
+asynchronous setup and guaranteeing resource release even if errors
+occur within the `BODY` or during channel creation.
 
 Arguments:
 - `VAR` (symbol): A variable to bind the channel instance to within `BODY`.
@@ -1032,14 +1087,17 @@ Side Effects:
          (braid! (apply #'warp:channel ,channel-name ,keys)
            (:then (lambda (channel-instance)
                     (setq ,var channel-instance)
-                    (warp:log! :debug (warp-channel-name ,var) "Channel ready, executing body...")
-                    (progn ,@body))) ; Execute user's body once channel is ready.
+                    (warp:log! :debug (warp-channel-name ,var)
+                               "Channel ready, executing body...")
+                    (progn ,@body)))
            (:catch (lambda (err)
                      (error "Failed to open channel '%s': %s"
                             ,channel-name (loom-error-message err)))))
-       ;; Cleanup form: This runs regardless of whether `BODY` succeeds or errors.
+       ;; Cleanup form: This runs regardless of whether `BODY` succeeds
+       ;; or errors.
        (when (and ,var (cl-typep ,var 'warp-channel))
-         (warp:log! :debug (warp-channel-name ,var) "Cleaning up channel on exit.")
+         (warp:log! :debug (warp-channel-name ,var)
+                    "Cleaning up channel on exit.")
          ;; Await the asynchronous close operation to ensure resources are
          ;; fully released before the `unwind-protect` block finishes.
          (loom:await (warp:channel-close ,var))))))

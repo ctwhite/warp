@@ -360,4 +360,4 @@ Returns:
   :cleanup-fn #'warp-tcp-protocol--cleanup-fn)
 
 (provide 'warp-tcp)
-;;; warp-tcp.el ends here ;;;
+;;; warp-tcp.el ends here

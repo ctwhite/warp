@@ -30,10 +30,10 @@
 ;;   would require careful handling of duplicate event processing).
 ;; - **Durability (Potential)**: While this implementation primarily uses
 ;;   Redis Pub/Sub (which is a "fire-and-forget" model), the architecture
-;;   could be extended to use more robust Redis features like **Redis Streams**
-;;   for full event durability, ensuring no events are lost even if brokers
-;;   are temporarily offline. This provides a clear upgrade path for stricter
-;;   reliability requirements.
+;;   could be extended to use more robust Redis features like
+;;   **Redis Streams** for full event durability, ensuring no events are
+;;   lost even if brokers are temporarily offline. This provides a clear
+;;   upgrade path for stricter reliability requirements.
 ;; - **Centralized Event Monitoring**: All distributed events flow through
 ;;   the Redis channel, making it a central point for monitoring, logging,
 ;;   and debugging cluster-wide event activity.
@@ -65,8 +65,8 @@ connects to and interacts with the Redis backend.
 Fields:
 - `redis-key-prefix` (string): The namespace for Redis keys and channels
   used by the event broker. This should match the prefix used by other
-  components publishing distributed events (e.g., `warp:events`). It ensures
-  isolation and prevents key collisions in Redis.
+  components publishing distributed events (e.g., `warp:events`). It
+  ensures isolation and prevents key collisions in Redis.
 - `redis-options` (plist): A plist of options to configure the connection
   to the Redis server (e.g., `:host`, `:port`, `:password`, `:db`). These
   options are passed directly to `warp:redis-service-create`."
@@ -76,7 +76,8 @@ Fields:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Private Functions
 
-(defun warp-event-broker--handle-redis-message (broker-event-system channel-name message-payload)
+(defun warp-event-broker--handle-redis-message
+    (broker-event-system channel-name message-payload)
   "Callback for messages received from the Redis Pub/Sub channel.
 This is the core logic of the event broker. When a message arrives from
 Redis, it's deserialized into a `warp-event` object and then immediately
@@ -94,21 +95,22 @@ Arguments:
 
 Returns:
 - This is a callback function for `warp:redis-subscribe` and does not
-  have a meaningful return value. Its purpose is side-effects (re-emitting
-  the event or logging errors).
+  have a meaningful return value. Its purpose is side-effects
+  (re-emitting the event or logging errors).
 
 Side Effects:
 - Deserializes `MESSAGE-PAYLOAD`.
 - Emits a new local event via `warp:emit-event-with-options`.
 - Logs errors if deserialization or re-emission fails.
-- Crucially, sets `distribution-scope` to `:local` to prevent re-publishing
-  to Redis and creating an infinite loop."
+- Crucially, sets `distribution-scope` to `:local` to prevent
+  re-publishing to Redis and creating an infinite loop."
   (warp:log! :trace (warp-event-system-id broker-event-system)
              "Received distributed event from Redis on channel '%s'."
              channel-name)
   (condition-case err
-      (let ((event (warp:deserialize message-payload :protocol :json)))
-        (unless (warp-event-p event)
+      (let ((event (warp:deserialize message-payload
+                                     :protocol :json))) 
+        (unless (warp-event-p event) 
           (error "Deserialized payload is not a valid warp-event"))
         ;; Re-emit the event on the LOCAL bus. This is crucial to prevent
         ;; an infinite loop where the broker would otherwise try to
@@ -137,8 +139,9 @@ listener for Redis Pub/Sub messages. These are added to the base
 `warp-worker` components.
 
 Arguments:
-- `BROKER-CONFIG` (event-broker-config): The event broker's configuration,
-  used to parameterize the Redis service and channel subscription.
+- `BROKER-CONFIG` (event-broker-config): The event broker's
+  configuration, used to parameterize the Redis service and channel
+  subscription.
 
 Returns:
 - (list): A list of plists, each defining a specialized component."
@@ -155,18 +158,19 @@ Returns:
      ;; This component defines the Redis Pub/Sub listener. It subscribes
      ;; to a wildcard channel pattern to receive all distributed events
      ;; published to the cluster.
-     :deps (:redis-service :event-system) ; Needs Redis to subscribe, and local ES to re-emit
+     :deps (:redis-service :event-system)
      :start (lambda (_ system)
-              (let* ((redis (warp:component-system-get system :redis-service))
-                     (es (warp:component-system-get system :event-system))
+              (let* ((redis (warp:component-system-get system
+                                                       :redis-service))
+                     (es (warp:component-system-get system
+                                                    :event-system))
                      ;; Subscribe to all channels under the configured prefix.
-                     ;; E.g., if prefix is "warp:events", it subscribes to
-                     ;; "warp:events:cluster", "warp:events:global", etc.
                      (channel-pattern (format "%s:*"
                                               (event-broker-config-redis-key-prefix
                                                ,broker-config))))
                 (warp:log! :info (warp-event-system-id es)
-                           "Event broker subscribing to Redis channel pattern: %s."
+                           "Event broker subscribing to Redis channel \
+                            pattern: %s."
                            channel-pattern)
                 (warp:redis-subscribe
                  redis channel-pattern
@@ -199,7 +203,8 @@ Returns:
          ;; Generate a unique ID for this specific event broker worker.
          (worker-id (format "event-broker-%s"
                             (warp-worker--generate-worker-id)))
-         ;; Prepare worker creation options, including the broker-specific config.
+         ;; Prepare worker creation options, including the
+         ;; broker-specific config.
          (worker-options (append options (list :name "event-broker"
                                                :config broker-config
                                                :worker-id worker-id)))
@@ -208,9 +213,11 @@ Returns:
          ;; Get the component system of the newly created worker.
          (cs (warp-worker-component-system broker-worker)))
     ;; Override/add broker-specific component definitions to the worker's
-    ;; component system. This is where the Redis client and listener are injected.
+    ;; component system. This is where the Redis client and listener
+    ;; are injected.
     (setf (warp-component-system-definitions cs)
-          (append (warp-event-broker--get-component-definitions broker-config)
+          (append (warp-event-broker--get-component-definitions
+                   broker-config)
                   (warp-component-system-definitions cs)))
     (warp:log! :info (warp:worker-id broker-worker)
                "Event Broker Worker created (Redis-backed).")

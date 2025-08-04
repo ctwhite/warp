@@ -203,7 +203,7 @@
                     :parent-span-id new-parent-span-id
                     :operation-name operation-name
                     :start-time (float-time)
-                    :tags (copy-sequence tags) 
+                    :tags (copy-sequence tags)
                     :status :active)))
     (warp:log! :trace "warp-trace"
                "Started span %s (trace: %s, parent: %s, op: %s)"
@@ -248,8 +248,8 @@
     (setf (warp-trace-span-status span) (or status (if error :error :ok)))
     (when error
       (warp--trace-set-tag span :error t)
-      (warp--trace-set-tag span :error.type (loom:error-type error))
-      (warp--trace-set-tag span :error.message (loom:error-message error)))
+      (warp--trace-set-tag span :error.type (loom-error-type error))
+      (warp--trace-set-tag span :error.message (loom-error-message error)))
     (warp:log! :trace "warp-trace"
                "Ended span %s (op: %s, duration: %.3fs, status: %S)"
                (warp-trace-span-span-id span)
@@ -303,7 +303,8 @@
               (warp:trace-end-span ,span-var :error err)
               (signal (car err) (cdr err)))))
        ;; This cleanup form runs regardless of how the body exits.
-       (warp:trace-end-span ,span-var))))
+       (when (eq (warp-trace-span-status ,span-var) :active) ; Ensure active before ending
+         (warp:trace-end-span ,span-var)))))
 
 ;;;###autoload
 (defun warp:trace-current-span ()

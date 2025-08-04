@@ -128,7 +128,7 @@ Returns:
           (cond
            (is-remote-target
             (warp:ipc-system-send-settlement ipc-system target-id payload)
-            t) ; Handled
+            t)
            (t
             (if (and (fboundp 'make-thread)
                      (not (eq (current-thread) (main-thread))))
@@ -142,8 +142,8 @@ Returns:
                      payload)))
               (loom:deferred #'warp-ipc--settle-promise-from-payload
                              payload))
-            t)))) ; Handled
-        nil)))) ; Not handled
+            t))))
+        nil)))
 
 (defun warp-ipc--settle-promise-from-payload (payload)
   "Settle a promise using data from a received IPC payload.
@@ -242,19 +242,24 @@ Signals:
         (unless addr (error 'warp-ipc-invalid-config
                             "IPC main channel address is required."))
 
-        (warp:log! :info "ipc" "Listening for IPC on channel: %s" addr)
-        (setf (warp-ipc-system-my-main-channel-address system) addr)
-        (let ((channel (apply #'warp:channel addr :mode :listen
+        (braid! (warp:channel addr :mode :listen
                               (append (list :name addr)
                                       (ipc-config-main-channel-transport-options
-                                       config)))))
-          (setf (warp-ipc-system-main-channel system) channel)
-          (warp:stream-for-each
-           (warp:channel-subscribe channel)
-           (lambda (payload)
-             (loom:with-mutex! (warp-ipc-system-queue-mutex system)
-               (loom:queue-enqueue
-                (warp-ipc-system-main-thread-queue system) payload))))))))
+                                       config)))
+          (:then (lambda (channel)
+                   (setf (warp-ipc-system-main-channel system) channel)
+                   (warp:stream-for-each
+                    (warp:channel-subscribe channel)
+                    (lambda (payload)
+                      (loom:await ; Await queue enqueue to ensure blocking behavior
+                       (loom:with-mutex! (warp-ipc-system-queue-mutex system)
+                         (loom:queue-enqueue
+                          (warp-ipc-system-main-thread-queue system)
+                          payload)))))))
+          (:catch (lambda (err)
+                    (warp:log! :fatal "ipc"
+                               "Failed to start IPC listener: %S" err)
+                    (loom:rejected! err)))))))
   system)
 
 ;;;###autoload
@@ -275,10 +280,10 @@ Side Effects:
 - Clears all internal data structures and resets the singleton."
   (warp:log! :info "ipc" "Stopping IPC system...")
   (when (warp-ipc-system-main-channel system)
-    (warp:channel-close (warp-ipc-system-main-channel system)))
+    (loom:await (warp:channel-close (warp-ipc-system-main-channel system))))
   (setq loom-promise-async-dispatch-functions
-        (remove #'warp-ipc--promise-dispatch-hook
-                loom-promise-async-dispatch-functions))
+        (cl-delete #'warp-ipc--promise-dispatch-hook
+                   loom-promise-async-dispatch-functions))
   (setf (warp-ipc-system-main-thread-queue system) nil)
   (setf (warp-ipc-system-queue-mutex system) nil)
   (setf (warp-ipc-system-main-channel system) nil)

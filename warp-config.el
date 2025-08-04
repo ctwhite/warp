@@ -67,7 +67,7 @@ Signals:
     ('string string-value)
     ('integer (string-to-number string-value))
     ('float (float (string-to-number string-value)))
-    ('boolean (member (downcase string-value) '("true" "t" "1")))
+    ('boolean (member (s-downcase string-value) '("true" "t" "1")))
     ('keyword (intern (s-trim-left ":" string-value)))
     ;; Coercing complex types requires custom parsing logic.
     ((or 'list 'hash-table)
@@ -143,9 +143,9 @@ Returns:
                 (plist-get user-options :no-constructor-p nil))
           (setq env-prefix-arg (plist-get user-options :env-prefix))
           (let ((opts (copy-list user-options)))
-            (remf opts :suffix-p)
-            (remf opts :no-constructor-p)
-            (remf opts :env-prefix)
+            (cl-remf opts :suffix-p)
+            (cl-remf opts :no-constructor-p)
+            (cl-remf opts :env-prefix)
             (setq schema-options opts)))
       (setq name name-or-name-and-options))
 
@@ -178,14 +178,14 @@ Returns:
          (defconst ,default-const-name
            (list
             ,@(cl-loop for field-def in fields collect
-                       (if (cadr field-def)
-                           `(,(car field-def) ,(cadr field-def))
-                         `(,(car field-def) nil))))
+                       (if (consp field-def) ; Check if it's (FIELD-NAME FIELD-DEFAULT OPTIONS)
+                           `(,(car field-def) ,(cadr field-def)) ; Use explicit default
+                         `(,field-def nil)))) ; No explicit default, use nil
            ,(format "Default values for `%S`." final-struct-name))
 
          ,(unless no-constructor-p
             `(cl-defun ,constructor-name (&rest args)
-               ,(format (string-join
+               ,(format (s-join
                          '("Creates a new `%S` instance."
                            ""
                            "Merges `ARGS` and environment variables with"
@@ -208,10 +208,15 @@ Returns:
 
                  ;; I. Apply environment variable overrides over defaults.
                  ,@(cl-loop for field-def in fields collect
-                            (let* ((field-name (car field-def))
-                                   (field-opts (cdr field-def))
+                            (let* ((field-name (if (consp field-def)
+                                                   (car field-def)
+                                                 field-def))
+                                   (field-opts (if (consp field-def)
+                                                   (cddr field-def)
+                                                 nil))
                                    (field-type (plist-get field-opts :type))
-                                   (env-var-name-form (plist-get field-opts :env-var))
+                                   (env-var-name-form
+                                    (plist-get field-opts :env-var))
                                    (env-var-name
                                     (if env-var-name-form
                                         env-var-name-form
@@ -237,8 +242,12 @@ Returns:
                  ;; III. Perform validation on the final instance.
                  (let ((_it-self config-instance))
                    ,@(cl-loop for field-def in fields collect
-                              (let* ((field-name (car field-def))
-                                     (field-opts (cdr field-def))
+                              (let* ((field-name (if (consp field-def)
+                                                     (car field-def)
+                                                   field-def))
+                                     (field-opts (if (consp field-def)
+                                                     (cddr field-def)
+                                                   nil))
                                      (validate-spec
                                       (plist-get field-opts :validate)))
                                 (when validate-spec

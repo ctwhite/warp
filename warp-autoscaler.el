@@ -75,17 +75,19 @@ Fields:
 - `max-resources`: The absolute maximum number of resources for the pool.
 - `scale-up-threshold`: Metric value to trigger a scale-up.
 - `scale-down-threshold`: Metric value to trigger a scale-down.
-- `scale-up-cooldown`: Min seconds to wait after a scale-up.
-- `scale-down-cooldown`: Min seconds to wait after a scale-down.
+- `scale-up-cooldown`: Minimum seconds to wait after a scale-up.
+- `scale-down-cooldown`: Minimum seconds to wait after a scale-down.
 - `metric-value-extractor-fn`: A function `(lambda (metrics-plist))` to
   extract the relevant metric value from the collected metrics.
-- `schedule`: A list of scheduled scaling events for `:scheduled` strategies.
+- `schedule`: A list of scheduled scaling events for `:scheduled`
+  strategies.
 - `evaluation-interval`: How often, in seconds, to evaluate the strategy.
 - `scale-step-size`: The number of resources to add/remove per action.
 - `composite-rules`: A list of rules for `:composite` strategies.
 - `predictive-window`: Number of data points for trend analysis.
 - `predictive-sensitivity`: Aggressiveness factor for predictive scaling.
-- `circuit-breaker-config`: Plist to configure an optional circuit breaker."
+- `circuit-breaker-config`: Plist to configure an optional circuit
+  breaker."
   (type nil :type keyword)
   (min-resources 1 :type integer)
   (max-resources 1 :type integer)
@@ -165,10 +167,12 @@ Arguments: None.
 Returns: None.
 
 Signals:
-- `warp-autoscaler-not-initialized`: If `warp-autoscaler--registry` is `nil`."
+- `warp-autoscaler-not-initialized`: If `warp-autoscaler--registry` is
+  `nil`."
   '(unless warp-autoscaler--registry
      (error 'warp-autoscaler-not-initialized
-            "Warp autoscaler not initialized. Call `warp:autoscaler-initialize` first.")))
+            "Warp autoscaler not initialized. Call `warp:autoscaler-initialize` \
+             first.")))
 
 (defun warp-autoscaler--generate-monitor-id ()
   "Generates a unique auto-scaler monitor identifier string.
@@ -182,6 +186,8 @@ Returns:
 (defun warp-autoscaler--add-metrics-to-history (history metrics)
   "Adds a new metrics data point to the historical record.
 This maintains a rolling window of recent metrics for trend analysis.
+This function is expected to be called by a single thread per monitor,
+ensuring sequential access to `data-points`.
 
 Arguments:
 - `history` (warp-autoscaler-metrics-history): The history object to update.
@@ -198,12 +204,15 @@ Side Effects:
     ;; Prepend the new data point to the list (most recent first).
     (setf (warp-autoscaler-metrics-history-data-points history)
           (cons data-point current-data))
-    ;; If the history is now too large, remove the oldest data point from the end.
+    ;; If the history is now too large, remove the oldest data point
+    ;; from the end.
     (when (> (length (warp-autoscaler-metrics-history-data-points history))
              max-size)
       (setf (warp-autoscaler-metrics-history-data-points history)
-            (butlast (warp-autoscaler-metrics-history-data-points history))))
-    (setf (warp-autoscaler-metrics-history-last-updated history) timestamp)))
+            (butlast
+             (warp-autoscaler-metrics-history-data-points history))))
+    (setf (warp-autoscaler-metrics-history-last-updated history)
+          timestamp)))
 
 (defun warp-autoscaler--calculate-trend (history metric-extractor-fn)
   "Calculates the trend for a specific metric using simple linear regression.
@@ -220,7 +229,8 @@ Returns:
   indicating reliability of the trend based on data points)."
   (let* ((data-points (nreverse ; Oldest to newest for regression.
                        (copy-list
-                        (warp-autoscaler-metrics-history-data-points history))))
+                        (warp-autoscaler-metrics-history-data-points
+                         history))))
          (values (cl-loop for point in data-points
                           for metrics = (plist-get point :metrics)
                           for value = (funcall metric-extractor-fn metrics)
@@ -231,17 +241,17 @@ Returns:
         `(:slope 0.0 :direction :stable :confidence 0.0)
       (let* (;; Standard linear regression formula components (y = mx + b).
              ;; We are calculating 'm' (the slope).
-             (sum-x (/ (* n (1- n)) 2.0)) ; Sum of x (indices 0..n-1).
-             (sum-y (apply #'+ values))   ; Sum of y (metric values).
+             (sum-x (/ (* n (1- n)) 2.0))
+             (sum-y (apply #'+ values))
              (sum-xy (cl-loop for i from 0 for val in values sum (* i val)))
              (sum-x2 (cl-loop for i from 0 below n sum (* i i)))
              (denom (- (* n sum-x2) (* sum-x sum-x)))
              ;; Calculate the slope.
-             (slope (if (= denom 0.0) 0.0 ; Avoid division by zero.
+             (slope (if (= denom 0.0) 0.0
                       (/ (- (* n sum-xy) (* sum-x sum-y)) denom)))
              ;; Classify the trend direction based on the slope.
-             (direction (cond ((> slope 0.1) :up) ; Threshold for "up" trend.
-                              ((< slope -0.1) :down) ; Threshold for "down" trend.
+             (direction (cond ((> slope 0.1) :up)
+                              ((< slope -0.1) :down)
                               (t :stable)))
              ;; Simple confidence score based on data size (max 20 data points).
              (confidence (min 1.0 (/ (float n) 20.0))))
@@ -275,7 +285,9 @@ Side Effects:
          (cb (warp-autoscaler-monitor-circuit-breaker monitor))
          (min (warp-autoscaler-strategy-min-resources strategy))
          (max (warp-autoscaler-strategy-max-resources strategy))
-         (current-size (plist-get (warp:pool-status pool-obj) :resources :total))
+         (current-size (plist-get
+                        (warp:pool-status pool-obj) ; Get current status
+                        :resources :total))
          ;; Clamp the target size to be within the allowed min/max bounds.
          (final-size (max min (min max target-size))))
     (cond
@@ -296,13 +308,34 @@ Side Effects:
         (loom:resolved! `(:action :no-action :size ,current-size
                                   :reason ,reason))))
 
+     ;; Check 3: Cooldown period active for this action type?
+     ((and (eq action :scale-up)
+           (warp-autoscaler-monitor-last-scale-up-time monitor)
+           (< (- (float-time) (warp-autoscaler-monitor-last-scale-up-time
+                                monitor))
+              (warp-autoscaler-strategy-scale-up-cooldown strategy)))
+      (let ((msg (format "Scale up for pool '%s' in cooldown."
+                         (warp-pool-name pool-obj))))
+        (warp:log! :debug "autoscaler" msg)
+        (loom:resolved! `(:action :no-action :reason ,msg))))
+     ((and (eq action :scale-down)
+           (warp-autoscaler-monitor-last-scale-down-time monitor)
+           (< (- (float-time) (warp-autoscaler-monitor-last-scale-down-time
+                                monitor))
+              (warp-autoscaler-strategy-scale-down-cooldown strategy)))
+      (let ((msg (format "Scale down for pool '%s' in cooldown."
+                         (warp-pool-name pool-obj))))
+        (warp:log! :debug "autoscaler" msg)
+        (loom:resolved! `(:action :no-action :reason ,msg))))
+
      ;; If all checks pass, proceed with the scaling operation.
      (t
       (warp:log! :info "autoscaler" "Scaling %s for pool '%s': %d -> %d. %s"
                  (if (> final-size current-size) "up" "down")
                  (warp-pool-name pool-obj) current-size final-size
                  (format "Reason: %s" reason))
-      ;; The actual resizing is asynchronous, so use `braid!` to handle the promise.
+      ;; The actual resizing is asynchronous, so use `braid!` to handle the
+      ;; promise.
       (braid! (warp:pool-resize pool-obj final-size)
         (:then (lambda (result)
                  ;; On success, update the monitor's state.
@@ -311,12 +344,16 @@ Side Effects:
                             (warp-pool-name pool-obj) final-size)
                  (if (> final-size current-size)
                      (progn
-                       (cl-incf (warp-autoscaler-monitor-total-scale-ups monitor))
-                       (setf (warp-autoscaler-monitor-last-scale-up-time monitor)
+                       (cl-incf
+                        (warp-autoscaler-monitor-total-scale-ups monitor))
+                       (setf (warp-autoscaler-monitor-last-scale-up-time
+                              monitor)
                              (float-time)))
                    (progn
-                     (cl-incf (warp-autoscaler-monitor-total-scale-downs monitor))
-                     (setf (warp-autoscaler-monitor-last-scale-down-time monitor)
+                     (cl-incf
+                      (warp-autoscaler-monitor-total-scale-downs monitor))
+                     (setf (warp-autoscaler-monitor-last-scale-down-time
+                            monitor)
                            (float-time))))
                  (when cb (warp:circuit-breaker-record-success cb))
                  result))
@@ -347,7 +384,8 @@ Signals:
   (let* ((type (warp-autoscaler-strategy-type strategy))
          (min (warp-autoscaler-strategy-min-resources strategy))
          (max (warp-autoscaler-strategy-max-resources strategy))
-         (eval-interval (warp-autoscaler-strategy-evaluation-interval strategy))
+         (eval-interval
+          (warp-autoscaler-strategy-evaluation-interval strategy))
          (step-size (warp-autoscaler-strategy-scale-step-size strategy)))
     ;; Basic sanity checks applicable to all strategies.
     (unless (and (integerp min) (>= min 0))
@@ -365,11 +403,13 @@ Signals:
     (pcase type
       ((or :cpu-utilization :request-rate :response-time
            :healthy-resources :active-resources :memory-utilization)
-       (unless (functionp (warp-autoscaler-strategy-metric-value-extractor-fn
-                           strategy))
+       (unless (functionp
+                (warp-autoscaler-strategy-metric-value-extractor-fn
+                 strategy))
          (error 'warp-autoscaler-invalid-strategy
                 "Metric strategies require a :metric-value-extractor-fn."))
-       (unless (numberp (warp-autoscaler-strategy-scale-up-threshold strategy))
+       (unless (numberp (warp-autoscaler-strategy-scale-up-threshold
+                         strategy))
          (error 'warp-autoscaler-invalid-strategy
                 "Metric strategies require numeric :scale-up-threshold."))
        (unless (numberp (warp-autoscaler-strategy-scale-down-threshold
@@ -385,12 +425,14 @@ Signals:
          (error 'warp-autoscaler-invalid-strategy
                 "Composite strategy requires a :composite-rules list")))
       (:predictive
-       (unless (functionp (warp-autoscaler-strategy-metric-value-extractor-fn
-                           strategy))
+       (unless (functionp
+                (warp-autoscaler-strategy-metric-value-extractor-fn
+                 strategy))
          (error 'warp-autoscaler-invalid-strategy
                 "Predictive strategy requires a :metric-value-extractor-fn."))
        (let ((win (warp-autoscaler-strategy-predictive-window strategy))
-             (sens (warp-autoscaler-strategy-predictive-sensitivity strategy)))
+             (sens (warp-autoscaler-strategy-predictive-sensitivity
+                    strategy)))
          (unless (and (integerp win) (> win 2))
            (error 'warp-autoscaler-invalid-strategy
                   "Predictive window must be an integer > 2."))
@@ -412,7 +454,7 @@ Arguments:
 
 Returns:
 - (loom-promise): A promise that resolves with the scaling decision
-  (e.g., `(:action :scale-up :size 5)` or `(:action :no-action)`).
+  (e.g., `(:action :scale-up :size 5)`) or `(:action :no-action)`).
 
 Side Effects:
 - May call `warp-autoscaler--handle-scaling-decision`.
@@ -421,15 +463,16 @@ Signals:
 - `warp-autoscaler-metric-collection-failed`: If the extracted metric
   is not a number, indicating a problem with the metric provider."
   (let* ((strategy (warp-autoscaler-monitor-strategy monitor))
-         (metric-fn (warp-autoscaler-strategy-metric-value-extractor-fn
-                     strategy))
+         (metric-fn
+          (warp-autoscaler-strategy-metric-value-extractor-fn strategy))
          (metric-val (funcall metric-fn metrics))
          (current-size (plist-get
                         (warp:pool-status
                          (warp-autoscaler-monitor-pool-obj monitor))
                         :resources :total))
          (up-thresh (warp-autoscaler-strategy-scale-up-threshold strategy))
-         (down-thresh (warp-autoscaler-strategy-scale-down-threshold strategy))
+         (down-thresh
+          (warp-autoscaler-strategy-scale-down-threshold strategy))
          (step (warp-autoscaler-strategy-scale-step-size strategy)))
     ;; Ensure the metric extractor returned a valid number.
     (unless (numberp metric-val)
@@ -469,10 +512,10 @@ Side Effects:
 - May call `warp-autoscaler--handle-scaling-decision`."
   (let* ((history (warp-autoscaler-monitor-metrics-history monitor))
          (strategy (warp-autoscaler-monitor-strategy monitor))
-         (metric-fn (warp-autoscaler-strategy-metric-value-extractor-fn
-                     strategy))
-         (sensitivity (warp-autoscaler-strategy-predictive-sensitivity
-                       strategy))
+         (metric-fn
+          (warp-autoscaler-strategy-metric-value-extractor-fn strategy))
+         (sensitivity
+          (warp-autoscaler-strategy-predictive-sensitivity strategy))
          (current-size (plist-get
                         (warp:pool-status
                          (warp-autoscaler-monitor-pool-obj monitor))
@@ -488,14 +531,17 @@ Side Effects:
            (> (* (plist-get trend :slope) sensitivity) 0.1))
       (warp-autoscaler--handle-scaling-decision
        monitor :scale-up (+ current-size step)
-       (format "Predictive scale-up (slope: %.2f)" (plist-get trend :slope))))
-     ;; Scale down if we detect a significant downward trend with enough confidence.
+       (format "Predictive scale-up (slope: %.2f)"
+               (plist-get trend :slope))))
+     ;; Scale down if we detect a significant downward trend with enough
+     ;; confidence.
      ((and (eq (plist-get trend :direction) :down)
            (>= (plist-get trend :confidence) 0.5)
            (< (* (plist-get trend :slope) sensitivity) -0.1))
       (warp-autoscaler--handle-scaling-decision
        monitor :scale-down (- current-size step)
-       (format "Predictive scale-down (slope: %.2f)" (plist-get trend :slope))))
+       (format "Predictive scale-down (slope: %.2f)"
+               (plist-get trend :slope))))
      ;; If no significant trend is detected, do nothing.
      (t
       (loom:resolved! `(:action :no-action
@@ -545,8 +591,10 @@ Side Effects:
               (let ((reason (format "Rule: Metric %.2f %S %.2f"
                                     metric-val op thresh)))
                 (pcase (plist-get rule :action)
-                  (:scale-up   (setq should-scale-up t) (push reason up-reasons))
-                  (:scale-down (setq should-scale-down t) (push reason down-reasons)))))))))
+                  (:scale-up   (setq should-scale-up t)
+                               (push reason up-reasons))
+                  (:scale-down (setq should-scale-down t)
+                               (push reason down-reasons)))))))))
     ;; Make a final decision based on the collected signals.
     (cond
      ;; If signals conflict, prioritize scale-up for availability.
@@ -594,13 +642,15 @@ Side Effects:
                       (target-size (plist-get rule :target-size))
                       (met t))
                  ;; A rule only matches if all its time components match.
-                 ;; `nth` indices for `decode-time`: 1:minute, 2:hour, 6:day-of-week.
-                 (when (and hour   (not (= (nth 2 now) hour))) (setq met nil))
-                 (when (and min    (not (= (nth 1 now) min)))  (setq met nil))
-                 (when (and dow    (not (= (nth 6 now) dow)))  (setq met nil))
+                 ;; `nth` indices for `decode-time`: 1:minute, 2:hour,
+                 ;; 6:day-of-week.
+                 (when (and hour (not (= (nth 2 now) hour))) (setq met nil))
+                 (when (and min (not (= (nth 1 now) min))) (setq met nil))
+                 (when (and dow (not (= (nth 6 now) dow))) (setq met nil))
                  ;; If a rule is met, trigger scaling and exit.
                  (when met
-                   (cl-return-from warp-autoscaler--evaluate-scheduled-strategy
+                   (cl-return-from
+                       warp-autoscaler--evaluate-scheduled-strategy
                      (warp-autoscaler--handle-scaling-decision
                       monitor :scale-to target-size
                       (format "Scheduled scale to %d" target-size))))))
@@ -619,8 +669,8 @@ Arguments:
 
 Returns:
 - (loom-promise): A promise that resolves with the evaluation outcome
-  (e.g., `(:action :scale-up :size 5)` or `(:action :no-action)`) or rejects
-  if metric collection fails or the pool becomes inactive.
+  (e.g., `(:action :scale-up :size 5)` or `(:action :no-action)`) or
+  rejects if metric collection fails or the pool becomes inactive.
 
 Side Effects:
 - May stop the monitor if the target pool is inactive.
@@ -631,8 +681,9 @@ Side Effects:
            (strategy (warp-autoscaler-monitor-strategy monitor))
            (now (float-time)))
       ;; Step 1: Sanity check: ensure the pool is still active.
-      (unless (and pool-obj (eq (warp-pool-status pool-obj) :active))
-        (warp:log! :warn "autoscaler" "Pool '%s' not active; stopping monitor."
+      (unless (and pool-obj (eq (warp:pool-status pool-obj) :active))
+        (warp:log! :warn "autoscaler"
+                   "Pool '%s' not active; stopping monitor."
                    (warp-pool-name pool-obj))
         (warp:autoscaler-stop (warp-autoscaler-monitor-id monitor))
         (cl-return-from warp-autoscaler--evaluate-strategy
@@ -643,10 +694,12 @@ Side Effects:
       (let* ((up-cd (warp-autoscaler-strategy-scale-up-cooldown strategy))
              (down-cd (warp-autoscaler-strategy-scale-down-cooldown strategy))
              (last-up (warp-autoscaler-monitor-last-scale-up-time monitor))
-             (last-down (warp-autoscaler-monitor-last-scale-down-time monitor)))
+             (last-down
+              (warp-autoscaler-monitor-last-scale-down-time monitor)))
         (when (or (and last-up (< (- now last-up) up-cd))
                   (and last-down (< (- now last-down) down-cd)))
-          (warp:log! :debug "autoscaler" "Scaling for pool '%s' in cooldown."
+          (warp:log! :debug "autoscaler"
+                     "Scaling for pool '%s' in cooldown."
                      (warp-pool-name pool-obj))
           (cl-return-from warp-autoscaler--evaluate-strategy
             (loom:resolved! `(:action :no-action :reason "Cooldown")))))
@@ -659,14 +712,18 @@ Side Effects:
                  ;; Step 5: Dispatch to the appropriate evaluation function.
                  (pcase (warp-autoscaler-strategy-type strategy)
                    ((or :cpu-utilization :request-rate :response-time
-                        :healthy-resources :active-resources :memory-utilization)
+                        :healthy-resources :active-resources
+                        :memory-utilization)
                     (warp-autoscaler--evaluate-metric-strategy monitor metrics))
                    (:predictive
-                    (warp-autoscaler--evaluate-predictive-strategy monitor metrics))
+                    (warp-autoscaler--evaluate-predictive-strategy
+                     monitor metrics))
                    (:composite
-                    (warp-autoscaler--evaluate-composite-strategy monitor metrics))
+                    (warp-autoscaler--evaluate-composite-strategy
+                     monitor metrics))
                    (:scheduled
-                    ;; Scheduled strategies don't use real-time metrics for decision.
+                    ;; Scheduled strategies don't use real-time metrics for
+                    ;; decision.
                     (warp-autoscaler--evaluate-scheduled-strategy monitor))
                    (_ (loom:resolved! `(:action :no-action
                                          :reason "Unknown strategy"))))))
@@ -694,12 +751,12 @@ Returns: `t`.
 Side Effects:
 - Creates and configures the internal `warp-autoscaler--registry`."
   (setq warp-autoscaler--registry
-        (warp:registry-create
+        (warp:registry-create 
          :name "warp-autoscaler-registry"
          :event-system event-system
          :indices `((:by-pool-name .
-                      ,(lambda (id item _m) ; Index by pool name for easy lookup.
-                         (declare (ignore id _m)) ; Unused args.
+                      ,(lambda (id item _m)
+                         (declare (ignore id _m))
                          (warp-pool-name
                           (warp-autoscaler-monitor-pool-obj item)))))))
   t)
@@ -737,7 +794,7 @@ Signals:
   (warp-autoscaler--ensure-initialized)
   (warp-autoscaler--validate-strategy strategy)
   (unless (and (fboundp 'warp:pool-p) (warp:pool-p pool-obj)
-               (eq (warp-pool-status pool-obj) :active))
+               (eq (warp:pool-status pool-obj) :active))
     (error 'warp-autoscaler-error "Invalid or inactive pool object."))
   (let* ((monitor-id (warp-autoscaler--generate-monitor-id))
          (cb-config (warp-autoscaler-strategy-circuit-breaker-config strategy))
@@ -769,9 +826,9 @@ Signals:
                                               "Eval failed: %S" err)
                                    (setf (warp-autoscaler-monitor-status
                                           monitor) :error))))
-                 :immediate t))) ; Run the first evaluation immediately.
+                 :immediate t)))
       (setf (warp-autoscaler-monitor-poll-instance monitor) poll)
-      (loom:poll-start poll) ; Start the background polling.
+      (loom:poll-start poll)
       ;; Register the new monitor in the global registry.
       (warp:registry-add warp-autoscaler--registry monitor-id monitor)
       (warp:log! :info "autoscaler"
@@ -826,7 +883,8 @@ Signals:
    (lambda (id)
      (when-let ((monitor (warp:registry-get warp-autoscaler--registry id)))
        `(:id ,id
-         :pool-name ,(warp-pool-name (warp-autoscaler-monitor-pool-obj monitor))
+         :pool-name ,(warp-pool-name
+                      (warp-autoscaler-monitor-pool-obj monitor))
          :strategy-type ,(warp-autoscaler-strategy-type
                           (warp-autoscaler-monitor-strategy monitor))
          :status ,(warp-autoscaler-monitor-status monitor))))
@@ -861,12 +919,15 @@ Signals:
         :min-resources ,(warp-autoscaler-strategy-min-resources strategy)
         :max-resources ,(warp-autoscaler-strategy-max-resources strategy)
         :total-scale-ups ,(warp-autoscaler-monitor-total-scale-ups monitor)
-        :total-scale-downs ,(warp-autoscaler-monitor-total-scale-downs monitor)
-        :last-scale-up-time ,(warp-autoscaler-monitor-last-scale-up-time monitor)
-        :last-scale-down-time ,(warp-autoscaler-monitor-last-scale-down-time
-                                monitor)
+        :total-scale-downs
+        ,(warp-autoscaler-monitor-total-scale-downs monitor)
+        :last-scale-up-time
+        ,(warp-autoscaler-monitor-last-scale-up-time monitor)
+        :last-scale-down-time
+        ,(warp-autoscaler-monitor-last-scale-down-time
+          monitor)
         :circuit-breaker-state ,(plist-get cb-status :state)
-        :metrics-history-size ,(length ; Number of data points in history.
+        :metrics-history-size ,(length
                                 (warp-autoscaler-metrics-history-data-points
                                  (warp-autoscaler-monitor-metrics-history
                                   monitor)))))))
@@ -881,8 +942,8 @@ Arguments:
 - `NAME` (symbol): The variable name for the new strategy (e.g.,
   `my-cpu-strategy`).
 - `DOCSTRING` (string): Documentation for the strategy.
-- `PLIST` (plist): A property list of strategy options, matching the keys
-  for `warp-autoscaler-strategy` struct fields (e.g., `:type`,
+- `PLIST` (plist): A property list of strategy options, matching the
+  keys for `warp-autoscaler-strategy` struct fields (e.g., `:type`,
   `:min-resources`, `:scale-up-threshold`).
 
 Returns: (symbol) The `NAME` of the defined constant.
@@ -905,8 +966,8 @@ Scales up if CPU goes above 70%, down if below 40%."
   :max-resources 10
   :scale-up-threshold 70.0
   :scale-down-threshold 40.0
-  :evaluation-interval 30 ; Check every 30 seconds.
-  :scale-step-size 1 ; Add/remove one worker at a time.
+  :evaluation-interval 30
+  :scale-step-size 1
   :metric-value-extractor-fn
   (lambda (m) (or (plist-get m :avg-cluster-cpu-utilization) 0.0)))
 
@@ -919,9 +980,9 @@ Scales up if active requests exceed 50, down if below 10."
   :scale-up-threshold 50.0
   :scale-down-threshold 10.0
   :evaluation-interval 30
-  :scale-step-size 2 ; More aggressive scaling for requests.
+  :scale-step-size 2
   :metric-value-extractor-fn
-  (lambda (m) (or (plist-get m :total-active-requests) 0.0))) ; Note: metrics changed in cluster to active-requests
+  (lambda (m) (or (plist-get m :total-active-requests) 0.0)))
 
 (warp:defautoscaler-strategy warp-autoscaler-memory-utilization-strategy
   "Auto-scaling strategy based on average memory utilization (in MB).
@@ -944,8 +1005,8 @@ Uses a rolling window of past CPU utilization to predict future needs."
   :max-resources 15
   :evaluation-interval 60
   :scale-step-size 1
-  :predictive-window 10 ; Uses the last 10 data points for trend.
-  :predictive-sensitivity 2.0 ; How aggressively to react to trends.
+  :predictive-window 10
+  :predictive-sensitivity 2.0
   :metric-value-extractor-fn
   (lambda (m) (or (plist-get m :avg-cluster-cpu-utilization) 0.0)))
 
@@ -955,14 +1016,15 @@ Scales to specific sizes at predefined hours of the day."
   :type :scheduled
   :min-resources 1
   :max-resources 5
-  :evaluation-interval 300 ; Evaluate every 5 minutes (less frequent for schedule).
-  :schedule `((:hour 9 :target-size 5 :reason "Morning peak") ; 9 AM to 5 workers.
-              (:hour 18 :target-size 2 :reason "Evening off-peak") ; 6 PM to 2 workers.
-              (:hour 23 :target-size 1 :reason "Overnight minimum"))) ; 11 PM to 1 worker.
+  :evaluation-interval 300
+  :schedule `((:hour 9 :target-size 5 :reason "Morning peak")
+              (:hour 18 :target-size 2 :reason "Evening off-peak")
+              (:hour 23 :target-size 1 :reason "Overnight minimum")))
 
 (warp:defautoscaler-strategy warp-autoscaler-composite-cpu-queue-strategy
   "Composite auto-scaling strategy combining CPU and request queue depth.
-Scales up if either CPU or active requests are high; scales down if CPU is low."
+Scales up if either CPU or active requests are high; scales down if CPU
+is low."
   :type :composite
   :min-resources 1
   :max-resources 10
@@ -971,13 +1033,13 @@ Scales up if either CPU or active requests are high; scales down if CPU is low."
   :composite-rules
   `((:metric-extractor-fn
      ,(lambda (m) (or (plist-get m :avg-cluster-cpu-utilization) 0.0))
-     :operator :gte :threshold 85.0 :action :scale-up) ; Scale up if CPU >= 85%.
+     :operator :gte :threshold 85.0 :action :scale-up)
     (:metric-extractor-fn
      ,(lambda (m) (or (plist-get m :total-active-requests) 0.0))
-     :operator :gte :threshold 60.0 :action :scale-up) ; Scale up if active requests >= 60.
+     :operator :gte :threshold 60.0 :action :scale-up)
     (:metric-extractor-fn
      ,(lambda (m) (or (plist-get m :avg-cluster-cpu-utilization) 0.0))
-     :operator :lt :threshold 30.0 :action :scale-down))) ; Scale down if CPU < 30%.
+     :operator :lt :threshold 30.0 :action :scale-down)))
 
 ;;----------------------------------------------------------------------
 ;;; Shutdown Hook
@@ -993,8 +1055,9 @@ Arguments: None.
 Returns: `nil`.
 
 Side Effects:
-- Iterates through all registered monitors and calls `warp:autoscaler-stop`
-  on each, logging any errors encountered during shutdown."
+- Iterates through all registered monitors and calls
+  `warp:autoscaler-stop` on each, logging any errors encountered
+  during shutdown."
   ;; Only proceed if the registry was initialized.
   (when warp-autoscaler--registry
     (let ((ids (warp:registry-list-keys warp-autoscaler--registry)))

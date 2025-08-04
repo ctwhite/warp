@@ -102,7 +102,7 @@ Side Effects:
 
 Returns: `nil`."
   (let ((keys (funcall key-extractor-fn item-id item metadata)))
-    (unless (listp keys) (setq keys (list keys))) ; Coerce single key
+    (unless (listp keys) (setq keys (list keys)))
     (dolist (key keys)
       (when key
         (let ((existing-ids (gethash key index)))
@@ -217,8 +217,10 @@ mechanism for announcing state changes.
 
 Arguments:
 - `:name` (string, optional): A descriptive name for logging.
-- `:test-type` (symbol, optional): The test function for the hash table.
-- `:event-system` (warp-event-system): The event system for notifications.
+- `:test-type` (symbol, optional): The test function for the hash
+  table. Defaults to `'equal`.
+- `:event-system` (warp-event-system): The event system for
+  notifications.
 - `:indices` (alist, optional): An alist to define secondary indices.
   Each element is `(INDEX-NAME . KEY-EXTRACTOR-FN)`.
 
@@ -270,7 +272,8 @@ Signals:
 
       (when (and existing-item (not overwrite-p))
         (error (warp:error! :type 'warp-registry-key-exists
-                            :message (format "Key '%S' already exists" key))))
+                            :message (format "Key '%S' already exists"
+                                             key))))
 
       ;; Step 1: Update the primary data and metadata stores.
       (puthash key value (warp-registry-data registry))

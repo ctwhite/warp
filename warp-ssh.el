@@ -112,12 +112,12 @@ Side Effects:
 
 Signals:
 - `warp-ssh-host-error`: If the host is invalid."
-  (unless (and (stringp remote-host) (not (string-empty-p remote-host)))
+  (unless (and (stringp remote-host) (not (s-empty? remote-host)))
     (signal (warp:error!
              :type 'warp-ssh-host-error
              :message "Remote host must be a non-empty string.")))
-  (let ((normalized-host (string-trim remote-host)))
-    (when (or (string-empty-p normalized-host)
+  (let ((normalized-host (s-trim remote-host)))
+    (when (or (s-empty? normalized-host)
               (string-match-p "[[:space:]]" normalized-host))
       (signal (warp:error! :type 'warp-ssh-host-error
                            :message "Remote host contains invalid whitespace.")))
@@ -141,8 +141,8 @@ Signals:
     (unless (stringp remote-user)
       (signal (warp:error! :type 'warp-ssh-error
                            :message "Remote user must be a string.")))
-    (let ((normalized-user (string-trim remote-user)))
-      (when (or (string-empty-p normalized-user)
+    (let ((normalized-user (s-trim remote-user)))
+      (when (or (s-empty? normalized-user)
                 (string-match-p "[[:space:]\n\r\t@]" normalized-user))
         (signal (warp:error!
                  :type 'warp-ssh-error
@@ -187,10 +187,10 @@ Side Effects:
 Signals:
 - `warp-ssh-command-error`: If the command is invalid."
   (unless (and (stringp remote-command)
-               (not (string-empty-p (string-trim remote-command))))
+               (not (s-empty? (s-trim remote-command))))
     (signal (warp:error! :type 'warp-ssh-command-error
                          :message "Remote command must be a non-empty string.")))
-  (string-trim remote-command))
+  (s-trim remote-command))
 
 (defun warp-ssh--build-connection-options ()
   "Build common SSH options based on `defcustom` values.
@@ -256,7 +256,7 @@ Side Effects:
 
 ;;;###autoload
 (cl-defun warp:ssh-build-command
-    (remote-host &key remote-user identity-file remote-command)
+    (remote-host &key remote-user identity-file remote-command (pty nil))
   "Construct the full `ssh` command array for executing a command.
 This function generates a list of strings suitable for `make-process`.
 It safely combines all necessary options for authentication,
@@ -267,6 +267,8 @@ Arguments:
 - `:REMOTE-USER` (string): Username for SSH authentication.
 - `:IDENTITY-FILE` (string): Path to an SSH private key file.
 - `:REMOTE-COMMAND` (string): Shell command to execute remotely.
+- `:PTY` (boolean, optional): If `t`, request a pseudo-terminal
+  (`-t`) for the SSH session. Defaults to `nil`.
 
 Returns:
 - (list): A list of strings for the full `ssh` command array.
@@ -290,7 +292,7 @@ Signals:
     ;; 3. Build SSH command components.
     (let* ((user-host (if v-user (format "%s@%s" v-user v-host) v-host))
            (identity-args (when v-identity (list "-i" v-identity)))
-           ;; These options ensure non-interactive execution for automation.
+           (pty-arg (when pty '("-t"))) ; Add -t for pseudo-terminal
            (base-options
             '("-o" "BatchMode=yes"
               "-o" "PasswordAuthentication=no"
@@ -302,6 +304,7 @@ Signals:
       ;; 4. Assemble the final command list.
       (append (list "ssh")
               identity-args
+              pty-arg ; Add PTY argument here
               base-options
               connection-opts
               host-key-opts

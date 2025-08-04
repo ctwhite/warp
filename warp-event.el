@@ -183,8 +183,8 @@ Fields:
 - `target-pattern` (t): An optional pattern to target specific handlers
   or destinations in a more fine-grained way than `event-type`.
 - `distribution-scope` (symbol): Controls event propagation:
-  `:local` (in-process only), `:cluster` (within the current Warp cluster),
-  or `:global` (potentially across multiple clusters).
+  `:local` (in-process only), `:cluster` (within the current Warp
+  cluster), or `:global` (potentially across multiple clusters).
 - `priority` (symbol): Processing priority: `:low`, `:normal`, `:high`,
   or `:critical`. Influences thread pool scheduling."
   (id (warp-event--generate-event-id) :type string :json-key "id")
@@ -230,7 +230,7 @@ Fields:
 - `id` (string): A unique identifier for this handler registration.
   Generated at subscription time.
 - `pattern` (t): The event matching pattern used for subscription.
-  (e.g., `:worker-started`, `\"task-*\"`, a predicate function).
+  (e.g., `:all`, `:worker-started`, `\"task-*\"`, a predicate function).
 - `handler-fn` (function): The actual Lisp function that processes the
   event. This is not serializable.
 - `options` (plist): Handler options specified at subscription (e.g.,
@@ -361,7 +361,7 @@ Fields:
 - `event-queue` (warp-stream): The main in-memory buffer (`warp-stream`)
   for inbound **local** events. It provides backpressure capabilities.
 - `dead-letter-queue` (warp-stream): A separate `warp-stream` for
-  events that have failed all processing attempts and retries.
+  events that have failed all processing attempts.
 - `executor-pool` (warp-thread-pool): The `warp-thread-pool` used for
   concurrently executing event handlers. Ensures that handlers run
   off the main Emacs thread.
@@ -399,10 +399,11 @@ unique identifiers for event instances across different parts of the
 system without relying on a central ID generator.
 
 Returns:
-- (string): A unique string identifier for an event (e.g., 'evt-1701010101234-abc123')."
+- (string): A unique string identifier for an event (e.g.,
+  'evt-1701010101234-abc123')."
   (format "evt-%s-%06x"
-          (format-time-string "%s%3N") ; Unix timestamp + milliseconds
-          (random (expt 16 6))))       ; 6 random hex characters
+          (format-time-string "%s%3N")
+          (random (expt 2 64))))
 
 (defun warp-event--generate-handler-id ()
   "Generate a unique ID for an event handler registration.
@@ -410,7 +411,8 @@ This provides a unique identifier for each subscription, which is
 used as the key in the handler registry and for unsubscribing.
 
 Returns:
-- (string): A unique string identifier for a handler (e.g., 'hdl-1701010101234-ab12')."
+- (string): A unique string identifier for a handler (e.g.,
+  'hdl-1701010101234-ab12')."
   (format "hdl-%s-%04x"
           (format-time-string "%s%3N")
           (random (expt 16 4))))
@@ -418,8 +420,8 @@ Returns:
 (defun warp-event--event-system-log-target (system)
   "Generate a standardized logging target string for an event system.
 This creates a consistent identifier for use in log messages, making
-it easier to filter and search logs for a specific event system instance
-within a larger Warp application.
+it easier to filter and search logs for a specific event system
+instance within a larger Warp application.
 
 Arguments:
 - `SYSTEM` (warp-event-system): The event system instance.
@@ -441,10 +443,8 @@ Arguments:
 
 Returns:
 - (string): A regular expression string suitable for `string-match-p`."
-  (let ((regexp (regexp-quote wildcard))) ; Escape all regex metachars first
-    ;; Then replace escaped asterisks with the regexp equivalent '.*'.
+  (let ((regexp (regexp-quote wildcard)))
     (setq regexp (s-replace-regexp "\\\\\\*" ".*" regexp))
-    ;; Anchor the regex to match the whole string (`\`A` is start, `\'` is end).
     (concat "\\`" regexp "\\'")))
 
 (defun warp-event--pattern-matches-p (pattern event-type data)
@@ -510,7 +510,7 @@ Side Effects:
          (task (lambda ()
                  ;; The actual work of dispatching to handlers happens here.
                  (braid! (warp-event--dispatch-event system event)
-                   (:then ; Success path: update metrics.
+                   (:then
                     (lambda (_)
                       (loom:with-mutex! (warp-event-system-lock system)
                         (cl-incf (warp-event-system-metrics-events-processed
@@ -519,14 +519,13 @@ Side Effects:
                                            (warp-event-timestamp event))))
                           (warp-event--update-processing-time-stats
                            metrics duration)))))
-                   (:catch ; Failure path: trigger retry/DLQ logic.
+                   (:catch
                     (lambda (err)
                       (loom:with-mutex! (warp-event-system-lock system)
                         (cl-incf (warp-event-system-metrics-events-failed
                                   metrics)))
-                      (warp-event--handle-event-failure system event err)))))))
-    (warp:log! :trace worker-id
-               "Submitting event %s to executor pool." event-id)
+                      (loom:await ; Await handling failure before returning
+                       (warp-event--handle-event-failure system event err))))))))
     (loom:with-mutex! (warp-event-system-lock system)
       (cl-incf (warp-event-system-metrics-events-in-queue metrics)))
     (braid!
@@ -539,20 +538,23 @@ Side Effects:
                                 :name (format "event-proc-task-%s" event-id)))
      (:then (lambda (_)
               (loom:with-mutex! (warp-event-system-lock system)
-                (cl-decf (warp-event-system-metrics-events-in-queue metrics)))
+                (cl-decf (warp-event-system-metrics-events-in-queue
+                          metrics)))
               (loom:resolved! t)))
-     (:catch ; This handles rejection if the thread pool is overloaded.
+     (:catch
       (lambda (err)
         (loom:with-mutex! (warp-event-system-lock system)
           (cl-decf (warp-event-system-metrics-events-in-queue metrics))
           (cl-incf (warp-event-system-metrics-events-failed metrics)))
-        (warp:error! :type 'warp-event-system-overload
-                     :message (format "Failed to submit event %s: %S"
-                                      event-id err)
-                     :reporter-id (warp-event--event-system-log-target system)
-                     :context :event-submission
-                     :details err)
-        (loom:rejected! err))))))
+        (loom:rejected! (warp:error! ; Propagate overload error
+                         :type 'warp-event-system-overload
+                         :message
+                         (format "Failed to submit event %s: %S"
+                                 event-id err)
+                         :reporter-id
+                         (warp-event--event-system-log-target system)
+                         :context :event-submission
+                         :cause err))))))
 
 (defun warp-event--dispatch-event (system event)
   "Dispatch a single event to all matching handlers concurrently.
@@ -566,9 +568,9 @@ Arguments:
 - `EVENT` (warp-event): The event to dispatch.
 
 Returns:
-- (loom-promise): A promise that resolves with the results of all handler
-  invocations after they have settled (either successfully or with a
-  rejection).
+- (loom-promise): A promise that resolves with the results of all
+  handler invocations after they have settled (either successfully or
+  with a rejection).
 
 Side Effects:
 - Invokes all matching handler functions.
@@ -583,17 +585,16 @@ Side Effects:
     (loom:with-mutex! (warp-event-system-lock system)
       (maphash
        (lambda (id handler-info)
-         (when (warp-event-handler-info-active handler-info) ; Only dispatch to active handlers
+         (when (warp-event-handler-info-active handler-info)
            (when (warp-event--pattern-matches-p
                   (warp-event-handler-info-pattern handler-info)
                   event-type event-data)
              (push (braid! (warp-event--invoke-handler
                             system handler-info event)
-                     (:then ; If a `:once` handler succeeds, mark for
-                            ; unsubscription.
+                     (:then
                       (lambda (result)
                         (when (eq result :handler-once-fired-successfully)
-                          (push id unsub-ids)) ; Add ID to list for later unsub
+                          (push id unsub-ids))
                         (if (eq result :handler-once-fired-successfully)
                             t result)))
                      (:catch
@@ -608,16 +609,11 @@ Side Effects:
 
     ;; Wait for all matching handler promises to complete.
     (braid! (loom:all-settled handler-promises)
-      (:then ; After all handlers have finished, unsubscribe the `:once` ones.
+      (:then
        (lambda (results)
          (dolist (id unsub-ids)
-           ;; Unsubscribe asynchronously to avoid blocking.
-           (braid! (warp:unsubscribe system id)
-             (:catch (lambda (err)
-                       (warp:log! :warn worker-id
-                                  "Failed to unsubscribe handler %s: %S"
-                                  id err))))
-           results)))
+           (loom:await (warp:unsubscribe system id))) 
+         results))
       (:catch
        (lambda (err)
          (warp:log! :error worker-id
@@ -657,7 +653,8 @@ Side Effects:
 
     (loom:with-mutex! (warp-event-system-lock system)
       (cl-incf (warp-event-handler-info-trigger-count handler-info))
-      (setf (warp-event-handler-info-last-triggered-at handler-info) start-time))
+      (setf (warp-event-handler-info-last-triggered-at handler-info)
+            start-time))
 
     (braid!
      ;; Execute the handler within the event's dynamic context.
@@ -668,7 +665,8 @@ Side Effects:
                             :message "Handler timed out."
                             :reporter-id
                             (warp-event--event-system-log-target system)
-                            :context (warp-event-handler-info-id handler-info)
+                            :context
+                            (warp-event-handler-info-id handler-info)
                             :source-id (warp-event-id event)))
      (:then
       (lambda (result)
@@ -720,10 +718,10 @@ Side Effects:
 
 (defun warp-event--handle-event-failure (system event error)
   "Handle a failed event by retrying it or moving it to the Dead Letter Queue.
-This function implements the fault-tolerance logic for event processing,
-using exponential backoff for retries to avoid hammering the system.
-If all configured retries fail, the event is placed in the Dead Letter
-Queue for later analysis or manual intervention.
+This function implements the fault-tolerance logic for event
+processing, using exponential backoff for retries to avoid hammering
+the system. If all configured retries fail, the event is placed in the
+Dead Letter Queue for later analysis or manual intervention.
 
 Arguments:
 - `SYSTEM` (warp-event-system): The event system instance.
@@ -746,7 +744,8 @@ Side Effects:
                  (cl-incf (warp-event-delivery-count event))
                  (setf (warp-event-last-error event) (format "%S" error)))
                ;; Re-queue the event for processing.
-               (warp-event--queue-event-processing-task system event))
+               (loom:await (warp-event--queue-event-processing-task
+                            system event))) 
              :retries max-retries
              :delay (lambda (n _)
                       ;; Exponential backoff delay.
@@ -771,7 +770,8 @@ Side Effects:
               (warp:error!
                :type 'warp-internal-error
                :message (format "Failed to move event %s to DLQ." event-id)
-               :reporter-id (warp-event--event-system-log-target system)
+               :reporter-id
+               (warp-event--event-system-log-target system)
                :context :event-dlq-failure
                :details dlq-err)))))))))
 
@@ -793,10 +793,12 @@ Side Effects:
           (warp-event-system-metrics-average-processing-time metrics))
          (new-avg (if (zerop processed)
                       duration
-                    ;; Calculate new average: (sum_old + new_val) / (count_old + 1)
+                    ;; Calculate new average: (sum_old + new_val) /
+                    ;; (count_old + 1)
                     (/ (+ (* current-avg (float (1- processed))) duration)
                        (float processed)))))
-    (setf (warp-event-system-metrics-average-processing-time metrics) new-avg)))
+    (setf (warp-event-system-metrics-average-processing-time metrics)
+          new-avg)))
 
 (defun warp-event--start-event-metrics-collection (system)
   "Start a periodic task to collect and report event system metrics.
@@ -808,23 +810,26 @@ Arguments:
 - `SYSTEM` (warp-event-system): The event system instance.
 
 Side Effects:
-- Submits a recurring task to the executor pool (`warp-thread-pool-submit`).
-  This task runs indefinitely until the event system is stopped."
+- Submits a recurring task to the executor pool
+  (`warp-thread-pool-submit`). This task runs indefinitely until the
+  event system is stopped."
   (let* ((log-target (warp-event--event-system-log-target system))
          (pool (warp-event-system-executor-pool system))
          (interval (event-system-config-metrics-reporting-interval
                     (warp-event-system-config system))))
-    (warp:log! :debug log-target "Starting event metrics collection (interval: %s s)." interval)
+    (warp:log! :debug log-target
+               "Starting event metrics collection (interval: %s s)."
+               interval)
     (loom:thread-pool-submit
      pool
      (lambda ()
        ;; Loop indefinitely, updating and reporting metrics.
        (loom:loop!
-         (warp-event--update-event-metrics system)
-         (warp-event--report-event-metrics system)
+         (loom:await (warp-event--update-event-metrics system)) ; Await update
+         (loom:await (warp-event--report-event-metrics system)) ; Await report
          (loom:delay! interval (loom:continue!))))
      nil
-     :priority 0 ; Low priority for metrics collection
+     :priority 0
      :name (format "%s-metrics-collector" log-target))))
 
 (defun warp-event--update-event-metrics (system)
@@ -859,7 +864,8 @@ Side Effects:
       (setf (warp-event-system-metrics-events-in-queue metrics) q-size)
       (setf (warp-event-system-metrics-events-in-dead-letter-queue metrics)
             dlq-size)
-      (setf (warp-event-system-metrics-active-handlers metrics) active-handlers)
+      (setf (warp-event-system-metrics-active-handlers metrics)
+            active-handlers)
       (setf (warp-event-system-metrics-total-handlers metrics)
             (hash-table-count (warp-event-system-handler-registry system)))
       (when (> q-size peak)
@@ -868,9 +874,9 @@ Side Effects:
             (float-time)))))
 
 (defun warp-event--report-event-metrics (system)
-  "Report collected event system metrics to the log and external monitoring
-systems. This function makes observability data available to operators
-and other Warp components that consume system metrics.
+  "Report collected event system metrics to the log and external
+monitoring systems. This function makes observability data available
+to operators and other Warp components that consume system metrics.
 
 Arguments:
 - `SYSTEM` (warp-event-system): The event system instance.
@@ -882,7 +888,8 @@ Side Effects:
   (let* ((metrics (warp-event-system-metrics system))
          (log-target (warp-event--event-system-log-target system)))
     (warp:log! :info log-target
-               "Metrics - Processed: %d, Failed: %d, Queue: %d, DLQ: %d, Avg Proc Time: %.3f s"
+               "Metrics - Processed: %d, Failed: %d, Queue: %d, DLQ: %d, \
+                Avg Proc Time: %.3f s"
                (warp-event-system-metrics-events-processed metrics)
                (warp-event-system-metrics-events-failed metrics)
                (warp-event-system-metrics-events-in-queue metrics)
@@ -892,7 +899,8 @@ Side Effects:
                 metrics))
     ;; Report to central monitoring system if it's available.
     (when (fboundp 'warp:system-monitor-report-metrics)
-      (warp:system-monitor-report-metrics 'event-system metrics))))
+      (warp:system-monitor-report-metrics 'event-system metrics))
+    (loom:resolved! t))) ; Resolve because it's called with await
 
 (defun warp-event--drain-event-queue (system)
   "Process all remaining events in the local event queue during a
@@ -914,24 +922,30 @@ Side Effects:
         (processed 0)
         (log-target (warp-event--event-system-log-target system)))
     (warp:log! :info log-target "Initiating queue drain for shutdown...")
-    (braid! (warp:stream-read-batch stream (warp:stream-buffer-length stream))
-      (:then
-       (lambda (events)
-         (setq processed (length events))
-         (warp:log! :info log-target "Found %d events to drain." processed)
-         ;; Process each drained event.
-         (braid! events
-           (:map (lambda (event)
-                   (braid! (warp-event--dispatch-event system event)
-                     (:catch (lambda (err)
-                               (warp:log! :warn log-target
-                                          "Failed to drain event %s: %S"
-                                          (warp-event-id event) err)
-                               nil))))))))
-      (:finally
-       (lambda ()
-         (warp:log! :info log-target "Drained %d events from queue."
-                    processed))))))
+    (braid! (loom:await (warp:stream-close stream)) ; Close stream to signal end of input
+      (:then (_)
+        (braid! (warp:stream-drain stream) ; Drain any remaining items
+          (:then (events)
+            (setq processed (length events))
+            (warp:log! :info log-target "Found %d events to drain." processed)
+            ;; Process each drained event.
+            (braid! (loom:all ; Process drained events in parallel
+                     (cl-loop for event in events
+                              collect (braid!
+                                       (warp-event--dispatch-event system event)
+                                       (:catch (lambda (err)
+                                                 (warp:log! :warn log-target
+                                                            "Failed to drain event %s: %S"
+                                                            (warp-event-id event) err)
+                                                 nil))))) ; Return nil for individual failures to continue loom:all
+              (:then (results)
+                (warp:log! :info log-target "Drained %d events from queue."
+                           processed)
+                t))))
+      (:catch (lambda (err)
+                (warp:log! :error log-target "Error during queue drain: %S"
+                           err)
+                (loom:rejected! err))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
@@ -956,7 +970,8 @@ Arguments:
   is used.
 - `:redis-service` (warp-redis-service): The Redis client service
   component. This is **required** if `enable-distributed-events` is `t`
-  in `config-options`, as it facilitates inter-process event communication.
+  in `config-options`, as it facilitates inter-process event
+  communication.
 - `:config-options` (plist): A property list of options to override
   the default `event-system-config` settings (e.g., `max-queue-size`,
   `handler-timeout`).
@@ -975,12 +990,14 @@ Returns:
            :dead-letter-queue
            (warp:stream
             :name (format "%s-dlq" (or id "default"))
-            :max-buffer-size (event-system-config-dead-letter-queue-size config))
+            :max-buffer-size
+            (event-system-config-dead-letter-queue-size config))
            :executor-pool (or executor-pool (warp:thread-pool-default))
            :redis-service redis-service
            :lock (loom:lock (format "event-system-lock-%s" id)))))
     (warp:log! :info (warp-event--event-system-log-target system)
-               "Event system created with ID: %s." (warp-event-system-id system))
+               "Event system created with ID: %s."
+               (warp-event-system-id system))
     system))
 
 ;;;###autoload
@@ -1007,10 +1024,10 @@ Signals:
 - `(error)`: If the system is already running, to prevent accidental
   re-initialization."
   (when (warp-event-system-running system)
-    (error "Event system is already running.")) ; Prevent double-start
+    (error "Event system is already running."))
   (setf (warp-event-system-running system) t)
 
-  (warp-event--start-event-metrics-collection system)
+  (loom:await (warp-event--start-event-metrics-collection system))
   (warp:log! :info (warp-event--event-system-log-target system)
              "Event system started.")
   t)
@@ -1039,16 +1056,19 @@ Side Effects:
     (warp:log! :info (warp-event--event-system-log-target system)
                "Event system already stopped.")
     (cl-return-from warp:event-system-stop (loom:resolved! t)))
-  (setf (warp-event-system-running system) nil) ; Signal to stop new work
+  (setf (warp-event-system-running system) nil)
 
   (let ((log-target (warp-event--event-system-log-target system)))
-    (warp:log! :info log-target "Initiating graceful event system shutdown.")
-    (braid! (warp-event--drain-event-queue system) ; Process any remaining events
+    (warp:log! :info log-target
+               "Initiating graceful event system shutdown.")
+    (braid! (warp-event--drain-event-queue system)
       (:then (lambda (_)
-               (warp:log! :info log-target "Drained queue. Shutting down executor pool...")
+               (warp:log! :info log-target
+                          "Drained queue. Shutting down executor pool...")
                ;; Shutdown the thread pool. This will stop the metrics collector.
-               (warp:thread-pool-shutdown
-                (warp-event-system-executor-pool system))))
+               (loom:await ; Await pool shutdown
+                (warp:thread-pool-shutdown
+                 (warp-event-system-executor-pool system)))))
       (:then (lambda (_)
                (warp:log! :info log-target "Event system stopped.")
                t))
@@ -1068,10 +1088,12 @@ providing a simpler interface for common event emission scenarios.
 
 Arguments:
 - `SYSTEM` (warp-event-system): The event system to emit from.
-- `EVENT-TYPE` (symbol): The symbolic type of the event (e.g., `:job-created`).
+- `EVENT-TYPE` (symbol): The symbolic type of the event (e.g.,
+  `:job-created`).
 - `DATA` (t): The event's payload, a serializable Lisp object.
 - `&rest OPTIONS` (plist): Additional options passed directly to
-  `warp:emit-event-with-options` (e.g., `:distribution-scope`, `:priority`).
+  `warp:emit-event-with-options` (e.g., `:distribution-scope`,
+  `:priority`).
 
 Returns:
 - (loom-promise): Resolves with the new event's ID on successful
@@ -1133,39 +1155,47 @@ Side Effects:
                 :distribution-scope (or distribution-scope :local)
                 :priority (or priority :normal)
                 :metadata metadata)))
+
+    ;; Inject trace context from the current span into the event metadata.
+    (when-let (current-span (warp:trace-current-span))
+      (let ((trace-context `(:trace-id ,(warp-trace-span-trace-id current-span)
+                             :parent-span-id
+                             ,(warp-trace-span-span-id current-span))))
+        (setf (warp-event-metadata event)
+              (plist-put (warp-event-metadata event) :trace-context
+                         trace-context))))
+
     (cond
      ;; Route distributed events through Redis Pub/Sub if enabled.
      ((and (memq (warp-event-distribution-scope event) '(:cluster :global))
            (event-system-config-enable-distributed-events config))
       (if-let (redis (warp-event-system-redis-service system))
           (braid!
-           ;; Use a main channel for all cluster events.
            (warp:redis-publish redis
                                "warp:events:cluster"
                                (warp:serialize event :protocol :json))
            (:then (lambda (_)
                     (loom:with-mutex! (warp-event-system-lock system)
                       (cl-incf (warp-event-system-metrics-distributed-events-sent
-                                (warp-event-system-metrics system))))
+                                metrics)))
                     (warp-event-id event)))
            (:catch (lambda (err)
                      (warp:log! :error (warp-event-system-id system)
-                                "Failed to publish distributed event %s (type %S) to Redis: %S"
-                                (warp-event-id event) event-type err)
+                                "Failed to publish distributed event %s to \
+                                 Redis: %S"
+                                (warp-event-id event) err)
                      (loom:with-mutex! (warp-event-system-lock system)
-                       (cl-incf (warp-event-system-metrics-distributed-events-failed
-                                 (warp-event-system-metrics system))))
+                       (cl-incf
+                        (warp-event-system-metrics-distributed-events-failed
+                         metrics)))
                      (loom:rejected! err))))
         (progn
           (warp:log! :warn (warp-event-system-id system)
-                     "Cannot publish distributed event %s (type %S). No Redis service configured or distributed events disabled."
-                     (warp-event-id event) event-type)
-          (loom:with-mutex! (warp-event-system-lock system)
-            (cl-incf (warp-event-system-metrics-distributed-events-failed
-                      (warp-event-system-metrics system))))
-          (loom:resolved! nil)))) ; Resolve to nil or reject based on error handling policy.
+                     "Cannot publish distributed event. No Redis service \
+                      configured.")
+          (loom:resolved! nil))))
 
-     ;; Handle local events with the in-memory queue and executor pool.
+     ;; Handle local events with the in-memory queue
      (t
       (braid! (warp-event--queue-event-processing-task system event)
         (:then (lambda (_) (warp-event-id event))))))))
@@ -1182,30 +1212,33 @@ event system instance, the `HANDLER-FN` will be asynchronously invoked
 with the `warp-event` object as its argument.
 
 Arguments:
-- `SYSTEM` (warp-event-system): The event system instance to subscribe with.
-- `PATTERN` (t): The pattern to match against incoming events. Can be one of:
+- `SYSTEM` (warp-event-system): The event system to subscribe with.
+- `PATTERN` (t): The pattern to match against incoming events. Can be
+  one of:
   - `:all`: Matches any event type.
   - a `symbol`: Matches `event-type` exactly (e.g., `:worker-started`).
   - a `string`: e.g., `\"worker-*\"`. Wildcard `*` matches any characters.
-  - a `predicate function`: `(lambda (type data))` returning non-nil on match.
-    The function receives the event's type and data payload.
-  - a `plist`: `(:type SYMBOL :predicate FN)`. Combines type matching with
-    an additional predicate function on the data.
+  - a `predicate function`: `(lambda (type data))` returning non-nil on
+    match. The function receives the event's type and data payload.
+  - a `plist`: `(:type SYMBOL :predicate FN)`. Combines type matching
+    with an additional predicate function on the data.
 - `HANDLER-FN` (function): The Emacs Lisp function to execute. It must
   accept one argument, which will be the full `warp-event` struct.
 - `&rest OPTIONS` (plist): Additional options for the handler:
-  - `:timeout` (number, optional): Max seconds for handler execution. Overrides
-    system default. If exceeded, handler fails with `warp-event-handler-timeout`.
-  - `:once` (boolean, optional): If `t`, the handler will be automatically
-    unsubscribed after its first successful execution.
+  - `:timeout` (number, optional): Max seconds for handler execution.
+    Overrides system default. If exceeded, handler fails with
+    `warp-event-handler-timeout`.
+  - `:once` (boolean, optional): If `t`, the handler will be
+    automatically unsubscribed after its first successful execution.
 
 Returns:
-- (string): A unique handler ID that can be used later to `warp:unsubscribe`
-  this specific registration.
+- (string): A unique handler ID that can be used later to
+  `warp:unsubscribe` this specific registration.
 
 Side Effects:
 - Adds a new entry to the system's `handler-registry`.
-- Updates `warp-event-system-metrics` (`total-handlers`, `active-handlers`)."
+- Updates `warp-event-system-metrics` (`total-handlers`,
+  `active-handlers`)."
   (let* ((id (warp-event--generate-handler-id))
          (info (make-warp-event-handler-info
                 :id id
@@ -1243,14 +1276,17 @@ Side Effects:
     (if-let (info (remhash handler-id
                            (warp-event-system-handler-registry system)))
         (progn
-          (when (warp-event-handler-info-active info) ; Ensure it was active before decr.
+          (when (warp-event-handler-info-active info)
             (let ((metrics (warp-event-system-metrics system)))
-              (cl-decf (warp-event-system-metrics-active-handlers metrics))))
+              (cl-decf (warp-event-system-metrics-active-handlers
+                        metrics))))
           (warp:log! :debug (warp-event--event-system-log-target system)
                      "Unsubscribed handler %s." handler-id)
           t)
       (let ((log-target (warp-event--event-system-log-target system)))
-        (warp:log! :warn log-target "Attempted to unsubscribe non-existent handler ID: %s." handler-id)
+        (warp:log! :warn log-target
+                   "Attempted to unsubscribe non-existent handler ID: %s."
+                   handler-id)
         nil))))
 
 ;;----------------------------------------------------------------------

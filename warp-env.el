@@ -74,7 +74,8 @@ This should be used when constructing the environment list for child
 processes to ensure canonical keys are used.
 
 Arguments:
-- `ENV-KEY-SYMBOL` (symbol): A symbol representing the key (e.g., `worker-rank`).
+- `ENV-KEY-SYMBOL` (symbol): A symbol representing the key (e.g.,
+  `worker-rank`).
 
 Returns:
 - (string): The actual string name of the environment variable (e.g.,
@@ -87,7 +88,8 @@ Returns:
 This is used at runtime to read configuration passed to the current process.
 
 Arguments:
-- `ENV-KEY-SYMBOL` (symbol): A symbol representing the key (e.g., `worker-rank`).
+- `ENV-KEY-SYMBOL` (symbol): A symbol representing the key (e.g.,
+  `worker-rank`).
 
 Returns:
 - (string or nil): The string value of the variable, or `nil` if not set."

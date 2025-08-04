@@ -736,4 +736,4 @@ Side Effects:
                    (t (error "Invalid RPC handler definition: %S" ',def)))))))
 
 (provide 'warp-rpc)
-;;; warp-rpc.el ends here ;;;
+;;; warp-rpc.el ends here

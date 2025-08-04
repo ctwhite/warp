@@ -127,8 +127,9 @@ Fields:
                (:constructor make-warp-coordinator-log-entry)
                (:copier nil))
   "A simplified log entry for the coordinator's state changes.
-(Note: This is NOT a full Raft log, but a simplified in-memory representation
-for basic state propagation and leader-driven consistency in this model).
+(Note: This is NOT a full Raft log, but a simplified in-memory
+representation for basic state propagation and leader-driven consistency
+in this model).
 
 Fields:
 - `index` (integer): The index of this entry in the log.
@@ -156,14 +157,15 @@ Fields:
   used for emitting leadership changes and other coordination events.
 - `command-router` (warp-command-router): The internal command router
   for dispatching RPC handlers specific to coordinator operations.
-- `connection-manager` (warp-connection-manager): Manages network connections
-  to other coordinator nodes and potentially the master.
+- `connection-manager` (warp-connection-manager): Manages network
+  connections to other coordinator nodes and potentially the master.
 - `rpc-system` (warp-rpc-system): Reference to the RPC system for
   making outgoing RPC calls to peers.
-- `component-system-id` (string): The ID of the parent `warp-component-system`
-  instance, used for `warp-rpc`'s `origin-instance-id`.
-- `role` (keyword): Current role in the consensus (`:follower`, `:candidate`,
-  `:leader`).
+- `component-system-id` (string): The ID of the parent
+  `warp-component-system` instance, used for `warp-rpc`'s
+  `origin-instance-id`.
+- `role` (keyword): Current role in the consensus (`:follower`,
+  `:candidate`, `:leader`).
 - `current-term` (integer): Current term number this coordinator
   believes. Increments during elections.
 - `voted-for` (string or nil): Candidate ID voted for in `current-term`.
@@ -195,7 +197,7 @@ Fields:
   (current-term 0 :type integer)
   (voted-for nil :type (or null string))
   (leader-id nil :type (or null string))
-  (log nil :type list) ; Simplified in-memory log
+  (log nil :type list)
   (election-timer nil :type (or null timer))
   (heartbeat-timer nil :type (or null timer))
   (next-index (make-hash-table :test 'equal) :type hash-table)
@@ -238,8 +240,8 @@ update to ensure consistency in the shared distributed state.
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
-- `leader-state` (plist): The new leader state to write. Must be a plist
-  containing at least `:id` and `:term`.
+- `leader-state` (plist): The new leader state to write. Must be a
+  plist containing at least `:id` and `:term`.
 
 Returns:
 - (loom-promise): A promise resolving to `t` on success of the state
@@ -255,10 +257,10 @@ Side Effects:
 (defun warp-coordinator--update-term (coordinator new-term &optional leader-id)
   "Updates the coordinator's current term and potentially its leader.
 If `new-term` is strictly greater than the `coordinator`'s
-`current-term`, the coordinator transitions to follower role, clears its
-vote for the old term, and updates its term and known leader ID. This is a
-critical Raft rule for ensuring term monotonicity and leader-follower
-consistency across the cluster.
+`current-term`, the coordinator transitions to follower role, clears
+its vote for the old term, and updates its term and known leader ID.
+This is a critical Raft rule for ensuring term monotonicity and
+leader-follower consistency across the cluster.
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
@@ -266,8 +268,7 @@ Arguments:
 - `leader-id` (string or nil, optional): The ID of the new leader,
   if known (e.g., from an AppendEntries RPC).
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Modifies `coordinator`'s `current-term`, `role`, `voted-for`, and
@@ -276,8 +277,8 @@ Side Effects:
   a new leader or election, resetting the timer implicitly."
   (when (> new-term (warp-coordinator-current-term coordinator))
     (warp:log! :info (warp-coordinator-id coordinator)
-                (format "Term updated: %d -> %d. Transitioning to follower."
-                        (warp-coordinator-current-term coordinator) new-term))
+               (format "Term updated: %d -> %d. Transitioning to follower."
+                       (warp-coordinator-current-term coordinator) new-term))
     (setf (warp-coordinator-current-term coordinator) new-term)
     (setf (warp-coordinator-role coordinator) :follower)
     ;; Clear vote for old term, as per Raft rules.
@@ -295,25 +296,26 @@ implementation, merely an in-memory list for tracking).
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
-- `entries` (list): A list of `warp-coordinator-log-entry` objects to append.
+- `entries` (list): A list of `warp-coordinator-log-entry` objects to
+  append.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Modifies `coordinator`'s `log` list by appending `entries`."
   (cl-loop for entry in entries do
-            (setf (warp-coordinator-log coordinator)
-                  (append (warp-coordinator-log coordinator) (list entry))))
+           (setf (warp-coordinator-log coordinator)
+                 (append (warp-coordinator-log coordinator) (list entry))))
   (warp:log! :trace (warp-coordinator-id coordinator)
-              (format "Appended %d log entries. New log length: %d"
-                      (length entries) (length (warp-coordinator-log coordinator)))))
+             (format "Appended %d log entries. New log length: %d"
+                     (length entries) (length (warp-coordinator-log
+                                               coordinator)))))
 
 (defun warp-coordinator--get-last-log-info (coordinator)
   "Retrieves the term and index of the last entry in the coordinator's
-local in-memory log. This information is crucial for Raft's log matching
-consistency check during leader election (`RequestVote` RPCs) and log
-replication (`AppendEntries` RPCs).
+local in-memory log. This information is crucial for Raft's log
+matching consistency check during leader election (`RequestVote` RPCs)
+and log replication (`AppendEntries` RPCs).
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
@@ -325,7 +327,7 @@ Returns:
   (if-let (last-entry (car (last (warp-coordinator-log coordinator))))
       `(:index ,(warp-coordinator-log-entry-index last-entry)
         :term ,(warp-coordinator-log-entry-term last-entry))
-    `(:index 0 :term 0))) ; Initial state for empty log
+    `(:index 0 :term 0)))
 
 ;;----------------------------------------------------------------------
 ;;; Timers and Role Management
@@ -342,8 +344,7 @@ once and initiating elections simultaneously, reducing network contention.
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Cancels any existing `election-timer` associated with the coordinator.
@@ -362,7 +363,7 @@ Side Effects:
           (run-at-time timeout-s nil
                        #'warp-coordinator--start-election coordinator))
     (warp:log! :debug (warp-coordinator-id coordinator)
-                (format "Election timer reset to %.3fs." timeout-s))))
+               (format "Election timer reset to %.3fs." timeout-s))))
 
 (defun warp-coordinator--process-vote-response (coordinator
                                                 response
@@ -377,15 +378,15 @@ to be called asynchronously for each `RequestVote` RPC response.
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
 - `response` (warp-rpc-command): The RPC response containing vote
-  information (specifically, the `warp-protocol-coordinator-request-vote-response-payload`).
+  information (specifically, the
+  `warp-protocol-coordinator-request-vote-response-payload`).
 - `current-term` (integer): The term of the election this node is
   currently participating in. Used to validate the response.
 - `vote-counter-lock` (loom-lock): A mutex to protect the shared
   `votes-received` counter, ensuring atomic updates in a concurrent
   environment.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - May increment internal `votes-received` count (in caller's lexical scope).
@@ -404,11 +405,13 @@ Side Effects:
       ;; stale responses affecting new elections.
       (when (eq (warp-coordinator-role coordinator) :candidate)
         ;; Raft Rule: If a higher term is seen, immediately step down.
-        ;; This ensures that a node always defers to a more up-to-date cluster state.
+        ;; This ensures that a node always defers to a more up-to-date
+        ;; cluster state.
         (when (> response-term current-term)
           (warp:log! :info (warp-coordinator-id coordinator)
-                      (format "Received vote response with higher term %d.
-                               Stepping down." response-term))
+                     (format "Received vote response with higher term %d. \
+                              Stepping down."
+                             response-term))
           (warp-coordinator--update-term
            coordinator response-term nil))
         ;; If the vote is granted and for the current term, count it.
@@ -430,15 +433,16 @@ Arguments:
   initiating the vote request.
 - `member-id` (string): The ID of the peer to send the RPC to.
 - `current-term` (integer): The current term of the candidate.
-- `last-log-info` (plist): The last log index and term of the candidate's
-  log, used by Raft to determine vote eligibility. `(:index <int> :term <int>)`.
+- `last-log-info` (plist): The last log index and term of the
+  candidate's log, used by Raft to determine vote eligibility.
+  `(:index <int> :term <int>)`.
 - `rpc-timeout` (number): Timeout for this specific RPC call.
 
 Returns:
 - (loom-promise): A promise that resolves to the RPC response (a
   `warp-rpc-command` carrying the `RequestVoteResponse` payload) on
-  success, or rejects on failure. This promise's outcome is then handled
-  by `loom:all-settled` in the calling function (`start-election`)."
+  success, or rejects on failure. This promise's outcome is then
+  handled by `loom:all-settled` in the calling function (`start-election`)."
   (let* ((cm (warp-coordinator-connection-manager coordinator))
          (rpc-system (warp-coordinator-rpc-system coordinator))
          (conn (warp:connection-manager-get-connection cm))
@@ -453,14 +457,13 @@ Returns:
            :last-log-index (plist-get last-log-info :index)
            :last-log-term (plist-get last-log-info :term))))
     (unless conn
-      (warp:log! :warn (warp-coordinator-id coordinator)
-                  (format "No active connection to %s for vote request."
-                          member-id))
-      (loom:rejected! (warp:error! :type 'warp-coordinator-error
-                                   :message "No connection to send vote request.")))
+      (signal (warp:error! :type 'warp-coordinator-error
+                           :message
+                           (format "No active connection to %s for vote request."
+                                   member-id))))
     (braid! (warp:protocol-coordinator-request-vote
-             rpc-system conn (warp-coordinator-id coordinator) ; Sender is self ID
-             member-id ; Recipient is peer ID
+             rpc-system conn (warp-coordinator-id coordinator)
+             member-id
              (warp-protocol-coordinator-request-vote-payload-candidate-id
               (warp-rpc-command-args command-payload))
              (warp-protocol-coordinator-request-vote-payload-term
@@ -471,20 +474,20 @@ Returns:
               (warp-rpc-command-args command-payload))
              :timeout rpc-timeout
              :origin-instance-id origin-instance-id)
-      (:then (lambda (response) response)) ; Just pass the response through
+      (:then (lambda (response) response))
       (:catch (lambda (err)
                 (warp:log! :warn (warp-coordinator-id coordinator)
-                            (format "Vote request to %s failed: %S"
-                                    member-id err))
+                           (format "Vote request to %s failed: %S"
+                                   member-id err))
                 (loom:rejected! err))))))
 
 (defun warp-coordinator--start-election (coordinator)
   "Initiates a new leader election.
-This function is the core of the leader election process. The coordinator
-increments its current term, transitions to the `:candidate` role, votes
-for itself, and then requests votes from all other cluster members via
-RPCs. It waits for all vote responses (or timeouts) to determine if it
-has achieved a majority (quorum).
+This function is the core of the leader election process. The
+coordinator increments its current term, transitions to the
+`:candidate` role, votes for itself, and then requests votes from all
+other cluster members via RPCs. It waits for all vote responses (or
+timeouts) to determine if it has achieved a majority (quorum).
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
@@ -503,23 +506,19 @@ Side Effects:
   (setf (warp-coordinator-role coordinator) :candidate)
   (setf (warp-coordinator-voted-for coordinator)
         (warp-coordinator-id coordinator))
-  (setf (warp-coordinator-leader-id coordinator) nil) ; No leader known during election
-  (warp-coordinator--reset-election-timer coordinator) ; Reset timer for this election
+  (setf (warp-coordinator-leader-id coordinator) nil)
+  (warp-coordinator--reset-election-timer coordinator)
 
   (let* ((config (warp-coordinator-config coordinator))
          (members (warp-coordinator-config-cluster-members config))
          (current-term (warp-coordinator-current-term coordinator))
          (last-log-info (warp-coordinator--get-last-log-info coordinator))
-         ;; Initialize vote count: 1 for self-vote.
-         (votes-received 1)
+         (votes-received 1) ; Initialize vote count: 1 for self-vote.
          (total-members (1+ (length members))) ; Include self in total
          (quorum (1+ (floor total-members 2))) ; Majority rule
          (rpc-timeout (warp-coordinator-config-rpc-timeout config))
-         ;; Mutex to protect `votes-received` counter for concurrent updates
-         ;; from RPC response handlers.
          (vote-counter-lock (loom:make-lock "vote-counter-lock"))
 
-         ;; Create a list of promises for each vote request RPC to peers.
          (vote-request-promises
           (cl-loop for member-id in members
                    collect (warp-coordinator--send-vote-request
@@ -527,13 +526,9 @@ Side Effects:
                             last-log-info rpc-timeout))))
 
     (warp:log! :debug (warp-coordinator-id coordinator)
-                (format "Requesting votes for term %d (quorum needed: %d)."
-                        current-term quorum))
+               (format "Requesting votes for term %d (quorum needed: %d)."
+                       current-term quorum))
 
-    ;; Use `loom:all-settled` to wait for all vote requests to complete,
-    ;; regardless of individual success or failure (e.g., peer is down).
-    ;; This prevents a single failed RPC from prematurely stopping the
-    ;; entire election attempt.
     (braid! (loom:all-settled vote-request-promises)
       (:then (lambda (outcomes)
                ;; Process each individual vote response outcome.
@@ -553,23 +548,23 @@ Side Effects:
                             ;; Crucially, ensure we are still in the same term
                             ;; we started the election in. If a higher term
                             ;; appeared during the election (e.g., from an
-                            ;; `AppendEntries` RPC or another `RequestVote` response),
-                            ;; we would have already stepped down via
-                            ;; `warp-coordinator--update-term`.
+                            ;; `AppendEntries` RPC or another `RequestVote`
+                            ;; response), we would have already stepped down
+                            ;; via `warp-coordinator--update-term`.
                             (= (warp-coordinator-current-term coordinator)
                                current-term))
                    (loom:await (warp-coordinator--become-leader coordinator)))))))))
 
 (defun warp-coordinator--process-heartbeat-response (coordinator
-                                                      response
-                                                      current-term
-                                                      leader-id)
+                                                     response
+                                                     current-term
+                                                     leader-id)
   "Processes a single heartbeat response from a follower.
-This function is called by the leader after sending an `AppendEntries` RPC
-(even empty heartbeats). Its primary role is to ensure the leader steps
-down immediately if it receives a response from a follower indicating a
-higher term. This is a critical Raft safety rule, as it means a new
-leader has been elected, and the current leader is now stale.
+This function is called by the leader after sending an `AppendEntries`
+RPC (even empty heartbeats). Its primary role is to ensure the leader
+steps down immediately if it receives a response from a follower
+indicating a higher term. This is a critical Raft safety rule, as it
+means a new leader has been elected, and the current leader is now stale.
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance
@@ -579,8 +574,7 @@ Arguments:
 - `current-term` (integer): The term of the leader (the current node).
 - `leader-id` (string): The ID of the leader (the current node's ID).
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - May update `coordinator`'s `current-term` and `role` (to `:follower`)
@@ -589,14 +583,15 @@ Side Effects:
          (response-term
           (warp-protocol-coordinator-append-entries-response-payload-term
            response-payload))
-         (sender-id (plist-get (warp-rpc-command-metadata response) :sender-id)))
+         (sender-id (plist-get (warp-rpc-command-metadata response)
+                               :sender-id)))
     ;; Raft Rule: If leader receives response with higher term, it must
     ;; immediately step down. This handles cases where a new leader has
     ;; been elected while this node was still considering itself leader.
     (when (> response-term current-term)
       (warp:log! :info leader-id
-                  (format "Received higher term %d from %s. Stepping down."
-                          response-term (or sender-id "unknown-peer")))
+                 (format "Received higher term %d from %s. Stepping down."
+                         response-term (or sender-id "unknown-peer")))
       (warp-coordinator--update-term
        coordinator response-term nil))))
 
@@ -628,21 +623,22 @@ Side Effects:
   (let* ((cm (warp-coordinator-connection-manager coordinator))
          (rpc-system (warp-coordinator-rpc-system coordinator))
          (conn (warp:connection-manager-get-connection cm))
-         (origin-instance-id (warp-coordinator-component-system-id coordinator))
+         (origin-instance-id
+          (warp-coordinator-component-system-id coordinator))
          (command-payload
           (warp-protocol-make-command
            :coordinator-append-entries
            :term current-term
            :leader-id leader-id
-           :prev-log-index 0 ; Simplified for heartbeats (no log entries)
-           :prev-log-term 0  ; Simplified for heartbeats
-           :entries nil      ; No new log entries for heartbeat
-           :leader-commit 0))) ; Simplified
+           :prev-log-index 0
+           :prev-log-term 0
+           :entries nil
+           :leader-commit 0)))
     (unless conn
-      (warp:log! :warn leader-id
-                  (format "No connection to %s for heartbeat." member-id))
-      (loom:rejected! (warp:error! :type 'warp-coordinator-error
-                                   :message "No connection for heartbeat.")))
+      (signal (warp:error! :type 'warp-coordinator-error
+                           :message
+                           (format "No connection to %s for heartbeat."
+                                   member-id))))
     (braid! (warp:protocol-coordinator-append-entries
              rpc-system conn leader-id member-id
              (warp-protocol-coordinator-append-entries-payload-term
@@ -658,14 +654,14 @@ Side Effects:
              (warp-protocol-coordinator-append-entries-payload-leader-commit
               (warp-rpc-command-args command-payload))
              :timeout rpc-timeout
-             :origin-instance-id origin-instance-id) ; Pass origin ID
+             :origin-instance-id origin-instance-id)
       (:then (lambda (response)
                (warp-coordinator--process-heartbeat-response
                 coordinator response current-term leader-id)))
       (:catch (lambda (err)
                 (warp:log! :warn leader-id
-                            (format "Heartbeat to %s failed: %S"
-                                    member-id err))
+                           (format "Heartbeat to %s failed: %S"
+                                   member-id err))
                 (loom:rejected! err))))))
 
 (defun warp-coordinator--send-heartbeats (coordinator)
@@ -693,7 +689,7 @@ Side Effects:
            (rpc-timeout (warp-coordinator-config-rpc-timeout config))
            (heartbeat-promises nil))
       (warp:log! :trace leader-id
-                  (format "Sending heartbeats (term %d)." current-term))
+                 (format "Sending heartbeats (term %d)." current-term))
       (dolist (member-id members)
         (push (warp-coordinator--send-single-heartbeat
                coordinator member-id current-term leader-id rpc-timeout)
@@ -727,8 +723,8 @@ Side Effects:
 - Updates leader state in `warp-state-manager`.
 - Emits `:leader-elected` event."
   (warp:log! :info (warp-coordinator-id coordinator)
-              (format "Becoming leader for term %d."
-                      (warp-coordinator-current-term coordinator)))
+             (format "Becoming leader for term %d."
+                     (warp-coordinator-current-term coordinator)))
   (setf (warp-coordinator-role coordinator) :leader)
   (setf (warp-coordinator-leader-id coordinator)
         (warp-coordinator-id coordinator))
@@ -767,8 +763,8 @@ Side Effects:
   ;; Update the shared leader state in `warp-state-manager`.
   (loom:await (warp-coordinator--set-leader-state
                coordinator `(:id ,(warp-coordinator-id coordinator)
-                             :term ,(warp-coordinator-current-term coordinator)
-                             :last-heartbeat ,(float-time))))
+                                 :term ,(warp-coordinator-current-term coordinator)
+                                 :last-heartbeat ,(float-time))))
 
   ;; Emit leader elected event for external listeners (e.g., metrics, logs).
   (warp:emit-event
@@ -784,22 +780,56 @@ Side Effects:
 ;;; RPC Handlers (Received from other Coordinator Nodes)
 ;;----------------------------------------------------------------------
 
-(defun warp-coordinator-handle-request-vote (coordinator command context)
-  "Handles incoming `:coordinator-request-vote` RPCs.
-This is a core Raft handler. A coordinator (usually a follower) responds
-to a `RequestVote` RPC from a candidate. It grants its vote if the
-candidate's term is higher or equal to its own, and its log is at least
-as up-to-date. It also updates its term and steps down if the candidate's
-term is higher.
+;; NEW RPC Handler: For workers or other nodes to discover the current leader
+(defun warp-coordinator-handle-get-leader (coordinator command context)
+  "RPC handler for `:get-coordinator-leader`.
+This RPC allows other nodes (e.g., workers) to ask this coordinator node
+for its current view of who the cluster leader is, and their contact
+address (if known, typically stored in state manager by leader).
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
-- `command` (warp-rpc-command): The incoming RPC command, containing the
-  `RequestVote` payload.
+- `command` (warp-rpc-command): The incoming RPC command (no specific args).
 - `context` (plist): The RPC context from the router, providing sender ID.
 
 Returns:
-- (loom-promise): A promise that resolves with a `warp-protocol-coordinator-request-vote-response-payload`.
+- (loom-promise): A promise that resolves with a `warp-coordinator-get-leader-response`
+  containing the known leader's ID and address, or `nil` if no leader
+  is known or this node is not the leader itself."
+  (let* ((leader-id (warp-coordinator-leader-id coordinator))
+         (leader-address nil)
+         (sm (warp-coordinator-state-manager coordinator)))
+    (braid! (loom:await (warp-coordinator--get-leader-state coordinator))
+      (:then (leader-state)
+        (when leader-state
+          ;; Assuming leader contact address is also stored in state manager
+          (setq leader-address (plist-get leader-state :leader-contact-address))) ; Assuming this field
+        (loom:resolved! (warp-protocol-make-command
+                         :coordinator-get-leader-response
+                         :leader-id (or leader-id "unknown")
+                         :leader-address (or leader-address "unknown")))))
+      (:catch (err)
+        (warp:log! :error (warp-coordinator-id coordinator)
+                   "Failed to get leader info for RPC: %S" err)
+        (loom:rejected! err)))))
+
+(defun warp-coordinator-handle-request-vote (coordinator command context)
+  "Handles incoming `:coordinator-request-vote` RPCs.
+This is a core Raft handler. A coordinator (usually a follower)
+responds to a `RequestVote` RPC from a candidate. It grants its vote if
+the candidate's term is higher or equal to its own, and its log is at
+least as up-to-date. It also updates its term and steps down if the
+candidate's term is higher.
+
+Arguments:
+- `coordinator` (warp-coordinator-instance): The coordinator instance.
+- `command` (warp-rpc-command): The incoming RPC command, containing
+  the `RequestVote` payload.
+- `context` (plist): The RPC context from the router, providing sender ID.
+
+Returns:
+- (loom-promise): A promise that resolves with a
+  `warp-protocol-coordinator-request-vote-response-payload`.
 
 Side Effects:
 - May update `coordinator`'s `current-term`, `role`, `voted-for`.
@@ -808,11 +838,11 @@ Side Effects:
          (candidate-id (warp-protocol-coordinator-request-vote-payload-candidate-id
                         args))
          (candidate-term (warp-protocol-coordinator-request-vote-payload-term
-                           args))
-         (last-log-index (warp-protocol-coordinator-request-vote-payload-last-log-index
-                           args))
-         (last-log-term (warp-protocol-coordinator-request-vote-payload-last-log-term
                           args))
+         (last-log-index (warp-protocol-coordinator-request-vote-payload-last-log-index
+                          args))
+         (last-log-term (warp-protocol-coordinator-request-vote-payload-last-log-term
+                         args))
          (current-term (warp-coordinator-current-term coordinator))
          (voted-for (warp-coordinator-voted-for coordinator))
          (log-info (warp-coordinator--get-last-log-info coordinator))
@@ -820,8 +850,8 @@ Side Effects:
          (error-msg nil))
 
     (warp:log! :debug (warp-coordinator-id coordinator)
-                (format "Received RequestVote from %s for term %d. My term: %d."
-                        candidate-id candidate-term current-term))
+               (format "Received RequestVote from %s for term %d. My term: %d."
+                       candidate-id candidate-term current-term))
 
     (cond
       ;; Raft Rule 1: If RPC request or response contains term T > currentTerm,
@@ -831,8 +861,9 @@ Side Effects:
 
       ;; Raft Rule 2: If `candidate-term < current-term`, deny vote.
       ((< candidate-term current-term)
-       (setq error-msg (format "Candidate term %d is less than my term %d."
-                               candidate-term current-term)))
+       (setq error-msg
+             (format "Candidate term %d is less than my term %d."
+                     candidate-term current-term)))
 
       ;; Raft Rule 3: If `candidate-term == current-term`
       (t
@@ -841,21 +872,23 @@ Side Effects:
          (setq error-msg (format "Already voted for %s in term %d."
                                  voted-for current-term)))
 
-       ;; Raft Rule 4: Candidate's log must be at least as up-to-date as receiver's.
-       ;; Log is more up-to-date if (lastTerm > myLastTerm) or (lastTerm == myLastTerm and lastIndex >= myLastIndex).
+       ;; Raft Rule 4: Candidate's log must be at least as up-to-date as
+       ;; receiver's. Log is more up-to-date if (lastTerm > myLastTerm) or
+       ;; (lastTerm == myLastTerm and lastIndex >= myLastIndex).
        (unless (or (> last-log-term (plist-get log-info :term))
                    (and (= last-log-term (plist-get log-info :term))
                         (>= last-log-index (plist-get log-info :index))))
-         (setq error-msg "Candidate's log is not as up-to-date as mine."))
+         (setq error-msg
+               "Candidate's log is not as up-to-date as mine."))
 
        ;; If all checks pass, grant vote.
        (unless error-msg
          (setf (warp-coordinator-voted-for coordinator) candidate-id)
-         (warp-coordinator--reset-election-timer coordinator) ; Reset timer on valid vote
+         (warp-coordinator--reset-election-timer coordinator)
          (setq vote-granted-p t)
          (warp:log! :info (warp-coordinator-id coordinator)
-                     (format "Granted vote to %s for term %d."
-                             candidate-id candidate-term))))))
+                    (format "Granted vote to %s for term %d."
+                            candidate-id candidate-term))))))
 
     (loom:resolved! (warp-protocol-make-command
                      :coordinator-request-vote-response
@@ -880,7 +913,8 @@ Arguments:
 - `context` (plist): The RPC context from the router.
 
 Returns:
-- (loom-promise): A promise that resolves with a `warp-protocol-coordinator-append-entries-response-payload`.
+- (loom-promise): A promise that resolves with a
+  `warp-protocol-coordinator-append-entries-response-payload`.
 
 Side Effects:
 - May update `coordinator`'s `current-term`, `role`, `leader-id`, and `log`.
@@ -889,47 +923,48 @@ Side Effects:
          (leader-term (warp-protocol-coordinator-append-entries-payload-term
                        args))
          (leader-id (warp-protocol-coordinator-append-entries-payload-leader-id
-                      args))
+                     args))
          (prev-log-index (warp-protocol-coordinator-append-entries-payload-prev-log-index
-                           args))
-         (prev-log-term (warp-protocol-coordinator-append-entries-payload-prev-log-term
                           args))
+         (prev-log-term (warp-protocol-coordinator-append-entries-payload-prev-log-term
+                         args))
          (entries (warp-protocol-coordinator-append-entries-payload-entries
                    args))
          (leader-commit (warp-protocol-coordinator-append-entries-payload-leader-commit
-                          args))
+                         args))
          (current-term (warp-coordinator-current-term coordinator))
          (success-p nil)
          (error-msg nil))
 
     (warp:log! :debug (warp-coordinator-id coordinator)
-                (format "Received AppendEntries from %s for term %d. My term: %d."
-                        leader-id leader-term current-term))
+               (format "Received AppendEntries from %s for term %d. My term: %d."
+                       leader-id leader-term current-term))
 
     (cond
       ;; Raft Rule 1: If `leader-term < current-term`, respond `false`.
       ((< leader-term current-term)
-       (setq error-msg (format "Leader term %d is less than my term %d."
-                               leader-term current-term)))
+       (setq error-msg
+             (format "Leader term %d is less than my term %d."
+                     leader-term current-term)))
 
       ;; Raft Rule 2: If `leader-term >= current-term`, it's a valid leader
       ;; or new term. Update our state and reset election timer.
       (t
        ;; Update our term and step down to follower.
        (warp-coordinator--update-term coordinator leader-term leader-id)
-       (warp-coordinator--reset-election-timer coordinator) ; Always reset timer on valid heartbeat
+       (warp-coordinator--reset-election-timer coordinator)
 
        ;; If this is a heartbeat (no entries), respond true.
        (when (null entries)
          (setq success-p t)
          (warp:log! :trace (warp-coordinator-id coordinator)
-                     (format "Heartbeat from %s acknowledged." leader-id)))
+                    (format "Heartbeat from %s acknowledged." leader-id)))
 
        ;; Simplified Log Matching Raft Rule (for demonstration):
        ;; Check if log contains an entry at `prev-log-index` whose term
        ;; matches `prev-log-term`. If not, respond false.
-       ;; For full Raft, this is complex log truncation/consistency.
-       (let ((my-prev-log-info (warp-coordinator--get-last-log-info coordinator)))
+       (let ((my-prev-log-info
+              (warp-coordinator--get-last-log-info coordinator)))
          (unless (and (= prev-log-index (plist-get my-prev-log-info :index))
                       (= prev-log-term (plist-get my-prev-log-info :term)))
            ;; This is a log inconsistency. In full Raft, followers would
@@ -943,8 +978,8 @@ Side Effects:
          (warp-coordinator--log-append coordinator entries)
          (setq success-p t)
          (warp:log! :info (warp-coordinator-id coordinator)
-                     (format "Appended %d entries from leader %s."
-                             (length entries) leader-id)))))
+                    (format "Appended %d entries from leader %s."
+                            (length entries) leader-id)))))
 
     (loom:resolved! (warp-protocol-make-command
                      :coordinator-append-entries-response
@@ -954,16 +989,16 @@ Side Effects:
 
 (defun warp-coordinator-handle-acquire-lock (coordinator command context)
   "Handles incoming `:coordinator-acquire-lock` RPCs.
-Only the cluster leader processes these requests by performing an atomic
-transaction on the `warp-state-manager` to acquire the lock. If the local
-node is a follower, it directs the requesting client to the known leader.
+Only the cluster leader processes these requests by performing an
+atomic transaction on the `warp-state-manager` to acquire the lock. If
+the local node is a follower, it directs the requesting client to the
+known leader.
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
 - `command` (warp-rpc-command): The incoming RPC command. Its `args`
   contain `lock-name`, `holder-id`, and `expiry-time`.
-- `context` (plist): The RPC context from the router, providing access
-  to the original `warp-rpc-message`.
+- `context` (plist): The RPC context from the router, providing sender ID.
 
 Returns:
 - (loom-promise): A promise resolving with a
@@ -983,12 +1018,13 @@ Side Effects:
                        args)))
 
     (warp:log! :debug (warp-coordinator-id coordinator)
-                (format "Received acquire-lock request for '%s' from %s."
-                        lock-name holder-id))
+               (format "Received acquire-lock request for '%s' from %s."
+                       lock-name holder-id))
 
     (if (eq (warp-coordinator-role coordinator) :leader)
         ;; If this node is the leader, process the lock acquisition request.
-        ;; The core logic is encapsulated in `warp-coordinator--handle-acquire-lock-logic`.
+        ;; The core logic is encapsulated in
+        ;; `warp-coordinator--handle-acquire-lock-logic`.
         (braid! (warp-coordinator--handle-acquire-lock-logic
                  coordinator lock-name holder-id expiry-time)
           (:then (lambda (result)
@@ -1013,8 +1049,8 @@ Side Effects:
                            :error "Not leader and no leader known.")))))))
 
 (defun warp-coordinator--handle-acquire-lock-logic (coordinator lock-name holder-id expiry-time)
-  "Internal helper for processing the core logic of an acquire lock request.
-This function performs the atomic check-and-set operation for a
+  "Internal helper for processing the core logic of an acquire lock
+request. This function performs the atomic check-and-set operation for a
 distributed lock within a `warp-state-manager` transaction. This ensures
 that lock acquisition is an all-or-nothing operation across the
 cluster's shared state, preventing race conditions between concurrent
@@ -1041,15 +1077,17 @@ Side Effects:
     (braid! (warp:state-manager-transaction
              sm
              (lambda (tx)
-               (let* ((current-lock-entry (warp:state-manager-get tx
-                                                                  `(:locks ,lock-name)))
-                      ;; Check if a lock entry exists and is not marked as deleted (tombstone).
+               (let* ((current-lock-entry (loom:await
+                                           (warp:state-manager-get tx
+                                                                   `(:locks ,lock-name))))
+                      ;; Check if a lock entry exists and is not marked as
+                      ;; deleted (tombstone).
                       (lock-is-held (and current-lock-entry
-                                         (not (warp:state-entry-deleted
+                                         (not (warp-state-entry-deleted
                                                current-lock-entry))))
                       ;; Get current holder and expiry if lock is held.
                       (lock-data (when lock-is-held
-                                   (warp:state-entry-value
+                                   (warp-state-entry-value
                                     current-lock-entry)))
                       (lock-holder (when lock-is-held
                                      (plist-get lock-data :holder-id)))
@@ -1059,19 +1097,22 @@ Side Effects:
                    ;; Case 1: Lock is currently held but has expired.
                    ;; Grant the lock to the new requester, effectively taking over.
                    ((and lock-is-held (>= current-time lock-expired-at))
-                    (warp:state-tx-update
-                     tx `(:locks ,lock-name)
-                     `(:holder-id ,holder-id :expiry-time ,expiry-time))
+                    (loom:await ; Await state-tx-update
+                     (warp:state-tx-update
+                      tx `(:locks ,lock-name)
+                      `(:holder-id ,holder-id :expiry-time ,expiry-time)))
                     (setq granted-p t)
                     (warp:log! :info (warp-coordinator-id coordinator)
-                               (format "Lock '%s' acquired by %s (expired previous holder)."
+                               (format "Lock '%s' acquired by %s (expired \
+                                        previous holder)."
                                        lock-name holder-id)))
                    ;; Case 2: Lock is already held by the requesting client.
                    ;; This is a re-acquisition or renewal. Update the lease time.
                    ((and lock-is-held (string= lock-holder holder-id))
-                    (warp:state-tx-update
-                     tx `(:locks ,lock-name)
-                     `(:holder-id ,holder-id :expiry-time ,expiry-time))
+                    (loom:await ; Await state-tx-update
+                     (warp:state-tx-update
+                      tx `(:locks ,lock-name)
+                      `(:holder-id ,holder-id :expiry-time ,expiry-time)))
                     (setq granted-p t)
                     (warp:log! :info (warp-coordinator-id coordinator)
                                (format "Lock '%s' renewed by %s."
@@ -1079,9 +1120,10 @@ Side Effects:
                    ;; Case 3: Lock is not currently held by anyone.
                    ;; Acquire it for the requester.
                    ((not lock-is-held)
-                    (warp:state-tx-update
-                     tx `(:locks ,lock-name)
-                     `(:holder-id ,holder-id :expiry-time ,expiry-time))
+                    (loom:await ; Await state-tx-update
+                     (warp:state-tx-update
+                      tx `(:locks ,lock-name)
+                      `(:holder-id ,holder-id :expiry-time ,expiry-time)))
                     (setq granted-p t)
                     (warp:log! :info (warp-coordinator-id coordinator)
                                (format "Lock '%s' acquired by %s."
@@ -1096,16 +1138,17 @@ Side Effects:
                `(:granted-p ,granted-p :error ,error-msg)))
       (:catch (lambda (err)
                 (warp:log! :error (warp-coordinator-id coordinator)
-                            (format "Transaction for lock '%s' failed: %S"
-                                    lock-name err))
+                           (format "Transaction for lock '%s' failed: %S"
+                                   lock-name err))
                 `(:granted-p nil :error (format "Transaction error: %S"
                                                  err)))))))
 
 (defun warp-coordinator-handle-release-lock (coordinator command context)
   "Handles incoming `:coordinator-release-lock` RPCs.
-Only the cluster leader processes these requests by performing an atomic
-transaction on the `warp-state-manager` to release the lock. If the local
-node is a follower, it directs the requesting client to the known leader.
+Only the cluster leader processes these requests by performing an
+atomic transaction on the `warp-state-manager` to release the lock. If
+the local node is a follower, it directs the requesting client to the
+known leader.
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
@@ -1129,8 +1172,8 @@ Side Effects:
                      args)))
 
     (warp:log! :debug (warp-coordinator-id coordinator)
-                (format "Received release-lock request for '%s' from %s."
-                        lock-name holder-id))
+               (format "Received release-lock request for '%s' from %s."
+                       lock-name holder-id))
 
     (if (eq (warp-coordinator-role coordinator) :leader)
         ;; If this node is the leader, process the lock release request.
@@ -1139,7 +1182,7 @@ Side Effects:
           (:then (lambda (result)
                    (loom:resolved! (warp-protocol-make-command
                                     :coordinator-lock-response
-                                    :granted-p (plist-get result :success-p) ; Re-using granted-p as success-p
+                                    :granted-p (plist-get result :success-p)
                                     :leader-id (warp-coordinator-id coordinator)
                                     :error (plist-get result :error))))))
       ;; If this node is a follower, redirect to leader.
@@ -1157,16 +1200,18 @@ Side Effects:
                            :error "Not leader and no leader known.")))))))
 
 (defun warp-coordinator--handle-release-lock-logic (coordinator lock-name holder-id)
-  "Internal helper for processing the core logic of a release lock request.
-This function performs the atomic deletion of a distributed lock within
-a `warp-state-manager` transaction, but only if the requesting `holder-id`
-is the current owner of the lock. It ensures that locks are released only
-by their rightful owner or if they are not held.
+  "Internal helper for processing the core logic of a release lock
+request. This function performs the atomic deletion of a distributed
+lock within a `warp-state-manager` transaction, but only if the
+requesting `holder-id` is the current owner of the lock. It ensures
+that locks are released only by their rightful owner or if they are
+not held.
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
 - `lock-name` (string): The name of the lock to release.
-- `holder-id` (string): The ID of the requester (the client trying to release).
+- `holder-id` (string): The ID of the requester (the client trying to
+  release).
 
 Returns:
 - (loom-promise): A promise that resolves to a plist
@@ -1181,14 +1226,16 @@ Side Effects:
     (braid! (warp:state-manager-transaction
              sm
              (lambda (tx)
-               (let* ((current-lock-entry (warp:state-manager-get tx
-                                                                  `(:locks ,lock-name)))
-                      ;; Check if a lock entry exists and is not marked as deleted (tombstone).
+               (let* ((current-lock-entry (loom:await
+                                           (warp:state-manager-get tx
+                                                                   `(:locks ,lock-name))))
+                      ;; Check if a lock entry exists and is not marked as
+                      ;; deleted (tombstone).
                       (lock-is-held (and current-lock-entry
-                                         (not (warp:state-entry-deleted
+                                         (not (warp-state-entry-deleted
                                                current-lock-entry))))
                       (lock-data (when lock-is-held
-                                   (warp:state-entry-value
+                                   (warp-state-entry-value
                                     current-lock-entry)))
                       (lock-holder (when lock-is-held
                                      (plist-get lock-data :holder-id)))
@@ -1197,7 +1244,8 @@ Side Effects:
                  (cond
                    ;; Case 1: Lock is held by requester, so release it.
                    ((and lock-is-held (string= lock-holder holder-id))
-                    (warp:state-tx-delete tx `(:locks ,lock-name))
+                    (loom:await ; Await state-tx-delete
+                     (warp:state-tx-delete tx `(:locks ,lock-name)))
                     (setq success-p t)
                     (warp:log! :info (warp-coordinator-id coordinator)
                                (format "Lock '%s' released by %s."
@@ -1213,24 +1261,24 @@ Side Effects:
                    (t
                     (setq success-p t)
                     (warp:log! :info (warp-coordinator-id coordinator)
-                               (format "Lock '%s' not held, treating release
+                               (format "Lock '%s' not held, treating release \
                                         by %s as successful."
                                        lock-name holder-id)))))))
       (:then (lambda (_res)
                `(:success-p ,success-p :error ,error-msg)))
       (:catch (lambda (err)
                 (warp:log! :error (warp-coordinator-id coordinator)
-                            (format "Transaction for release lock '%s' failed: %S"
-                                    lock-name err))
+                           (format "Transaction for release lock '%s' failed: %S"
+                                   lock-name err))
                 `(:success-p nil :error (format "Transaction error: %S"
                                                  err)))))))
 
 (defun warp-coordinator-handle-barrier-increment (coordinator command context)
   "Handles incoming `:coordinator-barrier-increment` RPCs.
-Only the cluster leader processes these requests by performing an atomic
-transaction on the `warp-state-manager` to increment the barrier count.
-If the local node is a follower, it directs the requesting client to
-the known leader.
+Only the cluster leader processes these requests by performing an
+atomic transaction on the `warp-state-manager` to increment the
+barrier count. If the local node is a follower, it directs the
+requesting client to the known leader.
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
@@ -1256,8 +1304,8 @@ Side Effects:
                               args)))
 
     (warp:log! :debug (warp-coordinator-id coordinator)
-                (format "Received barrier increment for '%s' from %s."
-                        barrier-name participant-id))
+               (format "Received barrier increment for '%s' from %s."
+                       barrier-name participant-id))
 
     (if (eq (warp-coordinator-role coordinator) :leader)
         ;; If this node is the leader, process the barrier increment.
@@ -1287,23 +1335,26 @@ Side Effects:
                            :error "Not leader and no leader known.")))))))
 
 (defun warp-coordinator--handle-barrier-increment-logic (coordinator barrier-name
-                                                         participant-id total-participants)
+                                                         participant-id
+                                                         total-participants)
   "Internal helper for processing the core logic of a barrier increment.
-This function atomically updates the barrier's count and participant list
-in `warp-state-manager` via a transaction. It checks if the barrier is
-met after the increment. It also handles duplicate participant
-registrations by returning success without incrementing if the participant
-has already registered.
+This function atomically updates the barrier's count and participant
+list in `warp-state-manager` via a transaction. It checks if the
+barrier is met after the increment. It also handles duplicate participant
+registrations by returning success without incrementing if the
+participant has already registered.
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
 - `barrier-name` (string): The name of the barrier.
-- `participant-id` (string): The ID of the participant incrementing the barrier.
+- `participant-id` (string): The ID of the participant incrementing the
+  barrier.
 - `total-participants` (integer): The required count to meet the barrier.
 
 Returns:
 - (loom-promise): A promise that resolves to a plist
-  `(:success-p <boolean> :current-count <int> :is-met-p <boolean> :error <string or nil>)`.
+  `(:success-p <boolean> :current-count <int> :is-met-p <boolean>
+  :error <string or nil>)`.
 
 Side Effects:
 - May modify the barrier state in `warp-state-manager` via a transaction.
@@ -1316,12 +1367,15 @@ Side Effects:
     (braid! (warp:state-manager-transaction
              sm
              (lambda (tx)
-               (let* ((current-barrier-entry
-                       (warp:state-manager-get tx `(:barriers ,barrier-name)))
+               (let* ((current-barrier-entry (loom:await
+                                              (warp:state-manager-get tx
+                                                                      `(:barriers ,barrier-name))))
+                      ;; Check if a barrier entry exists and is not marked as
+                      ;; deleted (tombstone).
                       (barrier-data (when (and current-barrier-entry
-                                               (not (warp:state-entry-deleted
-                                                     current-barrier-entry)))
-                                      (warp:state-entry-value
+                                                (not (warp-state-entry-deleted
+                                                      current-barrier-entry)))
+                                      (warp-state-entry-value
                                        current-barrier-entry)))
                       (current-count-in-state (plist-get barrier-data
                                                          :current-count 0))
@@ -1331,28 +1385,32 @@ Side Effects:
                  (unless (integerp total-participants)
                    (signal (warp:error!
                             :type 'warp-coordinator-barrier-failed
-                            :message "Total participants must be an integer.")))
+                            :message
+                            "Total participants must be an integer.")))
 
-                 ;; Check if this participant has already registered for this barrier.
+                 ;; Check if this participant has already registered for
+                 ;; this barrier.
                  (when (member participant-id participants-list
                                :test #'string=)
                    (setq success-p t)
                    (setq current-count current-count-in-state)
                    (setq is-met-p (>= current-count total-participants))
                    (setq error-msg
-                         "Participant already registered for this barrier."))
+                         (format "Participant already registered for this \
+                                  barrier.")))
 
-                 (unless error-msg ; Only proceed if not already registered
+                 (unless error-msg
                    (cl-incf current-count-in-state)
                    (setq participants-list
                          (cons participant-id participants-list))
 
-                   (warp:state-tx-update
-                    tx `(:barriers ,barrier-name)
-                    `(:current-count ,current-count-in-state
-                      :total-participants ,total-participants
-                      :participants-list ,participants-list
-                      :last-update ,(float-time)))
+                   (loom:await ; Await state-tx-update
+                    (warp:state-tx-update
+                     tx `(:barriers ,barrier-name)
+                     `(:current-count ,current-count-in-state
+                       :total-participants ,total-participants
+                       :participants-list ,participants-list
+                       :last-update ,(float-time))))
                    (setq success-p t)
                    (setq current-count current-count-in-state)
                    (setq is-met-p (>= current-count total-participants))
@@ -1365,20 +1423,20 @@ Side Effects:
                  :is-met-p ,is-met-p :error ,error-msg)))
       (:catch (lambda (err)
                 (warp:log! :error (warp-coordinator-id coordinator)
-                            (format "Transaction for barrier '%s' failed: %S"
-                                    barrier-name err))
+                           (format "Transaction for barrier '%s' failed: %S"
+                                   barrier-name err))
                 `(:success-p nil :current-count ,current-count
                   :is-met-p nil :error (format "Transaction error: %S"
                                                 err)))))))
 
 (defun warp-coordinator-handle-propose-change (coordinator command context)
   "Handles incoming `:coordinator-propose-change` RPCs.
-Only the cluster leader processes these requests. It attempts to apply the
-proposed state change (a key-value update) using `warp-state-manager`'s
-update function. This is a simplified consensus model; it doesn't involve
-full Raft log replication or quorum voting for each change, but rather
-assumes the leader's direct manipulation of the shared state manager
-reflects its consensus.
+Only the cluster leader processes these requests. It attempts to apply
+the proposed state change (a key-value update) using
+`warp-state-manager`'s update function. This is a simplified consensus
+model; it doesn't involve full Raft log replication or quorum voting
+for each change, but rather assumes the leader's direct manipulation of
+the shared state manager reflects its consensus.
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
@@ -1388,12 +1446,12 @@ Arguments:
 
 Returns:
 - (loom-promise): A promise resolving with a
-  `warp-protocol-coordinator-propose-change-response-payload` (indicating
-  `success-p` and `error` if any).
+  `warp-protocol-coordinator-propose-change-response-payload`
+  (indicating `success-p` and `error` if any).
 
 Side Effects:
-- If leader: Calls `warp:state-manager-update` to modify the shared state.
-  Logs the change application.
+- If leader: Calls `warp:state-manager-update` to modify the shared
+  state. Logs the change application.
 - If follower: Updates `coordinator`'s `leader-id` if redirecting."
   (let* ((args (warp-rpc-command-args command))
          (key (warp-protocol-coordinator-propose-change-payload-key args))
@@ -1403,7 +1461,7 @@ Side Effects:
          (error-msg nil))
 
     (warp:log! :debug (warp-coordinator-id coordinator)
-                (format "Received propose-change request for key '%S'." key))
+               (format "Received propose-change request for key '%S'." key))
 
     (if (eq (warp-coordinator-role coordinator) :leader)
         ;; If this node is the leader, apply the state change directly.
@@ -1412,8 +1470,9 @@ Side Effects:
           (:then (lambda (_res)
                    (setq success-p t)
                    (warp:log! :info (warp-coordinator-id coordinator)
-                               (format "Proposed change for key '%S' applied by leader."
-                                       key))
+                              (format "Proposed change for key '%S' applied \
+                                       by leader."
+                                      key))
                    (loom:resolved! (warp-protocol-make-command
                                     :coordinator-propose-change-response
                                     :success-p success-p
@@ -1421,7 +1480,8 @@ Side Effects:
           (:catch (lambda (err)
                     (setq error-msg (format "Failed to apply change: %S" err))
                     (warp:log! :error (warp-coordinator-id coordinator)
-                               (format "Failed to apply proposed change for key '%S': %S"
+                               (format "Failed to apply proposed change for \
+                                        key '%S': %S"
                                        key err))
                     (loom:resolved! (warp-protocol-make-command
                                      :coordinator-propose-change-response
@@ -1447,22 +1507,25 @@ Side Effects:
   "Registers all RPC handlers that this coordinator node will respond to.
 This function is called during the coordinator's startup lifecycle.
 It uses `warp:defrpc-handlers` to declaratively connect the RPC command
-names (as defined in `warp-protocol`) to their respective handling functions
-within this module. These handlers will be dispatched by the
+names (as defined in `warp-protocol`) to their respective handling
+functions within this module. These handlers will be dispatched by the
 `command-router` component.
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Registers handler functions on the `command-router` associated with
   this `coordinator`."
   (warp:log! :debug (warp-coordinator-id coordinator)
-              "Registering RPC handlers.")
+             "Registering RPC handlers.")
   (warp:defrpc-handlers (warp-coordinator-command-router coordinator)
+    ;; NEW: Handler for leader discovery RPC
+    (:get-coordinator-leader . (lambda (command context)
+                                 (warp-coordinator-handle-get-leader
+                                  coordinator command context)))
     (:coordinator-request-vote . (lambda (command context)
                                    (warp-coordinator-handle-request-vote
                                     coordinator command context)))
@@ -1490,11 +1553,11 @@ start their own heartbeat timers upon election.
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
-- Schedules the initial `election-timer` via `warp-coordinator--reset-election-timer`."
+- Schedules the initial `election-timer` via
+  `warp-coordinator--reset-election-timer`."
   (warp:log! :debug (warp-coordinator-id coordinator) "Starting timers.")
   (warp-coordinator--reset-election-timer coordinator))
 
@@ -1520,16 +1583,17 @@ Side Effects:
          (members (warp-coordinator-config-cluster-members config))
          (cm (warp-coordinator-connection-manager coordinator)))
     (warp:log! :info (warp-coordinator-id coordinator)
-                (format "Connecting to %d coordinator peers via Connection Manager."
-                        (length members)))
+               (format "Connecting to %d coordinator peers via Connection \
+                        Manager."
+                       (length members)))
     ;; Add all cluster members as endpoints to the connection manager.
     (dolist (member-address members)
       (warp:connection-manager-add-endpoint cm member-address))
     ;; The `warp:connection-manager-connect` with no arguments starts the
     ;; connection manager's process of establishing and maintaining
     ;; connections to all its configured endpoints. It returns a promise that
-    ;; resolves when the CM is actively trying to connect. Individual peer RPCs
-    ;; will then leverage the CM's established connections.
+    ;; resolves when the CM is actively trying to connect. Individual peer
+    ;; RPCs will then leverage the CM's established connections.
     (loom:await (warp:connection-manager-connect cm))))
 
 (defun warp-coordinator--stop-timers (coordinator)
@@ -1541,8 +1605,7 @@ associated timer resources.
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Cancels `election-timer` and `heartbeat-timer` if they are active."
@@ -1567,16 +1630,16 @@ Returns:
 
 Side Effects:
 - Calls `warp:connection-manager-shutdown` to close all active connections."
-  (warp:log! :info (warp-coordinator-id coordinator) "Disconnecting from peers.")
-  ;; `warp:connection-manager-shutdown` closes all active connections.
+  (warp:log! :info (warp-coordinator-id coordinator)
+             "Disconnecting from peers.")
   (loom:await (warp:connection-manager-shutdown
                (warp-coordinator-connection-manager coordinator))))
 
 (defun warp-coordinator--send-client-rpc (coordinator target-id command-payload)
   "Helper to send an RPC request from a client (this coordinator instance
 acting as a client) to a target coordinator (likely the leader).
-This function handles getting the connection and making the RPC call with
-the correct sender/recipient IDs and timeout.
+This function handles getting the connection and making the RPC call
+with the correct sender/recipient IDs and timeout.
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance
@@ -1604,39 +1667,40 @@ Side Effects:
                        (warp-coordinator-config coordinator)))
          (conn (warp:connection-manager-get-connection
                 (warp-coordinator-connection-manager coordinator)))
-         (origin-instance-id (warp-coordinator-component-system-id coordinator)))
-    ;; Critical: If no connection is active, RPCs cannot be sent.
+         (origin-instance-id
+          (warp-coordinator-component-system-id coordinator)))
     (unless conn
       (signal (warp:error! :type 'warp-coordinator-error
-                            :message "No active connection to peers for RPC.")))
+                           :message "No active connection to peers for RPC.")))
     (braid! (warp:rpc-request
              rpc-system
              conn
              sender-id
              target-id
              (make-warp-rpc-command
-              :name (warp-protocol-command-name command-payload)
-              :args (warp-protocol-command-args command-payload))
+              :name (plist-get command-payload :name) 
+              :args command-payload) 
              :timeout rpc-timeout
-             :origin-instance-id origin-instance-id) ; Pass origin ID
+             :origin-instance-id origin-instance-id)
       (:then (lambda (response) response))
       (:catch (lambda (err)
                 (warp:log! :warn sender-id
-                            (format "RPC to %s failed: %S. Retrying..."
-                                    target-id err))
+                           (format "RPC to %s failed: %S. Retrying..."
+                                   target-id err))
                 (loom:rejected! (warp:error! :type 'warp-rpc-error
-                                             :message (format "RPC to %s failed." target-id)
+                                             :message (format "RPC to %s failed."
+                                                              target-id)
                                              :cause err)))))))
 
 (defun warp-coordinator--handle-client-rpc-response (coordinator
-                                                      response
-                                                      operation-name)
+                                                     response
+                                                     operation-name)
   "Helper to process the generic response from a client-initiated RPC.
 This function extracts the success status, potential error message, and
-leader redirection information from the `warp-rpc-command` payload (which
-holds the actual response payload from the coordinator protocol). It also
-updates the local knowledge of the leader ID if the response indicates a
-new leader.
+leader redirection information from the `warp-rpc-command` payload
+(which holds the actual response payload from the coordinator protocol).
+It also updates the local knowledge of the leader ID if the response
+indicates a new leader.
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
@@ -1653,9 +1717,7 @@ Side Effects:
 - May update `coordinator`'s `leader-id` based on response if a new
   leader is indicated.
 - Logs the outcome of the operation."
-  (let* ((payload (warp-rpc-command-args response)) ; Response is args of a command
-         ;; Using `:granted-p` or `:success-p` as a generic success indicator,
-         ;; common in coordinator protocols for various responses.
+  (let* ((payload (warp-rpc-command-args response))
          (success-p (or (plist-get payload :granted-p)
                         (plist-get payload :success-p)))
          (leader-from-response (plist-get payload :leader-id))
@@ -1674,8 +1736,8 @@ Side Effects:
                    (not (string= leader-from-response
                                  (warp-coordinator-leader-id coordinator))))
           (warp:log! :info client-id
-                      (format "%s denied. New leader: %s. Updating leader ID."
-                              operation-name leader-from-response))
+                     (format "%s denied. New leader: %s. Updating leader ID."
+                             operation-name leader-from-response))
           (setf (warp-coordinator-leader-id coordinator)
                 leader-from-response))
         `(:success-p nil
@@ -1686,15 +1748,15 @@ Side Effects:
 (cl-defun warp-coordinator--rpc-call-with-leader-retry (coordinator
                                                         command-fn
                                                         &key timeout
-                                                             client-id
-                                                             op-name)
+                                                        client-id
+                                                        op-name)
   "Generic helper to make an RPC call to the leader with retry logic.
 This function determines the current leader (or itself if leadership is
-unknown), sends the RPC (`command-fn` generates the payload), and retries
-if the call fails or indicates a new leader. This forms an outer retry
-loop for client-initiated distributed operations, aiming for eventual
-consistency and successful operation despite transient network issues or
-leader changes.
+unknown), sends the RPC (`command-fn` generates the payload), and
+retries if the call fails or indicates a new leader. This forms an
+outer retry loop for client-initiated distributed operations, aiming
+for eventual consistency and successful operation despite transient
+network issues or leader changes.
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator.
@@ -1709,14 +1771,14 @@ Arguments:
   'Lock acquisition') for logging and error messages.
 
 Returns:
-- (loom-promise): A promise that resolves to the final `warp-rpc-command`
-  (containing the RPC response payload) from the leader on success, or
-  rejects with a `warp-coordinator-error` type if all retries fail or a
-  timeout occurs.
+- (loom-promise): A promise that resolves to the final
+  `warp-rpc-command` (containing the RPC response payload) from the
+  leader on success, or rejects with a `warp-coordinator-error` type if
+  all retries fail or a timeout occurs.
 
 Signals:
-- `warp-coordinator-timeout`: If retries for the overall operation exceed
-  the specified `timeout`.
+- `warp-coordinator-timeout`: If retries for the overall operation
+  exceed the specified `timeout`.
 - `warp-coordinator-error`: For other non-transient RPC failures."
   (let* ((req-timeout (or timeout
                           (warp-coordinator-config-rpc-timeout
@@ -1734,7 +1796,7 @@ Signals:
                                   :message (format "%s timed out." op-name))))
 
       (let* ((target-id (or (warp-coordinator-leader-id coordinator)
-                            client-id)) ; Target leader, or self if leader unknown.
+                            client-id))
              ;; Define the RPC sending attempt function for `loom:retry`.
              (rpc-attempt-fn
               (lambda ()
@@ -1745,29 +1807,32 @@ Signals:
         ;; failures (e.g., dropped packets, temporary connection issues).
         (braid! (loom:retry
                  rpc-attempt-fn
-                 :retries 2    ; Short retry count for the inner RPC call.
-                 :delay 0.5    ; Small delay between inner RPC retries.
+                 :retries 2
+                 :delay 0.5
                  :pred (lambda (err) (cl-typep err 'warp-rpc-error)))
           (:then (lambda (response)
                    ;; Process the RPC response and check for success/redirection.
                    (let ((result (warp-coordinator--handle-client-rpc-response
-                                  coordinator response op-name)))
+                                   coordinator response op-name)))
                      (if (plist-get result :success-p)
-                         (loom:break! response) ; Success, exit `loom:loop!` with response.
+                         (loom:break! response)
                        (progn
-                         ;; If the operation failed, and a new leader was identified,
-                         ;; or it's a generic failure, retry the outer loop after a delay.
+                         ;; If the operation failed, and a new leader was
+                         ;; identified, or it's a generic failure, retry
+                         ;; the outer loop after a delay.
                          (loom:delay! 0.1 (loom:continue!)))))))
           (:catch (lambda (err)
-                    ;; If the inner `loom:retry` for the RPC fails (all its retries exhausted),
-                    ;; it means the RPC couldn't be sent or consistently failed.
-                    ;; Log a warning and signal `loom:continue!` to re-enter the outer loop,
-                    ;; allowing time for network recovery or leader re-election.
+                    ;; If the inner `loom:retry` for the RPC fails (all its
+                    ;; retries exhausted), it means the RPC couldn't be
+                    ;; sent or consistently failed.
+                    ;; Log a warning and signal `loom:continue!` to re-enter
+                    ;; the outer loop, allowing time for network recovery
+                    ;; or leader re-election.
                     (warp:log! :warn client-id
-                               (format "%s RPC to %s failed (after retries): %S.
+                               (format "%s RPC to %s failed (after retries): %S. \
                                         Retrying main loop..."
                                        op-name target-id err))
-                    (loom:delay! 0.5 (loom:continue!)))))))))
+                    (loom:delay! 0.5 (loom:continue!))))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
@@ -1783,23 +1848,27 @@ Signals:
                                    &key config)
   "Creates and initializes a new `warp-coordinator-instance`.
 This factory function sets up a single node within a distributed
-coordinator cluster. It links to essential Warp components (state manager,
-event system, RPC system, connection manager) and initializes its internal
-Raft-like state for leader election and basic consensus.
+coordinator cluster. It links to essential Warp components (state
+manager, event system, RPC system, connection manager) and initializes
+its internal Raft-like state for leader election and basic consensus.
 
 Arguments:
-- `id` (string): A unique identifier for this coordinator instance within its cluster.
-- `cluster-id` (string): The logical ID of the cluster this coordinator belongs to.
-- `state-manager` (warp-state-manager): The `warp-state-manager` component,
-  used for storing and synchronizing distributed state (locks, leader, etc.).
-- `event-system` (warp-event-system): The `warp-event-system` component,
-  used for emitting and subscribing to cluster-wide events (e.g., leader changes).
+- `id` (string): A unique identifier for this coordinator instance
+  within its cluster.
+- `cluster-id` (string): The logical ID of the cluster this coordinator
+  belongs to.
+- `state-manager` (warp-state-manager): The `warp-state-manager`
+  component, used for storing and synchronizing distributed state
+  (locks, leader, etc.).
+- `event-system` (warp-event-system): The `warp-event-system`
+  component, used for emitting and subscribing to cluster-wide events
+  (e.g., leader changes).
 - `command-router` (warp-command-router): The `warp-command-router`
   component where this coordinator will register its RPC handlers
   (e.g., for `RequestVote`, `AppendEntries`).
-- `connection-manager` (warp-connection-manager): The `warp-connection-manager`
-  component, used for establishing and maintaining network connections to
-  other cluster members.
+- `connection-manager` (warp-connection-manager): The
+  `warp-connection-manager` component, used for establishing and
+  maintaining network connections to other cluster members.
 - `rpc-system` (warp-rpc-system): The `warp-rpc-system` component, used
   for sending and receiving RPC messages between coordinator peers.
 - `:config` (coordinator-config, optional): Configuration for this
@@ -1809,32 +1878,36 @@ Returns:
 - (warp-coordinator-instance): A new, initialized coordinator instance.
 
 Signals:
-- `cl-assert`: If any required component (e.g., `state-manager`, `rpc-system`)
-  is not provided.
+- `cl-assert`: If any required component (e.g., `state-manager`,
+  `rpc-system`) is not provided.
 
 Side Effects:
-- Initializes internal state, including `current-term`, `role`, and empty logs.
+- Initializes internal state, including `current-term`, `role`, and
+  empty logs.
 - Registers its specific RPC handlers on the provided `command-router`.
 - Logs the creation of the coordinator."
   (let* ((final-config (or config (make-coordinator-config)))
          ;; Infer the ID of the component system running this coordinator.
          ;; This is needed for `warp:rpc-request`'s `origin-instance-id`.
-         (component-system-id (if (functionp 'warp-component-system-id) ; Check if function exists (warp-component dependency)
-                                 (warp-component-system-id (warp-rpc-system-component-system rpc-system))
-                               "unknown-component-system"))) ; Fallback or error if not in component system
+         (component-system-id (if (fboundp 'warp-component-system-id)
+                                  (warp-component-system-id
+                                   (warp-rpc-system-component-system
+                                    rpc-system))
+                                "unknown-component-system")))
 
     (let ((coordinator (%%make-coordinator-instance
-                        :id id
-                        :cluster-id cluster-id
-                        :config final-config
-                        :state-manager state-manager
-                        :event-system event-system
-                        :command-router command-router
-                        :connection-manager connection-manager
-                        :rpc-system rpc-system
-                        :component-system-id component-system-id))) 
-      (warp:log! :info id (format "Coordinator instance '%s' created for cluster '%s'."
-                                  id cluster-id))
+                         :id id
+                         :cluster-id cluster-id
+                         :config final-config
+                         :state-manager state-manager
+                         :event-system event-system
+                         :command-router command-router
+                         :connection-manager connection-manager
+                         :rpc-system rpc-system
+                         :component-system-id component-system-id)))
+      (warp:log! :info id
+                 (format "Coordinator instance '%s' created for cluster '%s'."
+                         id cluster-id))
       ;; Initialize RPC handlers specific to coordinator operations.
       (warp-coordinator--initialize-rpc-handlers coordinator)
       coordinator)))
@@ -1867,9 +1940,9 @@ Side Effects:
 (defun warp:coordinator-stop (coordinator)
   "Stops the coordinator node's operation, stopping timers and
 disconnecting from peers.
-This function performs a graceful shutdown of the coordinator. It cancels
-all active timers (election and heartbeat) and closes network connections
-to other cluster members, releasing resources.
+This function performs a graceful shutdown of the coordinator. It
+cancels all active timers (election and heartbeat) and closes network
+connections to other cluster members, releasing resources.
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance to stop.
@@ -1889,8 +1962,8 @@ Side Effects:
 (defun warp:coordinator-get-leader (coordinator)
   "Retrieves the currently known leader's ID for this coordinator cluster.
 This function provides immediate access to the coordinator's local view
-of who the current leader is. This information might be slightly stale if
-a leader change has just occurred but not yet propagated.
+of who the current leader is. This information might be slightly stale
+if a leader change has just occurred but not yet propagated.
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
@@ -1914,11 +1987,12 @@ Returns:
 ;;;###autoload
 (cl-defun warp:coordinator-get-lock (coordinator lock-name &key timeout)
   "Acquires a distributed lock.
-This function attempts to obtain a named lock across the cluster. The request
-is always directed to the known leader. If the current node is a follower,
-it internally attempts to redirect the request to the known leader. It will
-wait if necessary until the lock is available or the `timeout` expires,
-retrying automatically on transient errors or leader changes.
+This function attempts to obtain a named lock across the cluster. The
+request is always directed to the known leader. If the current node is a
+follower, it internally attempts to redirect the request to the known
+leader. It will wait if necessary until the lock is available or the
+`timeout` expires, retrying automatically on transient errors or leader
+changes.
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
@@ -1928,9 +2002,9 @@ Arguments:
   leader redirection). Defaults to `warp-coordinator-config-rpc-timeout`.
 
 Returns:
-- (loom-promise): A promise that resolves to `t` if the lock is successfully
-  acquired, or rejects with a `warp-coordinator-lock-failed` or
-  `warp-coordinator-timeout` error on failure.
+- (loom-promise): A promise that resolves to `t` if the lock is
+  successfully acquired, or rejects with a `warp-coordinator-lock-failed`
+  or `warp-coordinator-timeout` error on failure.
 
 Side Effects:
 - Sends RPCs to the cluster leader (via `warp-rpc`).
@@ -1946,7 +2020,7 @@ Side Effects:
 
     (braid! (warp-coordinator--rpc-call-with-leader-retry
              coordinator
-             (lambda () ;; Command payload function for acquire-lock RPC.
+             (lambda ()
                (warp-protocol-make-command
                 :coordinator-acquire-lock
                 :lock-name lock-name
@@ -1957,7 +2031,8 @@ Side Effects:
              :op-name (format "Lock acquisition for '%s'" lock-name))
       (:then (lambda (_response)
                ;; On successful acquisition, update local cache of held locks.
-               (warp:log! :info holder-id (format "Lock '%s' acquired." lock-name))
+               (warp:log! :info holder-id
+                          (format "Lock '%s' acquired." lock-name))
                (puthash lock-name expiry-time
                         (warp-coordinator-lock-registry coordinator))
                t))
@@ -1967,8 +2042,9 @@ Side Effects:
                                    lock-name err))
                 ;; Re-signal as a specific lock-failed error for consumers.
                 (signal (warp:error! :type 'warp-coordinator-lock-failed
-                                     :message (format "Failed to acquire lock %S"
-                                                      lock-name)
+                                     :message
+                                     (format "Failed to acquire lock %S"
+                                             lock-name)
                                      :cause err)))))))
 
 ;;;###autoload
@@ -1997,7 +2073,7 @@ Side Effects:
          (holder-id (warp-coordinator-id coordinator)))
     (braid! (warp-coordinator--rpc-call-with-leader-retry
              coordinator
-             (lambda () ;; Command payload function for release-lock RPC.
+             (lambda ()
                (warp-protocol-make-command
                 :coordinator-release-lock
                 :lock-name lock-name
@@ -2007,7 +2083,8 @@ Side Effects:
              :op-name (format "Lock release for '%s'" lock-name))
       (:then (lambda (_response)
                ;; On successful release, remove from local cache.
-               (warp:log! :info holder-id (format "Lock '%s' released." lock-name))
+               (warp:log! :info holder-id
+                          (format "Lock '%s' released." lock-name))
                (remhash lock-name
                         (warp-coordinator-lock-registry coordinator))
                t))
@@ -2017,8 +2094,9 @@ Side Effects:
                                    lock-name err))
                 ;; Re-signal as a specific lock-failed error for consumers.
                 (signal (warp:error! :type 'warp-coordinator-lock-failed
-                                     :message (format "Failed to release lock %S"
-                                                      lock-name)
+                                     :message
+                                     (format "Failed to release lock %S"
+                                             lock-name)
                                      :cause err)))))))
 
 ;;;###autoload
@@ -2029,8 +2107,8 @@ must be in the `:leader` role). It attempts to update the shared state
 in `warp-state-manager` via an RPC to itself (as the leader).
 This is a simplified consensus model; it doesn't involve full log
 replication or quorum voting for each change, but rather assumes the
-leader's direct manipulation of the shared state manager (which is
-CRDT-based) reflects its consensus.
+leader's direct manipulation of the shared state manager
+(which is CRDT-based) reflects its consensus.
 
 Arguments:
 - `coordinator` (warp-coordinator-instance): The coordinator instance.
@@ -2041,8 +2119,8 @@ Arguments:
   `warp-coordinator-config-rpc-timeout`.
 
 Returns:
-- (loom-promise): A promise that resolves to `t` if the state change is
-  successfully proposed and applied by the leader, or rejects with a
+- (loom-promise): A promise that resolves to `t` if the state change
+  is successfully proposed and applied by the leader, or rejects with a
   `warp-coordinator-consensus-failed` or `warp-coordinator-timeout`
   error.
 
@@ -2051,7 +2129,8 @@ Signals:
   (This is a client-side check for this simplified model).
 
 Side Effects:
-- Sends an RPC to the cluster leader (which is itself if this node is leader).
+- Sends an RPC to the cluster leader (which is itself if this node is
+  leader).
 - Calls `warp:state-manager-update` on the leader to apply the change.
 - Logs proposal progress and errors."
   (let* ((req-timeout (or timeout
@@ -2066,7 +2145,7 @@ Side Effects:
 
     (braid! (warp-coordinator--rpc-call-with-leader-retry
              coordinator
-             (lambda () ;; Command payload function for propose-change RPC.
+             (lambda ()
                (warp-protocol-make-command
                 :coordinator-propose-change
                 :key key
@@ -2078,7 +2157,8 @@ Side Effects:
                ;; No local state update needed here, as `warp-state-manager`
                ;; already handles the authoritative state and its propagation.
                (warp:log! :info proposer-id
-                          (format "Proposed change for key '%S' successfully applied."
+                          (format "Proposed change for key '%S' successfully \
+                                   applied."
                                   key))
                t))
       (:catch (lambda (err)
@@ -2086,13 +2166,14 @@ Side Effects:
                            (format "Failed to propose change for key '%S': %S"
                                    key err))
                 (signal (warp:error! :type 'warp-coordinator-consensus-failed
-                                     :message (format "Failed to propose change for key %S"
-                                                      key)
+                                     :message
+                                     (format "Failed to propose change for \
+                                              key %S" key)
                                      :cause err)))))))
 
 ;;;###autoload
 (cl-defun warp:coordinator-wait-for-barrier (coordinator barrier-name
-                                          total-participants &key timeout)
+                                             total-participants &key timeout)
   "Waits for a distributed barrier to be met.
 This function repeatedly attempts to increment a named barrier's count on
 the current leader and waits until the `current-count` reaches
@@ -2126,35 +2207,36 @@ Side Effects:
     ;; Use `loom:loop!` to repeatedly attempt incrementing the barrier
     ;; until it's met or a timeout occurs.
     (loom:loop!
-      ;; First, check the overall timeout for the entire barrier wait.
+      ;; First, check the overall timeout for the entire operation.
       (when (> (- (float-time) start-time) req-timeout)
         (warp:log! :error participant-id
-                    (format "Barrier '%S' timed out after %.2fs."
-                            barrier-name req-timeout))
+                   (format "Barrier '%S' timed out after %.2fs."
+                           barrier-name req-timeout))
         ;; If timed out, break from the loop with a rejection.
         (loom:break! (warp:error! :type 'warp-coordinator-timeout
-                                  :message (format "Barrier '%S' timed out."
-                                                   barrier-name))))
+                                  :message
+                                  (format "Barrier '%S' timed out."
+                                          barrier-name))))
 
       (warp:log! :debug participant-id
-                  (format "Attempting to increment barrier '%s' (current role: %S)."
-                          barrier-name (warp-coordinator-role coordinator)))
+                 (format "Attempting to increment barrier '%s' (current role: %S)."
+                         barrier-name (warp-coordinator-role coordinator)))
 
       ;; Attempt to increment the barrier and handle the response.
       (braid! (warp-coordinator--rpc-call-with-leader-retry
                coordinator
-               (lambda () ;; Command payload function for barrier-increment RPC.
+               (lambda ()
                  (warp-protocol-make-command
                   :coordinator-barrier-increment
                   :barrier-name barrier-name
                   :participant-id participant-id
                   :total-participants total-participants))
-               :timeout req-timeout ; Overall timeout handled by outer loop
+               :timeout req-timeout
                :client-id participant-id
                :op-name (format "Barrier increment for '%s'" barrier-name))
         (:then (lambda (response)
                  ;; Process the RPC response from the leader.
-                 (let* ((payload (warp-rpc-command-args response)) ; Barrier response payload
+                 (let* ((payload (warp-rpc-command-args response))
                         (current-count (plist-get payload :current-count))
                         (is-met-p (plist-get payload :is-met-p)))
                    (cond
@@ -2163,24 +2245,26 @@ Side Effects:
                                  (format "Barrier '%s' met. Count: %d/%d."
                                          barrier-name current-count
                                          total-participants))
-                      (loom:break! t)) ; Barrier met, exit `loom:loop!` successfully.
+                      (loom:break! t))
                      (t
                       (warp:log! :debug participant-id
-                                 (format "Barrier '%s' incremented to %d/%d. Waiting..."
+                                 (format "Barrier '%s' incremented to %d/%d. \
+                                          Waiting..."
                                          barrier-name current-count
                                          total-participants))
                       ;; If not met yet, continue the outer loop after a small delay.
                       (loom:delay! 0.1 (loom:continue!)))))))
         (:catch (lambda (err)
                   ;; If the `warp-coordinator--rpc-call-with-leader-retry` itself
-                  ;; signals an error (e.g., all its retries failed, or a timeout
-                  ;; specific to the RPC call occurred), log and continue the
-                  ;; outer `loom:loop!`. This allows the overall barrier wait
-                  ;; to continue trying, potentially with a new leader.
+                  ;; signals an error (e.g., all its retries failed, or a
+                  ;; timeout specific to the RPC call occurred), log and
+                  ;; continue the outer `loom:loop!`. This allows the
+                  ;; overall barrier wait to continue trying, potentially
+                  ;; with a new leader.
                   (warp:log! :warn participant-id
-                              (format "Barrier increment attempt failed for '%s': %S.
-                                       Retrying main loop..."
-                                      barrier-name err))
+                             (format "Barrier increment attempt failed for '%s': \
+                                      %S. Retrying main loop..."
+                                     barrier-name err))
                   (loom:delay! 0.5 (loom:continue!))))))))
 
 (provide 'warp-coordinator)

@@ -122,7 +122,7 @@ Fields:
 - `endpoint-registry`: The backing `warp-registry` that stores all
   `warp-service-endpoint` objects.
 - `event-system`: The cluster's `warp-event-system` used to listen for
-  worker events (`:worker-registered`, `:worker-health-status-changed`).
+  worker status events (`:worker-registered`, `:worker-health-status-changed`).
 - `load-balancer`: The `warp-balancer-strategy` used for selecting
   healthy endpoints when clients request a service."
   (id nil :type string)
@@ -142,7 +142,7 @@ Fields:
 - `rpc-system`: The `warp-rpc-system` instance used for communicating
   with the master to request service endpoints.
 - `connection-manager`: The `warp-connection-manager` responsible for
-  managing the network connection to the master."
+  maintaining the network connection to the master."
   (rpc-system (cl-assert nil) :type (or null t))
   (connection-manager (cl-assert nil) :type (or null t)))
 
@@ -378,11 +378,21 @@ Side Effects:
         ;; Handler for clients requesting a service endpoint.
         (:service-select-endpoint
          (lambda (command context)
-           (let ((service-name (plist-get (warp-rpc-command-args command)
-                                          :service-name)))
-             ;; Delegating to a dedicated function for cleaner logic.
-             (warp:service-registry-select-endpoint service-registry
-                                                    service-name))))
+           (let* ((args (warp-rpc-command-args command))
+                  (service-name (plist-get args :service-name))
+                  (worker-id-hint (plist-get args :worker-id))) ; New: for direct worker ping
+             ;; If worker-id hint is provided, prioritize finding that specific endpoint.
+             (if worker-id-hint
+                 (braid! (warp:registry-get endpoint-registry (format "%s@%s" service-name worker-id-hint))
+                   (:then (specific-endpoint)
+                     (unless specific-endpoint
+                       (loom:rejected! (warp:error! :type 'warp-service-not-found
+                                                    :message (format "Service '%s' on worker '%s' not found." service-name worker-id-hint))))
+                     specific-endpoint)
+                   (:catch (err) (loom:rejected! err)))
+               ;; Otherwise, use the load balancer to select a healthy one.
+               (warp:service-registry-select-endpoint service-registry
+                                                      service-name)))))
 
         ;; Handler for workers dynamically registering a new service.
         ;; The RPC context provides the worker's identification.
@@ -406,7 +416,19 @@ Side Effects:
              ;; Use the private helper to remove the endpoint.
              (warp-service-registry--remove-service-endpoint service-registry
                                                              worker-id
-                                                             service-name))))))
+                                                             service-name))))
+        
+        ;; New RPC for CLI: list all services
+        (:service-list-all .
+         (lambda (command context)
+           (warp:service-registry-list-all service-registry)))
+
+        ;; New RPC for CLI: get info for a specific service
+        (:get-service-info .
+         (lambda (command context)
+           (let ((service-name (plist-get (warp-rpc-command-args command) :service-name)))
+             (warp:service-registry-get-service-info service-registry service-name))))
+        ))
     service-registry))
 
 ;;;###autoload
@@ -453,7 +475,11 @@ Arguments:
   endpoint is to be selected.
 
 Returns:
-- (warp-service-endpoint): The selected healthy endpoint.
+- (loom-promise): A promise that resolves with a `warp-service-endpoint`
+  struct on success. The promise rejects with an error if the service
+  cannot be found or no healthy endpoints are available (errors from master
+  RPC response, including `warp-service-not-found` or
+  `warp-balancer-no-healthy-nodes`).
 
 Signals:
 - `warp-service-error`: If the provided `registry` object is invalid.
@@ -479,6 +505,44 @@ Side Effects:
                                       (eq (warp-service-endpoint-health-status
                                            endpoint)
                                           :healthy)))))
+
+;;;###autoload
+(cl-defun warp:service-registry-list-all (registry)
+  "Retrieves all registered `warp-service-endpoint`s in the registry.
+This function retrieves all service endpoints from the internal registry
+without filtering by health status.
+
+Arguments:
+- `registry` (warp-service-registry): The service registry instance.
+
+Returns:
+- (loom-promise): A promise that resolves with a list of all `warp-service-endpoint` structs.
+  Returns `nil` if the registry is empty.
+
+Signals:
+- `warp-service-error`: If the provided `registry` object is invalid."
+  (unless (warp-service-registry-p registry)
+    (signal 'warp-service-error "Invalid `warp-service-registry` object."))
+  (let ((endpoint-reg (warp-service-registry-endpoint-registry registry)))
+    (loom:resolved! (warp:registry-all endpoint-reg)))) ; registry-all already returns a list.
+
+;;;###autoload
+(defun warp:service-registry-get-service-info (registry service-name)
+  "Retrieves detailed information for a specific service.
+This returns the `warp-service-endpoint` for the given service,
+selected by the load balancer.
+
+Arguments:
+- `registry` (warp-service-registry): The service registry instance.
+- `service-name` (string): The logical name of the service to query.
+
+Returns:
+- (loom-promise): A promise that resolves with the `warp-service-endpoint`
+  struct, or rejects if the service is not found or no healthy endpoints exist.
+
+Signals:
+- `warp-service-not-found`: If no healthy endpoint for the service is found."
+  (warp:service-registry-select-endpoint registry service-name)) ; Reuse select-endpoint
 
 ;;----------------------------------------------------------------------
 ;;; Client-Side Service Discovery

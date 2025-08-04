@@ -53,9 +53,10 @@
 
 (define-error 'warp-internal-error
   "An unexpected internal consistency error or unrecoverable state.
-This error type is reserved for severe, system-level issues that indicate
-a failure within the Warp framework itself, rather than an application-level
-error. When signaled, it triggers centralized logging and event emission."
+This error type is reserved for severe, system-level issues that
+indicate a failure within the Warp framework itself, rather than an
+application-level error. When signaled, it triggers centralized logging
+and event emission."
   'warp-error)
 
 (define-error 'warp-configuration-error
@@ -85,31 +86,35 @@ Side Effects:
   (condition-case err
       (let ((context-data nil))
         ;; Get worker context if this is a worker process
-        (when (and (fboundp 'warp:worker-p) (warp:worker-p))
+        (when (and (fboundp 'warp:worker-id) (fboundp 'warp:worker-p)
+                   (warp:worker-p))
           (when-let ((worker-id (warp:worker-id)))
-            (setq context-data (plist-put context-data :worker-id worker-id))))
+            (setq context-data (plist-put context-data :worker-id
+                                          worker-id))))
 
         ;; Get cluster context if this is a master process or part of a cluster
-        ;; Check for warp:cluster-p to avoid errors if in a non-cluster Emacs instance
-        (when (and (fboundp 'warp:cluster-p)
-                   (fboundp 'warp:master-p) (warp:master-p))
-          (when-let ((cluster-id (warp:cluster-id nil))) ; Assuming nil arg for default cluster
-            (setq context-data (plist-put context-data :cluster-id cluster-id))
+        (when (and (fboundp 'warp:cluster-id) (fboundp 'warp:master-p)
+                   (warp:master-p))
+          (when-let ((cluster-id (warp:cluster-id nil)))
+            (setq context-data (plist-put context-data :cluster-id
+                                          cluster-id))
             (when-let ((cluster-name (warp:cluster-name nil)))
-              (setq context-data (plist-put context-data :cluster-name cluster-name)))))
+              (setq context-data (plist-put context-data :cluster-name
+                                            cluster-name)))))
         context-data)
     (error
-     (warp:log! :warn "warp-error" "Failed to gather common error context: %S" err)
+     (warp:log! :warn "warp-error"
+                "Failed to gather common error context: %S" err)
      nil)))
 
 (defun warp--error-get-request-context ()
-  "Extracts request-specific context from `warp-request-pipeline-current-context`.
-This function inspects `warp-request-pipeline-current-context` (if
-dynamically bound) to pull out details relevant to the current RPC
-request being processed through the pipeline. This context is only
-available when `warp:error!` is called within the dynamic scope of a
-request pipeline step, providing critical information about the task
-that led to the error.
+  "Extracts request-specific context from
+`warp-request-pipeline-current-context`. This function inspects
+`warp-request-pipeline-current-context` (if dynamically bound) to pull
+out details relevant to the current RPC request being processed through
+the pipeline. This context is only available when `warp:error!` is
+called within the dynamic scope of a request pipeline step, providing
+critical information about the task that led to the error.
 
 Arguments:
 - None.
@@ -130,28 +135,33 @@ Side Effects:
                         (warp-request-pipeline-context-command ctx))))
             (when (fboundp 'warp-request-pipeline-context-request-id)
               (setq context-data (plist-put context-data :request-id
-                                            (warp-request-pipeline-context-request-id ctx))))
+                                            (warp-request-pipeline-context-request-id
+                                             ctx))))
             (when cmd
               (when (fboundp 'warp-rpc-command-name)
                 (setq context-data (plist-put context-data :command-name
                                               (warp-rpc-command-name cmd))))
               ;; Assuming service-name might be in command metadata
               (when (fboundp 'warp-rpc-command-metadata)
-                (when-let ((svc-name (plist-get (warp-rpc-command-metadata cmd)
-                                                :service-name)))
-                  (setq context-data (plist-put context-data :service-name svc-name))))
-              )
+                (when-let ((svc-name
+                            (plist-get
+                             (warp-rpc-command-metadata cmd) :service-name)))
+                  (setq context-data (plist-put context-data :service-name
+                                                svc-name)))))
             ;; Correlation ID from the original message in rpc-event-payload
             (when (fboundp 'warp-request-pipeline-context-rpc-event-payload)
-              (when-let* ((rpc-evt (warp-request-pipeline-context-rpc-event-payload ctx))
+              (when-let* ((rpc-evt
+                           (warp-request-pipeline-context-rpc-event-payload ctx))
                           (msg (when (fboundp 'warp-protocol-rpc-event-payload-message)
                                  (warp-protocol-rpc-event-payload-message rpc-evt))))
                 (when (fboundp 'warp-rpc-message-correlation-id)
                   (setq context-data (plist-put context-data :correlation-id
-                                                (warp-rpc-message-correlation-id msg))))))))
+                                                (warp-rpc-message-correlation-id
+                                                 msg))))))))
         context-data)
     (error
-     (warp:log! :warn "warp-error" "Failed to gather request error context: %S" err)
+     (warp:log! :warn "warp-error"
+                "Failed to gather request error context: %S" err)
      nil)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -166,11 +176,11 @@ standardized way to create errors within the Warp framework. It
 automatically collects information such as `worker-id`, `cluster-id`,
 and request details (if available in the current dynamic scope) and
 adds them to the error's `:data` slot.
-Crucially, if the error's `:type` is `warp-internal-error` (or a descendant),
-this macro also handles logging the error at a fatal level and emitting
-it as a structured `warp-internal-error` event onto the global
-`warp-event-system`, providing centralized observability for critical
-system failures.
+Crucially, if the error's `:type` is `warp-internal-error` (or a
+descendant), this macro also handles logging the error at a fatal level
+and emitting it as a structured `warp-internal-error` event onto the
+global `warp-event-system`, providing centralized observability for
+critical system failures.
 
 Arguments:
 - `USER-ARGS` (plist): Key-value pairs for `loom-error` fields.
@@ -179,8 +189,8 @@ Arguments:
   `:cause` (another error object), `:details`, `:severity`
   (`:warning`, `:error`, etc.), `:code`.
   Note: If `:data` is provided by the user, the auto-captured Warp
-  context will be merged into it, with user-provided data taking precedence
-  for conflicting keys.
+  context will be merged into it, with user-provided data taking
+  precedence for conflicting keys.
 
 Returns:
 - (loom-error): A new, populated `loom-error` struct, typed as a
@@ -207,14 +217,15 @@ Example:
   ;; Creating and reporting a critical internal error
   (warp:error! :type 'warp-internal-error
                :message \"Event system failed to start core channels.\"
-               :reporter-id \"cluster-my-cluster-id\" ; Critical for internal errors
+               :reporter-id \"cluster-my-cluster-id\"
                :context :init-event-system
                :details some-error-trace)"
   (declare (debug t))
   `(let* (;; 1. Capture Warp-specific context safely.
           (common-warp-context (warp--error-get-common-context))
           (request-warp-context (warp--error-get-request-context))
-          (auto-captured-data (append common-warp-context request-warp-context))
+          (auto-captured-data (append common-warp-context
+                                      request-warp-context))
           ;; 2. Prepare user arguments and merge data.
           (user-args-list (list ,@user-args))
           (existing-user-data (plist-get user-args-list :data))
@@ -243,12 +254,13 @@ Example:
          (let* ((error-data (loom-error-data created-error))
                 (reporter-id (plist-get error-data :reporter-id))
                 (event-system (when (fboundp 'warp:event-system-instance)
-                                (warp:event-system-instance reporter-id)))) 
+                                (warp:event-system-instance reporter-id))))
            (unless reporter-id
              ;; Fallback if reporter-id is missing for internal errors
              (setq reporter-id "unknown-reporter"))
            (warp:log! :fatal reporter-id
-                      "INTERNAL ERROR [%S]: %s (Context: %S, Source: %S, Details: %S)"
+                      "INTERNAL ERROR [%S]: %s (Context: %S, Source: %S, \
+                       Details: %S)"
                       (loom-error-type created-error)
                       (loom-error-message created-error)
                       (plist-get error-data :context)
@@ -256,11 +268,12 @@ Example:
                       (plist-get error-data :details))
            (when event-system
              (warp:emit-event-with-options
+              event-system
               :warp-internal-error
               error-data
               :source-id (or (plist-get error-data :source-id) reporter-id)
               :distribution-scope :global))))
-       created-error))) 
+       created-error)))
 
 (provide 'warp-error)
 ;;; warp-error.el ends here

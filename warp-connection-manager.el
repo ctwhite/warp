@@ -201,7 +201,7 @@ Side Effects:
     (warp:log! :info (warp-cm--log-target cm)
                "Attempting connection to peer '%s' at %s (CB: %S)."
                peer-id address (warp:circuit-breaker-state cb))
-    (braid! (warp:circuit-breaker-execute ; Execute connection attempt via circuit breaker
+    (braid! (warp:circuit-breaker-execute ; Execute connection attempt via CB
              cb
              (lambda ()
                ;; The actual transport connection logic.
@@ -229,9 +229,10 @@ Side Effects:
                            "Failed to connect to '%s': %S" peer-id err)
                 ;; Propagate the rejection with a specific error type.
                 (loom:rejected!
-                 (warp:error! :type 'warp-connection-manager-connection-failed
-                              :message (format "Connection to %s failed." address)
-                              :cause err)))))))
+                 (warp:error!
+                  :type 'warp-connection-manager-connection-failed
+                  :message (format "Connection to %s failed." address)
+                  :cause err)))))))
 
 (defun warp-cm--maintenance-loop (cm)
   "The continuous background loop for the connection manager.
@@ -254,7 +255,8 @@ Arguments:
                  "Running maintenance loop. Checking %d endpoints."
                  (length endpoints-to-check))
       (dolist (endpoint endpoints-to-check)
-        ;; If there's no active connection for this endpoint, try to establish one.
+        ;; If there's no active connection for this endpoint, try to
+        ;; establish one.
         (unless (warp-cm-endpoint-active-connection endpoint)
           (warp:log! :debug (warp-cm--log-target cm)
                      "Endpoint '%s' is not connected. Attempting reconnect."
@@ -262,9 +264,9 @@ Arguments:
           ;; Attempt connection asynchronously. Errors are handled and
           ;; logged internally by `warp-cm--attempt-connection`.
           (braid! (warp-cm--attempt-connection cm endpoint)
-            (:catch (lambda (_err) nil))))) ; Suppress further propagation of this error.
+            (:catch (lambda (_err) nil)))))
       ;; Pause for a short interval before the next check.
-      (loom:delay! 5.0 (loom:continue!))))) ; Check every 5 seconds
+      (loom:delay! 5.0 (loom:continue!)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
@@ -286,8 +288,9 @@ Arguments:
   (e.g., \"Leader RPC CM\"). Defaults to `\"default-cm\"`. Used in
   logging.
 - `:transport-options` (plist, optional): Options passed directly to
-  `warp:transport-connect` for all connections managed by this instance.
-  This is where `ssl-enabled`, `on-data-fn`, etc., are configured.
+  `warp:transport-connect` for all connections managed by this
+  instance. This is where `ssl-enabled`, `on-data-fn`, etc., are
+  configured.
 - `:event-system` (warp-event-system, optional): An instance of
   `warp-event-system`. If provided, the connection manager will emit
   connection status events (e.g., `:peer-connection-ready`,
@@ -298,9 +301,9 @@ Arguments:
   be invoked whenever data is received on any managed connection.
 
 Returns:
-- (warp-cm-manager): A new, configured `warp-connection-manager` instance.
-  It is initially inactive; call `warp:connection-manager-start` to
-  begin its operations."
+- (warp-cm-manager): A new, configured `warp-connection-manager`
+  instance. It is initially inactive; call
+  `warp:connection-manager-start` to begin its operations."
   (let* ((final-transport-options (copy-list transport-options))
          (cm (%%make-cm-manager
               :name (or name "default-cm")
@@ -318,16 +321,21 @@ Returns:
                        (warp-transport-connection-address conn) reason)
             (loom:with-mutex! (warp-cm-manager-lock cm)
               (maphash (lambda (_peer-id endpoint)
-                         (when (eq (warp-cm-endpoint-active-connection endpoint) conn)
-                           ;; If the closed connection matches the active one for this endpoint, clear it.
-                           (setf (warp-cm-endpoint-active-connection endpoint) nil)
+                         (when (eq (warp-cm-endpoint-active-connection endpoint)
+                                   conn)
+                           ;; If the closed connection matches the active one for
+                           ;; this endpoint, clear it.
+                           (setf (warp-cm-endpoint-active-connection endpoint)
+                                 nil)
                            (warp:log! :info (warp-cm--log-target cm)
-                                      "Connection to peer '%s' cleared for reconnect."
+                                      "Connection to peer '%s' cleared for \
+                                       reconnect."
                                       (warp-cm-endpoint-peer-id endpoint))))
                        (warp-cm-manager-endpoints cm)))))
     ;; Set the global data handler for all connections.
     (when on-message-fn
-      (setf (plist-get final-transport-options :on-data-fn) on-message-fn))
+      (setf (plist-get final-transport-options :on-data-fn)
+            on-message-fn))
     cm))
 
 ;;;###autoload
@@ -353,14 +361,16 @@ Side Effects:
 - Sets the `maintenance-loop-thread` field in the manager."
   (loom:with-mutex! (warp-cm-manager-lock cm)
     (when (warp-cm-manager-maintenance-loop-thread cm)
-      (warp:log! :warn (warp-cm--log-target cm) "Maintenance loop already running. Skipping start.")
+      (warp:log! :warn (warp-cm--log-target cm)
+                 "Maintenance loop already running. Skipping start.")
       (cl-return-from warp:connection-manager-start (loom:resolved! t)))
-    (warp:log! :info (warp-cm--log-target cm) "Starting maintenance loop for connections.")
+    (warp:log! :info (warp-cm--log-target cm)
+               "Starting maintenance loop for connections.")
     (let ((loop-thread
            (loom:thread-pool-submit
             (warp:thread-pool-default)
             (lambda () (warp-cm--maintenance-loop cm))
-            nil ; No initial value for the loop
+            nil
             :name (format "%s-cm-loop" (warp-cm-manager-name cm)))))
       (setf (warp-cm-manager-maintenance-loop-thread cm) loop-thread)))
   (loom:resolved! t))
@@ -397,7 +407,8 @@ Side Effects:
       (let ((endpoint (%%make-cm-endpoint :address address :peer-id peer-id)))
         (puthash peer-id endpoint (warp-cm-manager-endpoints cm))
         (warp:log! :info (warp-cm--log-target cm)
-                   "Added endpoint for peer '%s' at %s. Triggering initial connect."
+                   "Added endpoint for peer '%s' at %s. Triggering initial \
+                    connect."
                    peer-id address)
         ;; Trigger an immediate connection attempt. This is asynchronous,
         ;; and its errors are handled internally.
@@ -431,7 +442,7 @@ Side Effects:
         (warp:log! :info (warp-cm--log-target cm)
                    "Closing active connection for removed peer '%s'." peer-id)
         ;; Close the transport connection, `t` means immediate close.
-        (warp:transport-close conn t))
+        (loom:await (warp:transport-close conn t)))
       (warp:log! :info (warp-cm--log-target cm)
                  "Removed endpoint for peer '%s'." peer-id)
       (loom:resolved! t))))
@@ -464,19 +475,21 @@ closes all active connections currently managed by this instance.
 It ensures a clean release of network resources and threads.
 
 Arguments:
-- `CM` (warp-cm-manager): The `warp-connection-manager` instance to shut down.
+- `CM` (warp-cm-manager): The `warp-connection-manager` instance to
+  shut down.
 
 Returns:
 - (loom-promise): A promise that resolves to `t` on successful shutdown
-  after all connections are closed and the background thread is terminated.
-  If the manager is already stopped, the promise resolves immediately.
+  after all connections are closed and the background thread is
+  terminated. If the manager is already stopped, the promise resolves
+  immediately.
 
 Side Effects:
 - Signals the `maintenance-loop-thread` to terminate.
 - Iterates through all registered endpoints and attempts to close their
   active network connections via `warp:transport-close`.
 - Clears the internal `endpoints` hash table.
-- Logs the completion of the shutdown process."
+- Logs the completion of the `shutdown process`."
   (loom:with-mutex! (warp-cm-manager-lock cm)
     (unless (warp-cm-manager-maintenance-loop-thread cm)
       (warp:log! :info (warp-cm--log-target cm)
@@ -487,7 +500,8 @@ Side Effects:
                "Initiating graceful connection manager shutdown.")
 
     ;; Signal the maintenance loop thread to quit. `ignore-errors` is used
-    ;; because the thread might already have exited or be in an un-signalable state.
+    ;; because the thread might already have exited or be in an
+    ;; un-signalable state.
     (when-let (thread (warp-cm-manager-maintenance-loop-thread cm))
       (ignore-errors (thread-signal thread 'quit nil))
       (setf (warp-cm-manager-maintenance-loop-thread cm) nil))
@@ -500,7 +514,8 @@ Side Effects:
                               "Closing connection for peer '%s'."
                               (warp-cm-endpoint-peer-id endpoint))
                    ;; Add the promise from transport-close to our list.
-                   (push (warp:transport-close conn) close-promises)))
+                   (push (loom:await (warp:transport-close conn)) 
+                         close-promises)))
                (warp-cm-manager-endpoints cm))
       ;; Clear the hash table immediately to prevent further operations.
       (clrhash (warp-cm-manager-endpoints cm))

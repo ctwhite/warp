@@ -64,18 +64,18 @@
 ;;; Code:
 
 (require 'cl-lib)
-(require 'loom)  
-(require 'braid) 
+(require 'loom)
+(require 'braid)
 
-(require 'warp-log)             
-(require 'warp-error)           
-(require 'warp-marshal)         
-(require 'warp-pool)            
-(require 'warp-state-machine)   
-(require 'warp-stream)          
-(require 'warp-compress)        
-(require 'warp-crypt)           
-(require 'warp-config)          
+(require 'warp-log)
+(require 'warp-error)
+(require 'warp-marshal)
+(require 'warp-pool)
+(require 'warp-state-machine)
+(require 'warp-stream)
+(require 'warp-compress)
+(require 'warp-crypt)
+(require 'warp-config)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -137,7 +137,7 @@ Signaled when an API call (e.g., `send`, `receive`) is made while
 the connection is not in the required state (e.g., `:connected`)."
   'warp-transport-error
   :current-state t
-  :required-state t) ; Custom fields for more context
+  :required-state t)
 
 (define-error 'warp-unsupported-protocol-operation
   "Protocol does not support this operation.
@@ -195,18 +195,19 @@ precedence hierarchy.
 Fields:
 - `connect-timeout` (float): Timeout in seconds for establishing a
   connection (for `warp:transport-connect`).
-- `send-timeout` (float): Timeout in seconds for a single send operation
-  to complete.
+- `send-timeout` (float): Timeout in seconds for a single send
+  operation to complete.
 - `receive-timeout` (float): Default timeout in seconds for a receive
   operation to wait for an incoming message.
-- `health-check-timeout` (float): Timeout in seconds for a health check
-  ping to receive a response.
-- `shutdown-timeout` (float): Timeout in seconds for a graceful connection
-  shutdown. If exceeded, a forced shutdown may occur.
+- `health-check-timeout` (float): Timeout in seconds for a health
+  check ping to receive a response.
+- `shutdown-timeout` (float): Timeout in seconds for a graceful
+  connection shutdown. If exceeded, a forced shutdown may occur.
 - `max-send-concurrency` (integer): Maximum number of concurrent send
   operations allowed on a single connection. Uses a `loom-semaphore`.
-- `max-retries` (integer): Maximum number of automatic reconnect attempts
-  before giving up on a failed connection. Set to 0 to disable retries.
+- `max-retries` (integer): Maximum number of automatic reconnect
+  attempts before giving up on a failed connection. Set to 0 to disable
+  retries.
 - `initial-backoff` (float): Initial delay (in seconds) for the first
   reconnect attempt. Used in exponential backoff.
 - `backoff-multiplier` (float): Multiplier for exponential backoff
@@ -226,8 +227,8 @@ Fields:
 - `heartbeat-interval` (float): Interval (in seconds) between sending
   heartbeat messages.
 - `heartbeat-timeout` (float): Timeout (in seconds) for a heartbeat
-  response. If a response is not received within this time, it's counted
-  as a missed heartbeat.
+  response. If a response is not received within this time, it's
+  counted as a missed heartbeat.
 - `missed-heartbeat-threshold` (integer): Number of consecutive missed
   heartbeats before the connection is considered failed and dropped.
 - `auto-reconnect-p` (boolean): If `t`, enables automatic reconnection
@@ -321,8 +322,8 @@ Fields:
   received over the wire (before deserialization, etc.).
 - `last-send-time` (float): `float-time` of the most recent successful
   send operation.
-- `last-receive-time` (float): `float-time` of the most recent successful
-  receive operation.
+- `last-receive-time` (float): `float-time` of the most recent
+  successful receive operation.
 - `created-time` (float): `float-time` when this connection object was
   originally created."
   (total-connects 0 :type integer)
@@ -367,7 +368,7 @@ Non-Serializable Fields (runtime objects, not for network transfer):
   buffers deserialized messages received from the transport layer.
   Used when `queue-enabled-p` is true.
 - `serializer` (function): The composed function responsible for
-  serializing, compressing, and encrypting outbound Lisp objects into
+  serializings, compressing, and encrypting outbound Lisp objects into
   raw bytes.
 - `deserializer` (function): The composed function responsible for
   decrypting, decompressing, and deserializing inbound raw bytes into
@@ -386,7 +387,6 @@ Non-Serializable Fields (runtime objects, not for network transfer):
   (id nil :type string)
   (protocol-name nil :type keyword)
   (address nil :type string)
-  ;; --- Non-serializable slots ---
   (raw-connection nil :type t :serializable-p nil)
   (config nil :type (or null transport-config) :serializable-p nil)
   (compression-system nil :type t :serializable-p nil)
@@ -411,16 +411,16 @@ of `warp:deftransport` provide these functions.
 
 Fields:
 - `name` (keyword): The unique keyword for this protocol (e.g., `:tcp`).
-- `matcher-fn` (function): A predicate function `(lambda (address))` that
-  returns `t` if this protocol can handle the given address scheme
+- `matcher-fn` (function): A predicate function `(lambda (address))`
+  that returns `t` if this protocol can handle the given address scheme
   (e.g., checks if `address` starts with \"tcp://\").
 - `address-generator-fn` (function): An optional function
   `(lambda (&key id host))` that generates a default server address
   string suitable for this protocol. Useful for `warp:ipc` or `warp:tcp`.
-- `connect-fn` (function): `(lambda (connection))` -> promise for raw-handle.
-  Establishes an outgoing client connection.
-- `listen-fn` (function): `(lambda (connection))` -> promise for raw-handle.
-  Starts listening for incoming connections as a server.
+- `connect-fn` (function): `(lambda (connection))` -> promise for
+  raw-handle. Establishes an outgoing client connection.
+- `listen-fn` (function): `(lambda (connection))` -> promise for
+  raw-handle. Starts listening for incoming connections as a server.
 - `close-fn` (function): `(lambda (connection force))` -> promise for `t`.
   Closes the raw connection. `force` indicates immediate termination.
 - `send-fn` (function): `(lambda (connection data-bytes))` -> promise for `t`.
@@ -546,7 +546,8 @@ This function applies a three-tiered hierarchy for configuration:
 This ensures flexible and predictable configuration.
 
 Arguments:
-- `PROTOCOL-NAME` (keyword): The name of the protocol being used (e.g., `:tcp`).
+- `PROTOCOL-NAME` (keyword): The name of the protocol being used (e.g.,
+  `:tcp`).
 - `OPTIONS` (plist): User-provided options for this specific connection
   or operation.
 
@@ -567,25 +568,28 @@ Returns: (transport-config): A fully populated and merged
 ;;----------------------------------------------------------------------
 
 (defun warp-transport--find-protocol (address)
-  "Finds a suitable `warp-transport-protocol` implementation for a given `ADDRESS`.
-It iterates through the globally registered protocols and uses their
-`matcher-fn` to determine which protocol can handle the address scheme
-(e.g., \"tcp://\", \"ipc://\").
+  "Finds a suitable `warp-transport-protocol` implementation for a given
+`ADDRESS`. It iterates through the globally registered protocols and
+uses their `matcher-fn` to determine which protocol can handle the
+address scheme (e.g., \"tcp://\", \"ipc://\").
 
 Arguments:
-- `ADDRESS` (string): The connection address string (e.g., \"tcp://localhost:8080\").
+- `ADDRESS` (string): The connection address string (e.g.,
+  \"tcp://localhost:8080\").
 
 Returns:
 - (warp-transport-protocol or nil): The matching protocol struct, or
   `nil` if no registered protocol can handle the address."
   (cl-loop for protocol being the hash-values of warp-transport--registry
-           when (funcall (warp-transport-protocol-matcher-fn protocol) address)
+           when (funcall (warp-transport-protocol-matcher-fn protocol)
+                         address)
            return protocol))
 
 (defun warp-transport--resolve-protocol-impl (context)
-  "Resolves the `warp-transport-protocol` implementation struct from a `CONTEXT`.
-This is a utility function used internally to get the concrete protocol
-functions based on a keyword, an address string, or an existing connection.
+  "Resolves the `warp-transport-protocol` implementation struct from a
+`CONTEXT`. This is a utility function used internally to get the
+concrete protocol functions based on a keyword, an address string, or
+an existing connection.
 
 Arguments:
 - `CONTEXT` (keyword|string|warp-transport-connection): The context to
@@ -594,7 +598,8 @@ Arguments:
   - If `string`, uses `warp-transport--find-protocol`.
   - If `warp-transport-connection`, extracts `protocol-name` and looks up.
 
-Returns: (warp-transport-protocol): The resolved protocol implementation struct.
+Returns: (warp-transport-protocol): The resolved protocol implementation
+  struct.
 
 Signals:
 - `warp-transport-protocol-error`: If no protocol can be found for the
@@ -610,15 +615,17 @@ Signals:
         (t nil))
       (error (warp:error!
               :type 'warp-transport-protocol-error
-              :message (format "No transport protocol found for context: %S" context)
+              :message
+              (format "No transport protocol found for context: %S" context)
               :details `(:available-protocols
                          ,(hash-table-keys warp-transport--registry))))))
 
 (defun warp-transport--call-protocol (context fn-slot &rest args)
-  "Calls a protocol-specific function identified by `FN-SLOT` on the resolved
-`CONTEXT`. This is a generic dispatcher for all low-level transport functions
-defined in `warp-transport-protocol`. It abstracts away the need to
-manually look up the protocol and call its specific implementation.
+  "Calls a protocol-specific function identified by `FN-SLOT` on the
+resolved `CONTEXT`. This is a generic dispatcher for all low-level
+transport functions defined in `warp-transport-protocol`. It abstracts
+away the need to manually look up the protocol and call its specific
+implementation.
 
 Arguments:
 - `CONTEXT`: The context (keyword, address string, or connection) from
@@ -637,10 +644,11 @@ Signals:
     (unless fn
       (signal (warp:error!
                :type 'warp-unsupported-protocol-operation
-               :message (format "Operation '%s' not supported by protocol '%s'."
-                                fn-slot (warp-transport-protocol-name impl))
+               :message
+               (format "Operation '%s' not supported by protocol '%s'."
+                       fn-slot (warp-transport-protocol-name impl))
                :details `(:protocol ,(warp-transport-protocol-name impl)
-                          :operation ,fn-slot))))
+                                    :operation ,fn-slot))))
     (apply fn args)))
 
 ;;----------------------------------------------------------------------
@@ -658,8 +666,8 @@ Arguments:
 
 Returns: (string): A unique identifier for the connection."
   (format "%s://%s#%s" protocol address
-          ;; Append a short SHA256 hash of a random string + timestamp for uniqueness.
-          (substring (secure-hash 'sha256 (format "%s%s" (random) (float-time)))
+          (substring (secure-hash 'sha256 (format "%s%s" (random)
+                                                   (float-time)))
                      0 12)))
 
 (defun warp-transport--create-connection-instance (protocol-name address options)
@@ -670,7 +678,8 @@ send semaphore, and the (de)serialization pipeline (including
 compression and encryption if enabled).
 
 Arguments:
-- `PROTOCOL-NAME` (keyword): The name of the protocol being used (e.g., `:tcp`).
+- `PROTOCOL-NAME` (keyword): The name of the protocol being used (e.g.,
+  `:tcp`).
 - `ADDRESS` (string): The target address for the connection.
 - `OPTIONS` (plist): User-provided configuration options for this
   specific connection instance.
@@ -678,7 +687,8 @@ Arguments:
 Returns: (warp-transport-connection): A new, fully initialized
   connection object, ready to be connected or listened upon."
   (let* ((config (warp-transport--build-config protocol-name options))
-         (conn-id (warp-transport--generate-connection-id protocol-name address))
+         (conn-id (warp-transport--generate-connection-id protocol-name
+                                                          address))
          (metrics (make-warp-transport-metrics :created-time (float-time)))
          (connection
           (make-warp-transport-connection
@@ -686,7 +696,6 @@ Returns: (warp-transport-connection): A new, fully initialized
            :protocol-name protocol-name
            :address address
            :config config
-           ;; Pass an optional compression system instance if provided in options.
            :compression-system (plist-get options :compression-system)
            :metrics metrics))
          (max-sends (warp-transport-config-max-send-concurrency config)))
@@ -696,12 +705,12 @@ Returns: (warp-transport-connection): A new, fully initialized
           (warp:state-machine-create
            :name (format "conn-state-%s" conn-id)
            :initial-state :disconnected
-           ;; Pass connection context to FSM handlers.
            :context `(:connection-id ,conn-id :connection ,connection)
            :on-transition (lambda (ctx old-s new-s event-data)
-                            (warp-transport--handle-state-change
-                             (plist-get ctx :connection)
-                             old-s new-s event-data))
+                            (loom:await ; Await transition handler promises
+                             (warp-transport--handle-state-change
+                              (plist-get ctx :connection)
+                              old-s new-s event-data)))
            :states-list
            '(;; Define allowed state transitions.
              (:disconnected ((:connect . :connecting) (:close . :closing)))
@@ -709,8 +718,7 @@ Returns: (warp-transport-connection): A new, fully initialized
                            (:close . :closing)))
              (:connected ((:close . :closing) (:fail . :error)))
              (:closing ((:success . :closed) (:fail . :error)))
-             (:closed nil) ; Terminal state, no outgoing transitions.
-             ;; Allow reconnect attempts from an `:error` state.
+             (:closed nil)
              (:error ((:connect . :connecting) (:close . :closing))))))
 
     ;; Initialize the semaphore to control concurrent send operations.
@@ -723,14 +731,14 @@ Returns: (warp-transport-connection): A new, fully initialized
           (or (plist-get options :serializer)
               (lambda (obj)
                 (warp:serialize
-                 obj :protocol (warp-transport-config-serialization-protocol
-                                config)))))
+                 obj :protocol
+                 (warp-transport-config-serialization-protocol config)))))
     (setf (warp-transport-connection-deserializer connection)
           (or (plist-get options :deserializer)
               (lambda (data)
                 (warp:deserialize
-                 data :protocol (warp-transport-config-serialization-protocol
-                                 config)))))
+                 data :protocol
+                 (warp-transport-config-serialization-protocol config)))))
 
     ;; Apply optional compression and encryption layers as middleware,
     ;; wrapping the base (de)serializers.
@@ -765,8 +773,9 @@ Side Effects:
              connection warp-transport--active-connections)))
 
 (defun warp-transport--deregister-active-connection (connection)
-  "Removes a connection from the global `warp-transport--active-connections`
-hash table. This is called during the final cleanup of a connection.
+  "Removes a connection from the global
+`warp-transport--active-connections` hash table. This is called
+during the final cleanup of a connection.
 
 Arguments:
 - `CONNECTION` (warp-transport-connection): The connection to deregister.
@@ -783,11 +792,12 @@ Side Effects:
   "Safely runs all functions registered for a given `HOOK-NAME`.
 This function allows external modules to attach callbacks to specific
 transport lifecycle events without directly modifying the core logic.
-Errors within hook functions are logged but do not interrupt the main flow.
+Errors within hook functions are logged but do not interrupt the main
+flow.
 
 Arguments:
-- `HOOK-NAME` (keyword): The name of the hook to run (e.g.,
-  `:connection-established`).
+- `HOOK-NAME` (keyword): A keyword representing the hook point (e.g.,
+  `:connection-established`, `:connection-closed`).
 - `ARGS`: Arbitrary arguments to pass to each hook function.
 
 Returns: `nil`.
@@ -831,24 +841,26 @@ Side Effects:
   (let ((conn-id (warp-transport-connection-id connection)))
     (warp:log! :debug "transport" "Connection %s state: %S -> %S (%s)"
                conn-id old new (or reason "N/A"))
-    (braid! (loom:resolved! nil) ; Start with a resolved promise to chain actions
+    (braid! (loom:resolved! nil)
       (:then (lambda (_)
                ;; Run hooks based on state transition.
                (cond
                  ((and (eq old :connecting) (eq new :connected))
-                  (warp-transport--run-hooks :connection-established
-                                             connection))
+                  (loom:await ; Await hook execution
+                   (warp-transport--run-hooks :connection-established
+                                              connection)))
                  ((eq new :closed)
-                  (warp-transport--run-hooks :connection-closed
-                                             connection reason)))))
+                  (loom:await ; Await hook execution
+                   (warp-transport--run-hooks :connection-closed
+                                              connection reason))))))
       (:then (lambda (_)
                ;; Emit a global event to notify external systems of the state change.
-               (when (fboundp 'warp:emit-event-with-options) ; Check if event system is loaded
+               (when (fboundp 'warp:emit-event-with-options)
                  (warp:emit-event-with-options
                   :transport-state-changed
                   `(:connection-id ,conn-id :old-state ,old :new-state ,new
                     :reason ,reason)
-                  :source-id conn-id :distribution-scope :local)) ; Or :cluster if event broker used
+                  :source-id conn-id :distribution-scope :local))
                t))
       (:catch (lambda (err)
                 (warp:log! :error "transport"
@@ -869,8 +881,8 @@ updates connection metrics, runs `connection-failed` hooks, and (if
 auto-reconnect is enabled and error is transient) schedules a retry.
 
 Arguments:
-- `CONNECTION` (warp-transport-connection): The connection that experienced
-  the error.
+- `CONNECTION` (warp-transport-connection): The connection that
+  experienced the error.
 - `ERROR` (t): The raw error object from the failed operation.
 
 Returns: (loom-promise): A promise resolving after handling the error.
@@ -887,7 +899,8 @@ Side Effects:
          (sm (warp-transport-connection-state-machine connection)))
     (cl-incf (warp-transport-metrics-total-failures metrics))
     (warp:log! :error "transport" "Connection %s error: %S" conn-id error)
-    (warp-transport--run-hooks :connection-failed connection error)
+    (loom:await ; Await hook execution
+     (warp-transport--run-hooks :connection-failed connection error))
 
     (braid! (warp:state-machine-emit sm :fail (format "Error: %S" error))
       (:finally
@@ -898,7 +911,8 @@ Side Effects:
                     (not (memq (loom-error-type error)
                                '('warp-transport-protocol-error
                                  'warp-transport-security-error))))
-           (warp-transport--schedule-reconnect connection)))))))
+           (loom:await ; Await scheduled reconnect
+            (warp-transport--schedule-reconnect connection))))))))
 
 (defun warp-transport--schedule-reconnect (connection)
   "Schedules a reconnection attempt for a failed connection with exponential
@@ -922,7 +936,6 @@ Side Effects:
          (base (warp-transport-config-initial-backoff config))
          (multiplier (warp-transport-config-backoff-multiplier config))
          (max-backoff (warp-transport-config-max-backoff config))
-         ;; Calculate exponential backoff, capped by `max-backoff`.
          (delay (min (* base (expt multiplier attempts)) max-backoff))
          (conn-id (warp-transport-connection-id connection))
          (sm (warp-transport-connection-state-machine connection)))
@@ -932,7 +945,6 @@ Side Effects:
           (warp:log! :info "transport"
                      "Scheduling reconnect for %s in %.1fs (attempt %d/%d)."
                      conn-id delay (1+ attempts) max-retries)
-          ;; Use `run-at-time` for delayed, one-shot execution.
           (run-at-time delay nil #'warp-transport--attempt-reconnect
                        connection))
       (progn
@@ -961,7 +973,6 @@ Side Effects:
 - Resets `reconnect-attempts` on success.
 - Transitions connection's state machine."
   (let ((address (warp-transport-connection-address connection))
-        ;; Pass the full configuration plist to the new connect call.
         (config-plist (cl-struct-to-plist
                        (warp-transport-connection-config connection)))
         (conn-id (warp-transport-connection-id connection)))
@@ -1013,7 +1024,8 @@ Side Effects:
          (interval (warp-transport-config-heartbeat-interval config)))
     (when (and (warp-transport-config-heartbeat-enabled-p config)
                (> interval 0))
-      (warp:log! :debug "transport" "Starting heartbeat for %s (interval: %.1fs)."
+      (warp:log! :debug "transport"
+                 "Starting heartbeat for %s (interval: %.1fs)."
                  (warp-transport-connection-id connection) interval)
       (setf (warp-transport-connection-heartbeat-timer connection)
             (run-at-time interval interval #'warp-transport--send-heartbeat
@@ -1080,7 +1092,8 @@ Arguments:
   underlying transport protocol.
 
 Returns: (loom-promise): A promise resolving to the deserialized
-  application message, or `nil` for heartbeats. Rejects on processing errors.
+  application message, or `nil` for heartbeats. Rejects on processing
+  errors.
 
 Side Effects:
 - Updates `total-receives` and `total-bytes-received` metrics.
@@ -1092,12 +1105,12 @@ Side Effects:
          (stream (warp-transport-connection-message-stream connection))
          (metrics (warp-transport-connection-metrics connection)))
     (braid! (funcall deserializer raw-data) ; Apply decryption, decompression, deserialization
-      (:let ((message <>)) ; Bind the deserialized Lisp object to `<>`.
+      (:let ((message <>))
         (if (and (plistp message) (eq (plist-get message :type) :heartbeat))
             (progn
               (warp:log! :trace "transport" "Received heartbeat from %s."
                          conn-id)
-              (loom:resolved! nil)) ; Don't forward heartbeats to message stream.
+              (loom:resolved! nil))
           (progn
             ;; Update metrics for received application data.
             (cl-incf (warp-transport-metrics-total-receives metrics))
@@ -1105,20 +1118,24 @@ Side Effects:
                      (length raw-data))
             (setf (warp-transport-metrics-last-receive-time metrics)
                   (float-time))
-            ;; Write the message to the connection's inbound stream if queueing is enabled.
+            ;; Write the message to the connection's inbound stream if
+            ;; queueing is enabled.
             (if stream
                 (braid! (warp:stream-write stream message)
-                  (:then (lambda (_) message)) ; Forward the message.
+                  (:then (lambda (_) message))
                   (:catch (lambda (err)
                             (warp:log! :error "transport"
-                                       "Failed to write message to stream for %s: %S"
+                                       "Failed to write message to stream for \
+                                        %s: %S"
                                        conn-id err)
-                            (warp-transport--handle-error connection
-                                                          (warp:error!
-                                                           :type 'warp-transport-queue-error
-                                                           :message "Inbound queue error."
-                                                           :cause err))
-                            (loom:resolved! nil)))) ; Resolve to nil to continue.
+                            (loom:await ; Await error handling
+                             (warp-transport--handle-error
+                              connection
+                              (warp:error!
+                               :type 'warp-transport-queue-error
+                               :message "Inbound queue error."
+                               :cause err)))
+                            (loom:resolved! nil))))
               (progn
                 (warp:log! :warn "transport"
                            "No message stream for %s. Incoming message dropped: %S."
@@ -1130,13 +1147,14 @@ Side Effects:
          (let ((wrapped-err
                 (warp:error!
                  :type 'warp-transport-protocol-error
-                 :message (format "Incoming message processing failed for %s: %S"
-                                  conn-id err)
+                 :message
+                 (format "Incoming message processing failed for %s: %S"
+                         conn-id err)
                  :cause err)))
            (warp:log! :error "transport"
                       "Message processing failed for %s: %S" conn-id err)
-           (warp-transport--handle-error connection wrapped-err)
-           (loom:resolved! nil))))))) ; Resolve to nil to not break the upstream bridge loop.
+           (loom:await (warp-transport--handle-error connection wrapped-err)) ; Await error handler
+           (loom:rejected! nil))))))
 
 ;;----------------------------------------------------------------------
 ;;; Connection Cleanup
@@ -1162,15 +1180,16 @@ Side Effects:
     (warp-transport--stop-heartbeat connection)
     (when-let (stream (warp-transport-connection-message-stream connection))
       (warp:log! :debug "transport" "Closing message stream for %s." conn-id)
-      (warp:stream-close stream))
+      (loom:await (warp:stream-close stream))) ; Await stream close
     ;; Execute any protocol-specific cleanup functions.
     (dolist (cleanup-fn (warp-transport-connection-cleanup-functions
-                          connection))
+                         connection))
       (condition-case err
           (funcall cleanup-fn)
         (error (warp:error!
                 :type 'warp-internal-error
-                :message (format "Cleanup fn failed for %s: %S" conn-id err)
+                :message
+                (format "Cleanup fn failed for %s: %S" conn-id err)
                 :cause err))))))
 
 ;;----------------------------------------------------------------------
@@ -1178,14 +1197,14 @@ Side Effects:
 ;;----------------------------------------------------------------------
 
 (defun warp-transport--pooled-conn-factory-fn (resource internal-pool)
-  "Factory function for `warp-pool` to create a new pooled `warp-transport-connection`.
-This function is invoked by `warp-pool` when it needs to create a new
-connection to add to the pool (e.g., to meet `min-connections` or handle
-demand). It uses `warp-transport--initiate-operation` to establish the
-actual connection.
+  "Factory function for `warp-pool` to create a new pooled
+`warp-transport-connection`. This function is invoked by `warp-pool`
+when it needs to create a new connection to add to the pool (e.g., to
+meet `min-connections` or handle demand). It uses
+`warp-transport--initiate-operation` to establish the actual connection.
 
 Arguments:
-- `resource` (warp-pool-resource): The resource object provided by the pool.
+- `resource` (warp-pool-resource): The resource shell to populate.
   Its `id` corresponds to the connection ID to be created.
 - `internal-pool` (warp-pool): The pool instance itself, whose context
   contains the connection `address` and `options`.
@@ -1198,35 +1217,37 @@ Returns: (loom-promise): A promise that resolves to the newly created
     (warp:log! :debug "transport-pool"
                "Creating new pooled connection for %s (pool %s)."
                address (warp-pool-name internal-pool))
-    ;; Connect, but disable pooling recursively for this internal connect call
-    ;; to prevent infinite recursion if `warp:transport-connect` is called
-    ;; by the factory.
+    ;; Connect, but disable pooling recursively for this internal connect
+    ;; call to prevent infinite recursion if `warp:transport-connect` is
+    ;; called by the factory.
     (braid! (apply #'warp-transport--initiate-operation
                    address :connect 'connect-fn
                    (plist-put options :pool-config nil))
       (:then (lambda (conn)
-               ;; Mark the connection as belonging to this pool for later identification.
+               ;; Mark the connection as belonging to this pool for later
+               ;; identification.
                (setf (warp-transport-connection-connection-pool-id conn)
                      (warp-pool-name internal-pool))
                conn)))))
 
 (defun warp-transport--pooled-conn-validator-fn (resource _internal-pool)
-  "Validator function for `warp-pool` to check the health of a pooled connection.
-This function is invoked by `warp-pool` before returning an existing
-connection from the pool. It uses `warp:transport-health-check` to
-verify the connection's liveness. If the connection is unhealthy,
+  "Validator function for `warp-pool` to check the health of a pooled
+connection. This function is invoked by `warp-pool` before returning an
+existing connection from the pool. It uses `warp:transport-health-check`
+to verify the connection's liveness. If the connection is unhealthy,
 it will be removed from the pool.
 
 Arguments:
-- `resource` (warp-pool-resource): The resource (a `warp-transport-connection`)
-  to validate.
+- `resource` (warp-pool-resource): The resource (a
+  `warp-transport-connection`) to validate.
 - `_internal-pool` (warp-pool): The pool instance (unused directly).
 
-Returns: (loom-promise): A promise that resolves to `t` if the connection
-  is healthy, or rejects if it's unhealthy or the health check fails.
-  A rejection signals the pool to destroy this resource."
+Returns: (loom-promise): A promise that resolves to `t` if the
+  connection is healthy, or rejects if it's unhealthy or the health
+  check fails. A rejection signals the pool to destroy this resource."
   (let ((connection (warp-pool-resource-handle resource)))
-    (warp:log! :debug "transport-pool" "Validating pooled connection %s."
+    (warp:log! :debug "transport-pool"
+               "Validating pooled connection %s."
                (warp-transport-connection-id connection))
     (braid! (warp:transport-health-check connection)
       (:then (lambda (is-healthy)
@@ -1245,13 +1266,13 @@ Returns: (loom-promise): A promise that resolves to `t` if the connection
 (defun warp-transport--pooled-conn-destructor-fn (resource _internal-pool)
   "Destructor function for `warp-pool` to cleanly close a pooled connection.
 This function is invoked by `warp-pool` when a connection is removed
-from the pool (e.g., due to idle timeout, health check failure, or pool
-shutdown). It ensures all resources associated with the connection are
-properly cleaned up.
+from the pool (e.g., due to idle timeout, health check failure, or
+pool shutdown). It ensures all resources associated with the connection
+are properly cleaned up.
 
 Arguments:
-- `resource` (warp-pool-resource): The resource (a `warp-transport-connection`)
-  to destroy.
+- `resource` (warp-pool-resource): The resource (a
+  `warp-transport-connection`) to destroy.
 - `_internal-pool` (warp-pool): The pool instance (unused).
 
 Returns: (loom-promise): A promise resolving when the connection is closed."
@@ -1261,13 +1282,14 @@ Returns: (loom-promise): A promise resolving when the connection is closed."
     ;; Perform general connection resource cleanup.
     (warp-transport--cleanup-connection-resources connection)
     ;; Force close the underlying raw connection, as it's no longer pooled.
-    (warp:transport-close connection t)))
+    (loom:await (warp:transport-close connection t))))
 
 (defun warp-transport--pooled-conn-executor-fn (task resource internal-pool)
   "Executor that 'lends out' the connection to a submitted task.
 This function defines how `warp-pool` hands out a connection to a client
 task and how it retrieves the connection back after the task is done.
-The connection is returned to the pool once the client task's promise resolves.
+The connection is returned to the pool once the client task's promise
+resolves.
 
 Arguments:
 - `task` (loom-task): The task requesting the connection.
@@ -1277,15 +1299,15 @@ Arguments:
 Returns: (loom-promise): A promise resolving with the connection object."
   (let ((connection (warp-pool-resource-handle resource)))
     (warp:log! :debug "transport-pool" "Lending conn %s to task %s."
-               (warp-transport-connection-id connection) (loom-task-id task))
+               (warp-transport-connection-id connection) (warp-task-id task))
     ;; When the task's promise resolves (meaning the client is done with
     ;; the connection), the connection is returned to the pool. This is a
     ;; crucial part of `warp-pool`'s resource management.
-    (loom:then (loom-task-promise task)
+    (loom:then (warp-task-promise task)
                (lambda (_result)
                  (warp:log! :debug "transport-pool"
                             "Task %s done with conn %s. Returning to pool."
-                            (loom-task-id task)
+                            (warp-task-id task)
                             (warp-transport-connection-id connection))
                  ;; Submit a task to the pool to return the resource.
                  (loom:await (warp:pool-submit internal-pool (lambda () nil)
@@ -1342,7 +1364,7 @@ Side Effects:
                                   pool-config)
                                 :context (list :address address
                                                :options options))
-                        :config-options
+                        :internal-config
                         `(:min-resources
                           ,(warp-transport-pool-config-min-connections
                             pool-config)
@@ -1352,7 +1374,7 @@ Side Effects:
                           :idle-timeout
                           ,(warp-transport-pool-config-idle-timeout
                             pool-config)
-                          :polling-interval 5.0)))) ; Internal polling interval for pool management
+                          :polling-interval 5.0)))) ; Assuming polling-interval is part of internal-config
                   ;; Register the newly created pool in the global registry.
                   (loom:with-mutex! warp-transport--registry-lock
                     (puthash pool-id new-pool
@@ -1364,14 +1386,16 @@ Side Effects:
 This function orchestrates the common steps for both client connections
 and server listeners: finding the right protocol, creating a connection
 instance, initiating the state machine, and calling the protocol-specific
-`connect-fn` or `listen-fn`. It includes timeout handling and error propagation.
+`connect-fn` or `listen-fn`. It includes timeout handling and error
+propagation.
 
 Arguments:
 - `ADDRESS` (string): The target address for the operation.
 - `OP-TYPE` (keyword): The type of operation (e.g., `:connect`, `:listen`).
-- `FN-SLOT` (symbol): The protocol function slot to call (e.g., `'connect-fn`,
-  `'listen-fn`).
-- `OPTIONS` (plist): The user-provided configuration plist for this operation.
+- `FN-SLOT` (symbol): The protocol function slot to call (e.g.,
+  `'connect-fn`, `'listen-fn`).
+- `OPTIONS` (plist): The user-provided configuration plist for this
+  operation.
 
 Returns: (loom-promise): A promise resolving to the new
   `warp-transport-connection` object once the operation is successfully
@@ -1379,15 +1403,17 @@ Returns: (loom-promise): A promise resolving to the new
 
 Side Effects:
 - Creates a `warp-transport-connection` instance.
-- Transitions its state machine (`:disconnected` -> `:connecting` -> `:connected`).
+- Transitions its state machine (`:disconnected` -> `:connecting` ->
+  `:connected`).
 - Registers the connection in `warp-transport--active-connections`.
 - Starts heartbeats if `OP-TYPE` is `:connect` and heartbeats are enabled."
   (let* ((protocol (warp-transport--find-protocol address))
          (_ (unless protocol
               (signal (warp:error!
                        :type 'warp-transport-protocol-error
-                       :message (format "No protocol found for address: %s"
-                                        address)))))
+                       :message
+                       (format "No protocol found for address: %s"
+                               address)))))
          (conn (warp-transport--create-connection-instance
                 (warp-transport-protocol-name protocol) address options))
          (config (warp-transport-connection-config conn))
@@ -1396,12 +1422,12 @@ Side Effects:
                op-type address (warp-transport-protocol-name protocol)
                (warp-transport-connection-id conn))
 
-    (braid! (warp:state-machine-emit sm :connect ; Transition to connecting state
-                                      (format "Initiating %s." op-type))
+    (braid! (warp:state-machine-emit sm :connect
+                                     (format "Initiating %s." op-type))
       (:then (lambda (_)
                ;; Call the protocol-specific connect/listen function.
                (warp-transport--call-protocol conn fn-slot conn)))
-      (:timeout (warp-transport-config-connect-timeout config)) ; Apply connection timeout
+      (:timeout (warp-transport-config-connect-timeout config))
       (:then
        (lambda (raw-handle)
          ;; On successful raw connection establishment:
@@ -1420,18 +1446,18 @@ Side Effects:
          (warp:log! :info "transport" "%s successful for %s (Conn ID: %s)."
                     (s-capitalize (symbol-name op-type)) address
                     (warp-transport-connection-id conn))
-         conn)) ; Return the fully established connection object.
+         conn))
       (:catch
        (lambda (err)
          ;; Handle any errors during connection/listen setup.
          (let ((op-name (s-capitalize (symbol-name op-type))))
            (warp:log! :error "transport" "%s failed for %s (Conn ID: %s): %S"
                       op-name address (warp-transport-connection-id conn) err)
-           (warp-transport--handle-error conn err) ; Use generic error handler
+           (loom:await (warp-transport--handle-error conn err)) ; Await error handling
            (loom:rejected!
             (warp:error! :type 'warp-transport-connection-error
                          :message (format "%s failed: %S" op-name err)
-                         :cause err)))))
+                         :cause err))))
       (:timeout
        (lambda ()
          ;; Handle connection/listen timeout specifically.
@@ -1442,10 +1468,11 @@ Side Effects:
                                   config)
                                  address
                                  (warp-transport-connection-id conn)))
-                (err-obj (warp:error! :type 'warp-transport-timeout-error
-                                      :message err-msg)))
+                (err-obj (warp:error!
+                          :type 'warp-transport-timeout-error
+                          :message err-msg)))
            (warp:log! :error "transport" "%s" err-msg)
-           (warp-transport--handle-error conn err-obj)
+           (loom:await (warp-transport--handle-error conn err-obj)) ; Await error handler
            (loom:rejected! err-obj)))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -1458,24 +1485,26 @@ Side Effects:
 ;;;###autoload
 (defun warp:transport-configure (protocol-name &rest options)
   "Sets default configuration values for a specific transport protocol.
-These settings act as overrides to the global `transport-config` defaults
-and are applied when a connection is created for this `protocol-name`,
-unless further overridden by `warp:transport-connect` or `listen` options.
+These settings act as overrides to the global `transport-config`
+defaults and are applied when a connection is created for this
+`protocol-name`, unless further overridden by `warp:transport-connect`
+or `listen` options.
 
 Example:
   (warp:transport-configure :tcp
-    :connect-timeout 60.0    ; Long-lived TCP connections might need longer timeouts
-    :auto-reconnect-p t      ; Enable auto-reconnect for TCP by default
-    :max-retries 10          ; Allow up to 10 retries
-    :heartbeat-enabled-p t)  ; Enable heartbeats for TCP to detect dead connections
+    :connect-timeout 60.0
+    :auto-reconnect-p t
+    :max-retries 10
+    :heartbeat-enabled-p t)
 
 Arguments:
-- `PROTOCOL-NAME` (keyword): The protocol to configure (e.g., `:tcp`, `:pipe`).
-- `OPTIONS` (plist): A plist of `transport-config` keys and values to set as
-  defaults for this protocol.
+- `PROTOCOL-NAME` (keyword): The protocol to configure (e.g., `:tcp`,
+  `:pipe`).
+- `OPTIONS` (plist): A plist of `transport-config` keys and values to
+  set as defaults for this protocol.
 
-Returns: (plist): The new effective default configuration for the protocol
-  as a plist (useful for inspection).
+Returns: (plist): The new effective default configuration for the
+  protocol as a plist (useful for inspection).
 
 Side Effects:
 - Modifies the internal `warp-transport--protocol-configs` registry
@@ -1494,9 +1523,9 @@ Side Effects:
 ;;;###autoload
 (defun warp:transport-add-hook (hook-name function)
   "Adds a `FUNCTION` to a transport lifecycle hook.
-Hook functions provide a way for external modules to react to important
-connection events without modifying the core transport logic. Multiple
-functions can be registered for the same hook.
+Hook functions provide a way for external modules to attach callbacks
+to specific transport lifecycle events without directly modifying the
+core logic. Multiple functions can be registered for the same hook.
 
 Available hooks:
 - `:connection-established`: Runs asynchronously when a connection
@@ -1505,19 +1534,20 @@ Available hooks:
 - `:connection-closed`: Runs asynchronously when a connection transitions
   to the `:closed` state (either gracefully or due to exhaustion of
   retries). Receives `connection` and a `reason` string.
-- `:connection-failed`: Runs asynchronously when a connection error occurs
-  (e.g., `send` fails, `receive` errors). Receives `connection` and
-  the `error` object.
+- `:connection-failed`: Runs asynchronously when a connection error
+  occurs (e.g., `send` fails, `receive` errors). Receives `connection`
+  and the `error` object.
 
 Arguments:
 - `HOOK-NAME` (keyword): The name of the hook.
-- `FUNCTION` (function): The function (lambda or symbol) to add to the hook.
-  Its arguments must match the hook's signature.
+- `FUNCTION` (function): The function (lambda or symbol) to add to the
+  hook. Its arguments must match the hook's signature.
 
 Returns: The `FUNCTION`.
 
 Side Effects:
-- Modifies the internal `warp-transport--hooks` registry under a mutex lock."
+- Modifies the internal `warp-transport--hooks` registry under a
+  mutex lock."
   (loom:with-mutex! warp-transport--registry-lock
     (let ((current-hooks (gethash hook-name warp-transport--hooks)))
       (add-to-list 'current-hooks function)
@@ -1534,7 +1564,8 @@ Arguments:
 Returns: The removed `FUNCTION` or `nil` if not found.
 
 Side Effects:
-- Modifies the internal `warp-transport--hooks` registry under a mutex lock."
+- Modifies the internal `warp-transport--hooks` registry under a
+  mutex lock."
   (loom:with-mutex! warp-transport--registry-lock
     (puthash hook-name
              (remove function (gethash hook-name warp-transport--hooks))
@@ -1553,8 +1584,8 @@ It takes a unique name and a plist of functions implementing the
 `warp-transport-protocol` interface.
 
 Arguments:
-- `NAME` (keyword): A unique name for the protocol (e.g., `:tcp`, `:pipe`,
-  `:websocket`).
+- `NAME` (keyword): A unique name for the protocol (e.g., `:tcp`,
+  `:pipe`, `:websocket`).
 - `OPTIONS` (plist): Keyword-function pairs defining the protocol's
   implementation (e.g., `:matcher-fn`, `:connect-fn`, `:send-fn`).
   All functions defined in `warp-transport-protocol` should be provided
@@ -1574,11 +1605,12 @@ Side Effects:
 
 ;;;###autoload
 (defun warp:transport-generate-server-address (protocol &key id host)
-  "Generates a default server address string suitable for the given `PROTOCOL`.
-This is a generic way for higher-level components (like `warp-cluster`
-or `warp-channel`) to create a suitable listening address without
-needing to know the specifics of the protocol's address format. For
-example, a `:pipe` protocol might generate `\"ipc:///tmp/my-app-id\"`.
+  "Generates a default server address string suitable for the given
+`PROTOCOL`. This is a generic way for higher-level components (like
+`warp-cluster` or `warp-channel`) to create a suitable listening
+address without needing to know the specifics of the protocol's
+address format. For example, a `:pipe` protocol might generate
+`\"ipc:///tmp/my-app-id\"`.
 
 Arguments:
 - `PROTOCOL` (keyword): The protocol for which to generate an address.
@@ -1599,8 +1631,10 @@ Signals:
                         proto-impl)))
     (unless generator-fn
       (signal (warp:error! :type 'warp-unsupported-protocol-operation
-                            :message (format "Protocol %S does not support address generation."
-                                             protocol))))
+                           :message
+                           (format "Protocol %S does not support address \
+                                    generation."
+                                   protocol))))
     (funcall generator-fn :id id :host host)))
 
 ;;----------------------------------------------------------------------
@@ -1611,17 +1645,17 @@ Signals:
 (defun warp:transport-connect (address &rest options)
   "Establishes an outgoing client connection to `ADDRESS`.
 This is the primary way for client code to initiate a connection.
-It automatically resolves the correct protocol based on the `ADDRESS` scheme.
-If a `:pool-config` is provided in `OPTIONS`, the connection will be
-acquired from or managed by a connection pool. Otherwise, a direct,
-single-use connection is established.
+It automatically resolves the correct protocol based on the `ADDRESS`
+scheme. If a `:pool-config` is provided in `OPTIONS`, the connection
+will be acquired from or managed by a connection pool. Otherwise, a
+direct, single-use connection is established.
 
 Arguments:
 - `ADDRESS` (string): The full network address of the remote endpoint
   (e.g., `\"tcp://server.com:8080\"`, `\"ipc:///tmp/socket\"`).
-- `OPTIONS` (plist): Configuration options for the connection and/or pool.
-  These override protocol-specific and global defaults. Key options
-  include those from `transport-config` and `transport-pool-config`.
+- `OPTIONS` (plist): Configuration options for the connection and/or
+  pool. These override protocol-specific and global defaults. Key
+  options include those from `transport-config` and `transport-pool-config`.
   - `:pool-config` (plist or `warp-transport-pool-config`, optional):
     If provided, requests a connection from a pool. Can be a plist of
     options for `make-transport-pool-config` or an existing struct.
@@ -1633,23 +1667,25 @@ Returns: (loom-promise): A promise resolving to a fully established
 Side Effects:
 - Initiates network communication.
 - May create a new connection pool if one doesn't exist for the address.
-- Registers the connection (if not pooled) in `warp-transport--active-connections`."
+- Registers the connection (if not pooled) in
+  `warp-transport--active-connections`."
   (if-let (pool-config-opt (plist-get options :pool-config))
       ;; --- Pooled Connection Path ---
       (let* ((pool-cfg (if (cl-typep pool-config-opt
-                                      'warp-transport-pool-config)
+                                     'warp-transport-pool-config)
                            pool-config-opt
                          (apply #'make-transport-pool-config
                                 pool-config-opt)))
              (timeout (warp-transport-pool-config-pool-timeout pool-cfg))
-             ;; Remove pool-specific options before passing to actual connection init.
+             ;; Remove pool-specific options before passing to actual
+             ;; connection init.
              (conn-options (let ((opts (copy-list options)))
                              (remf opts :pool-config)
                              opts)))
         (warp:log! :debug "transport"
                    "Acquiring pooled connection for %s (pool timeout: %.1fs)."
                    address timeout)
-        (braid! (warp-transport--get-or-create-connection-pool ; Get or create pool.
+        (braid! (warp-transport--get-or-create-connection-pool
                  address pool-cfg conn-options)
           (:then
            (lambda (internal-pool)
@@ -1669,18 +1705,21 @@ Side Effects:
                 ((cl-typep err 'loom-timeout-error)
                  (warp:error!
                   :type 'warp-transport-pool-timeout-error
-                  :message (format "Connection pool request timed out for %s: %S"
-                                   address (loom-error-message err))
+                  :message
+                  (format "Connection pool request timed out for %s: %S"
+                          address (loom-error-message err))
                   :cause err))
                 ((cl-typep err 'warp-pool-exhausted-error)
                  (warp:error!
                   :type 'warp-transport-pool-exhausted-error
-                  :message (format "Connection pool exhausted for %s: %S"
-                                   address (loom-error-message err))
+                  :message
+                  (format "Connection pool exhausted for %s: %S"
+                          address (loom-error-message err))
                   :cause err))
                 (t err)))))))
     ;; --- Direct Connection Path ---
-    ;; If no pool configuration is provided, establish a direct, non-pooled connection.
+    ;; If no pool configuration is provided, establish a direct,
+    ;; non-pooled connection.
     (apply #'warp-transport--initiate-operation
            address :connect 'connect-fn options)))
 
@@ -1691,7 +1730,8 @@ This function makes the current Emacs instance act as a server,
 accepting incoming connections on the given address. The returned
 `warp-transport-connection` represents the listener itself, not an
 individual client connection. Incoming client connections will be
-handled by callbacks configured in `transport-options` (e.g., `:on-connect-fn`).
+handled by callbacks configured in `transport-options` (e.g.,
+`:on-connect-fn`).
 
 Arguments:
 - `ADDRESS` (string): The local address to listen on (e.g.,
@@ -1707,7 +1747,8 @@ Returns: (loom-promise): A promise resolving to a `warp-transport-connection`
 
 Side Effects:
 - Initiates network listening.
-- Registers the listener connection in `warp-transport--active-connections`."
+- Registers the listener connection in
+  `warp-transport--active-connections`."
   (apply #'warp-transport--initiate-operation
          address :listen 'listen-fn options))
 
@@ -1731,7 +1772,8 @@ Returns: (loom-promise): A promise resolving to `t` on successful send.
 
 Signals:
 - `warp-transport-invalid-state`: If connection is not in `:connected` state.
-- `warp-transport-connection-error`: If the underlying protocol `send-fn` fails.
+- `warp-transport-connection-error`: If the underlying protocol `send-fn`
+  fails.
 - `warp-transport-timeout-error`: If the send operation times out
   (`send-timeout`)."
   (let ((current-state (warp:state-machine-current-state
@@ -1741,8 +1783,10 @@ Signals:
     (unless (eq current-state :connected)
       (signal (warp:error!
                :type 'warp-transport-invalid-state
-               :message (format "Cannot send on connection %s: not in :connected state (current: %S)."
-                                conn-id current-state)
+               :message
+               (format "Cannot send on connection %s: not in :connected \
+                        state (current: %S)."
+                       conn-id current-state)
                :current-state current-state
                :required-state :connected))))
 
@@ -1750,15 +1794,15 @@ Signals:
          (sem (warp-transport-connection-send-semaphore connection))
          (serializer (warp-transport-connection-serializer connection))
          (metrics (warp-transport-connection-metrics connection)))
-    (braid! (funcall serializer message) ; First, serialize the message.
-      (:let ((raw-data <>) ; Bind the raw bytes.
+    (braid! (funcall serializer message)
+      (:let ((raw-data <>)
              (byte-size (length <>)))
         ;; Acquire a permit from the semaphore to limit send concurrency.
         (loom:semaphore-with-permit sem
           ;; Call the protocol's send function with the raw data.
           (warp-transport--call-protocol connection 'send-fn
                                          connection raw-data))
-        (:timeout (warp-transport-config-send-timeout config)) ; Apply send timeout.
+        (:timeout (warp-transport-config-send-timeout config))
         (:then
          (lambda (result)
            ;; Update send metrics on success. `result` might be bytes sent.
@@ -1767,15 +1811,16 @@ Signals:
                     (if (numberp result) result byte-size))
            (setf (warp-transport-metrics-last-send-time metrics)
                  (float-time))
-           t)) ; Resolve with `t` on successful send.
+           t))
         (:catch
          (lambda (err)
            ;; Handle errors during the raw send operation.
-           (warp-transport--handle-error connection err)
+           (loom:await (warp-transport--handle-error connection err))
            (loom:rejected!
             (warp:error! :type 'warp-transport-connection-error
                          :message (format "Send failed for %s: %S"
-                                          (warp-transport-connection-id connection) err)
+                                          (warp-transport-connection-id connection)
+                                          err)
                          :cause err))))
         (:timeout
          (lambda ()
@@ -1788,15 +1833,16 @@ Signals:
                             :type 'warp-transport-timeout-error
                             :message err-msg)))
              (warp:log! :error "transport" "%s" err-msg)
-             (warp-transport--handle-error connection err-obj)
+             (loom:await (warp-transport--handle-error conn err-obj))
              (loom:rejected! err-obj))))))))
 
 ;;;###autoload
 (defun warp:transport-receive (connection &optional timeout)
   "Receives a message from `CONNECTION`'s internal inbound message stream.
 This function retrieves a deserialized Lisp object that was previously
-received from the network and buffered in the connection's `message-stream`.
-It is typically used by client code that wants to consume incoming data.
+received from the network and buffered in the connection's
+`message-stream`. It is typically used by client code that wants to
+consume incoming data.
 
 Arguments:
 - `CONNECTION` (`warp-transport-connection`): The connection from which to
@@ -1813,7 +1859,8 @@ Signals:
 - `warp-transport-error`: If the connection has no message stream enabled
   (`queue-enabled-p` is `nil` in config).
 - `loom-timeout-error`: If no message is available within the `TIMEOUT`.
-- `warp-transport-connection-error`: If the underlying stream closes or errors."
+- `warp-transport-connection-error`: If the underlying stream closes or
+  errors."
   (let ((current-state (warp:state-machine-current-state
                          (warp-transport-connection-state-machine connection)))
         (conn-id (warp-transport-connection-id connection)))
@@ -1821,8 +1868,10 @@ Signals:
     (unless (eq current-state :connected)
       (signal (warp:error!
                :type 'warp-transport-invalid-state
-               :message (format "Cannot receive on connection %s: not in :connected state (current: %S)."
-                                conn-id current-state)
+               :message
+               (format "Cannot receive on connection %s: not in :connected \
+                        state (current: %S)."
+                       conn-id current-state)
                :current-state current-state
                :required-state :connected))))
 
@@ -1833,30 +1882,33 @@ Signals:
     (unless stream
       (signal (warp:error!
                :type 'warp-transport-error
-               :message (format (concat "No message stream for connection %s. "
-                                        "Enable :queue-enabled-p in config to receive messages.")
-                                conn-id))))
+               :message
+               (format (concat "No message stream for connection %s. "
+                               "Enable :queue-enabled-p in config to receive \
+                                messages.")
+                       conn-id))))
 
     (braid! (warp:stream-read
              stream
-             ;; Use a cancel token with timeout to make stream-read awaitable.
              :cancel-token (loom:make-cancel-token :timeout actual-timeout))
       (:then
        (lambda (msg)
-         (if (eq msg :eof) ; `warp-stream-read` returns :eof if stream is closed.
+         (if (eq msg :eof)
              (progn
                (warp:log! :warn "transport"
-                          "Message stream for %s closed unexpectedly." conn-id)
+                          "Message stream for %s closed unexpectedly."
+                          conn-id)
                (loom:rejected!
                 (warp:error! :type 'warp-transport-connection-error
-                             :message "Connection message stream closed unexpectedly.")))
-           msg))) ; Return the deserialized message.
+                             :message "Connection message stream closed \
+                                       unexpectedly.")))
+           msg)))
       (:catch
        (lambda (err)
          ;; Handle errors from the stream itself (e.g., timeout, read error).
          (warp:log! :error "transport" "Stream read error for %s: %S"
                     conn-id err)
-         (warp-transport--handle-error connection err)
+         (loom:await (warp-transport--handle-error connection err))
          (loom:rejected! err))))))
 
 ;;;###autoload
@@ -1864,8 +1916,8 @@ Signals:
   "Closes the `CONNECTION` gracefully.
 This function initiates the shutdown process for a connection.
 If the connection is part of a pool, it should generally be returned
-to the pool using `warp:transport-pool-return` instead of directly closed,
-unless a permanent closure is intended.
+to the pool using `warp:transport-pool-return` instead of directly
+closed, unless a permanent closure is intended.
 
 Arguments:
 - `CONNECTION` (`warp-transport-connection`): The connection to close.
@@ -1875,6 +1927,8 @@ Arguments:
 
 Returns: (loom-promise): A promise resolving to `t` when the connection
   is fully closed and all associated resources are cleaned up.
+  If the connection is already `:closing` or `:closed`, the promise
+  resolves immediately.
 
 Side Effects:
 - Transitions connection state to `:closing` then `:closed`.
@@ -1907,12 +1961,13 @@ Side Effects:
       (t
        (warp:log! :info "transport" "Closing connection %s%s."
                   conn-id (if force " (forced)" ""))
-       (braid! (warp:state-machine-emit sm :close "Initiating close.") ; Signal FSM
+       (braid! (warp:state-machine-emit sm :close "Initiating close.")
          (:then (lambda (_)
                   ;; Call the protocol's `close-fn` with `force` flag.
-                  (warp-transport--call-protocol connection 'close-fn
-                                                 connection force)))
-         (:timeout (warp-transport-config-shutdown-timeout config)) ; Apply shutdown timeout
+                  (loom:await
+                   (warp-transport--call-protocol connection 'close-fn
+                                                  connection force))))
+         (:timeout (warp-transport-config-shutdown-timeout config))
          (:then
           (lambda (_result)
             ;; On successful protocol-level close, transition FSM to `:closed`.
@@ -1920,23 +1975,24 @@ Side Effects:
          (:then
           (lambda (_state-res)
             ;; After state transition, clean up all internal resources.
-            (warp-transport--cleanup-connection-resources connection)
+            (loom:await
+             (warp-transport--cleanup-connection-resources connection))
             ;; Remove from global active connections registry.
             (warp-transport--deregister-active-connection connection)
             (warp:log! :info "transport" "Connection %s fully closed."
                        conn-id)
-            t)) ; Resolve with `t` on full success.
+            t))
          (:catch
           (lambda (err)
             ;; Handle any errors during the closure process.
             (let ((wrapped-err
                    (warp:error! :type 'warp-transport-connection-error
-                                :message (format "Close failed for %s: %S" conn-id err)
+                                :message
+                                (format "Close failed for %s: %S" conn-id err)
                                 :cause err)))
               (warp:log! :error "transport" "Close failed for %s: %S"
                          conn-id err)
-              ;; Use generic error handler, but it shouldn't auto-reconnect on final close.
-              (warp-transport--handle-error connection wrapped-err)
+              (loom:await (warp-transport--handle-error connection wrapped-err))
               (loom:rejected! wrapped-err))))
          (:timeout
           (lambda ()
@@ -1950,420 +2006,10 @@ Side Effects:
                              :message err-msg)))
               (warp:log! :warn "transport" "%s" err-msg)
               ;; Force internal cleanup and reject the promise.
-              (warp-transport--cleanup-connection-resources connection)
+              (loom:await (warp-transport--cleanup-connection-resources
+                           connection))
               (warp-transport--deregister-active-connection connection)
               (loom:rejected! err-obj))))))))
-
-;;;###autoload
-(defun warp:transport-bridge-connection-to-channel (connection channel-put-fn)
-  "Continuously bridges messages from `CONNECTION`'s internal message stream
-to an external `CHANNEL-PUT-FN`.
-This function sets up a durable loop that reads deserialized messages
-from the `connection`'s inbound `message-stream` (which is populated by
-`warp-transport--process-incoming-raw-data`) and passes them to a
-provided callback function, typically from `warp-channel`. This is how
-received data flows from the transport layer up to higher-level modules.
-
-Arguments:
-- `CONNECTION` (`warp-transport-connection`): The connection whose incoming
-  messages are to be bridged.
-- `CHANNEL-PUT-FN` (function): A function `(lambda (message))` that
-  accepts a deserialized Lisp object. This function typically represents
-  the "put" operation of a `warp-channel` or similar message consumer.
-
-Returns: (loom-promise): A promise that resolves when the bridging loop
-  terminates (e.g., when the connection's `message-stream` is closed),
-  or rejects if an unhandled error occurs in the stream.
-
-Signals:
-- `warp-transport-error`: If the connection has no message stream
-  (i.e., `queue-enabled-p` is `nil` in its config)."
-  (let* ((message-stream (warp-transport-connection-message-stream connection))
-         (conn-id (warp-transport-connection-id connection)))
-    (unless message-stream
-      (signal (warp:error!
-               :type 'warp-transport-error
-               :message (format (concat "No message stream for connection %s. "
-                                        "Enable :queue-enabled-p in config to bridge messages.")
-                                conn-id))))
-
-    (warp:log! :info "transport" "Bridging connection %s incoming messages to channel." conn-id)
-    (braid! (warp:stream-for-each message-stream channel-put-fn)
-      (:then
-       (lambda (_result)
-         (warp:log! :info "transport" "Bridge for %s ended (stream closed)."
-                    conn-id)
-         t))
-      (:catch
-       (lambda (err)
-         (warp:log! :warn "transport" "Bridge for %s failed with error: %S" conn-id err)
-         (warp-transport--handle-error connection err) ; Treat bridge error as connection error
-         (loom:rejected! err))))))
-
-;;;###autoload
-(defun warp:transport-health-check (connection)
-  "Checks the health of a `CONNECTION`.
-This function performs a low-level health check on the underlying
-`raw-connection` using the protocol's `health-check-fn`. This is used
-by pooling mechanisms or higher-level liveness probes to ensure a
-connection is still active and responsive.
-
-Arguments:
-- `CONNECTION` (`warp-transport-connection`): The connection to check.
-
-Returns: (loom-promise): A promise resolving to `t` if the connection
-  is healthy (and in the `:connected` state), `nil` if it's not
-  currently connected, or rejecting on failure to perform the check
-  or if the check times out.
-
-Side Effects:
-- Logs health check status.
-- If the health check fails, `warp-transport--handle-error` is called,
-  which might trigger auto-reconnect."
-  (let* ((sm (warp-transport-connection-state-machine connection))
-         (current-state (warp:state-machine-current-state sm))
-         (config (warp-transport-connection-config connection))
-         (conn-id (warp-transport-connection-id connection)))
-    (if (eq current-state :connected)
-        ;; Only perform a health check if the connection is in the :connected state.
-        (braid! (warp-transport--call-protocol connection 'health-check-fn
-                                               connection)
-          (:timeout (warp-transport-config-health-check-timeout config)) ; Apply health check timeout.
-          (:then (lambda (_) t)) ; Resolve to `t` if health check succeeds.
-          (:catch
-           (lambda (err)
-             (warp:log! :warn "transport" "Health check failed for %s: %S"
-                        conn-id err)
-             ;; Treat health check failure as a connection error.
-             (warp-transport--handle-error connection err)
-             (loom:rejected! err)))
-          (:timeout
-           (lambda ()
-             ;; Handle health check timeout explicitly.
-             (let* ((err-msg (format "Health check timeout after %.1fs for %s."
-                                     (warp-transport-config-health-check-timeout
-                                      config)
-                                     conn-id))
-                    (err-obj (warp:error!
-                              :type 'warp-transport-timeout-error
-                              :message err-msg)))
-               (warp:log! :warn "transport" "%s" err-msg)
-               (warp-transport--handle-error connection err-obj)
-               (loom:rejected! err-obj)))))
-      (warp:log! :debug "transport"
-                 "Health check for %s skipped; not in :connected state (%S)."
-                 conn-id current-state)
-      (loom:resolved! nil)))) ; Resolve to `nil` if not connected.
-
-;;;###autoload
-(defun warp:transport-get-metrics (connection)
-  "Gets a plist of performance and status metrics for a `CONNECTION`.
-This provides a snapshot of the connection's operational health,
-including uptime, message counts, byte transfers, and current state.
-
-Arguments:
-- `CONNECTION` (`warp-transport-connection`): The connection to inspect.
-
-Returns: (plist): A property list containing various metrics and status
-  indicators for the connection."
-  (let ((metrics (warp-transport-connection-metrics connection)))
-    `(:connection-id ,(warp-transport-connection-id connection)
-      :address ,(warp-transport-connection-address connection)
-      :protocol ,(warp-transport-connection-protocol-name connection)
-      :state ,(warp:state-machine-current-state
-               (warp-transport-connection-state-machine connection))
-      :uptime ,(- (float-time) (warp-transport-metrics-created-time metrics))
-      :connects ,(warp-transport-metrics-total-connects metrics)
-      :sends ,(warp-transport-metrics-total-sends metrics)
-      :receives ,(warp-transport-metrics-total-receives metrics)
-      :errors ,(warp-transport-metrics-total-failures metrics)
-      :bytes-sent ,(warp-transport-metrics-total-bytes-sent metrics)
-      :bytes-received ,(warp-transport-metrics-total-bytes-received metrics)
-      :last-send-time ,(warp-transport-metrics-last-send-time metrics)
-      :last-receive-time ,(warp-transport-metrics-last-receive-time metrics)
-      :is-pooled ,(if (warp-transport-connection-connection-pool-id
-                       connection) t nil)
-      :queue-depth ,(if-let (stream (warp-transport-connection-message-stream
-                                     connection))
-                           (plist-get (warp:stream-status stream)
-                                      :buffer-length) 0))))
-
-;;;###autoload
-(defun warp:transport-list-connections ()
-  "Lists all currently active (non-pooled) `warp-transport-connection`s.
-This provides an overview of all explicitly managed connections in
-the system, excluding those managed internally by connection pools.
-
-Returns: (list): A list of `warp-transport-connection` objects."
-  (loom:with-mutex! warp-transport--registry-lock
-    (hash-table-values warp-transport--active-connections)))
-
-;;;###autoload
-(defun warp:transport-find-connection (connection-id)
-  "Finds an active connection by its full ID.
-Allows direct lookup of a `warp-transport-connection` if its unique
-ID is known.
-
-Arguments:
-- `CONNECTION-ID` (string): The unique ID of the connection to find.
-
-Returns: (`warp-transport-connection` or nil): The found connection
-  object, or `nil` if no active connection matches the ID."
-  (loom:with-mutex! warp-transport--registry-lock
-    (gethash connection-id warp-transport--active-connections)))
-
-;;;###autoload
-(defun warp:transport-shutdown (&optional timeout)
-  "Shuts down all active transport connections and pools gracefully.
-This function initiates a system-wide cleanup for the transport layer,
-ensuring all open connections and active connection pools are closed
-and their resources released. This is essential for a clean exit of
-a Warp application.
-
-Arguments:
-- `TIMEOUT` (float, optional): Maximum time in seconds to wait for
-  all connections and pools to shut down gracefully. If the timeout
-  is exceeded, a forced shutdown will be attempted.
-
-Returns: (loom-promise): A promise that resolves when the shutdown
-  process is complete (either gracefully or forced).
-
-Side Effects:
-- Iterates and shuts down all registered connection pools.
-- Iterates and closes all individual active connections.
-- Executes `cleanup-fn` for all registered protocols.
-- Logs shutdown progress and any errors/timeouts."
-  (let* ((default-config (make-transport-config))
-         (actual-timeout (or timeout
-                             (warp-transport-config-shutdown-timeout default-config)))
-         ;; Get lists of pools and connections before starting shutdown.
-         (pools (loom:with-mutex! warp-transport--registry-lock
-                  (cl-loop for pool being the hash-values
-                           of warp-transport--connection-pools
-                           collect pool)))
-         (connections (warp:transport-list-connections)))
-    (warp:log! :info "transport" "Initiating transport shutdown for %d pools and %d active connections (timeout: %.1fs)."
-               (length pools) (length connections) actual-timeout)
-    (braid! (loom:resolved! nil)
-      (:log :debug "transport" "Shutting down all connection pools...")
-      ;; Parallel shutdown of all pools.
-      (:all
-       (cl-loop for pool in pools
-                collect (warp:pool-shutdown pool nil))) ; nil for graceful
-      (:log :debug "transport" "Closing all non-pooled connections...")
-      ;; Parallel closing of all individual connections.
-      (:all
-       (cl-loop for conn in connections
-                collect (warp:transport-close conn nil))) ; nil for graceful
-      (:then
-       (lambda (_)
-         (warp:log! :debug "transport" "Running protocol cleanup hooks...")
-         ;; Execute global cleanup functions for each registered protocol.
-         (loom:with-mutex! warp-transport--registry-lock
-           (maphash (lambda (_name proto)
-                      (when-let (cleanup-fn (warp-transport-protocol-cleanup-fn
-                                             proto))
-                        (condition-case err (funcall cleanup-fn)
-                          (error (warp:error!
-                                  :type 'warp-internal-error
-                                  :message (format "Protocol cleanup %S failed for %S: %S"
-                                                   cleanup-fn (warp-transport-protocol-name proto)
-                                                   err)
-                                  :cause err)))))
-                    warp-transport--registry)))
-      (:log :info "transport" "Transport shutdown complete.")
-      t) ; Resolve with `t` on success
-    (:catch
-     (lambda (err)
-       (warp:log! :error "transport" "Error during transport shutdown: %S" err)
-       (loom:rejected! err)))
-    (:timeout
-     (lambda ()
-       (warp:log! :warn "transport" "Transport shutdown timed out after %.1fs. Forcing remaining closures." actual-timeout)
-       ;; If timeout, force shutdown all remaining pools and connections.
-       (dolist (pool pools) (warp:pool-shutdown pool t))
-       (dolist (conn connections) (warp:transport-close conn t))
-       (loom:rejected!
-        (warp:error! :type 'warp-transport-timeout-error
-                     :message "Transport shutdown timed out and was forced."))))))
-
-;;----------------------------------------------------------------------
-;;; Connection Pooling
-;;----------------------------------------------------------------------
-
-;;;###autoload
-(defun warp:transport-pool-get (address &rest options)
-  "Acquires a connection from the pool for a given `ADDRESS`.
-This is a convenience wrapper around `warp:transport-connect` that
-automatically ensures connection pooling is utilized. If a pool for
-the `ADDRESS` doesn't exist, it will be created.
-
-Arguments:
-- `ADDRESS` (string): The target address for which to get a pooled connection.
-- `OPTIONS` (plist): Pool-specific and general connection options. Any
-  `transport-pool-config` options can be passed here, as well as `transport-config`
-  options for the underlying connections.
-
-Returns: (loom-promise): A promise resolving to a `warp-transport-connection`
-  object from the pool. Rejects if the pool is exhausted or times out.
-
-Side Effects:
-- May create a new connection pool for the `ADDRESS` if one doesn't exist."
-  (let ((final-options (copy-sequence options)))
-    ;; Ensure `:pool-config` is present; if not, use default pool config.
-    (unless (plist-get final-options :pool-config)
-      (setf (plist-put final-options
-                       :pool-config
-                       (make-transport-pool-config)))) ; Default pool config
-    ;; Delegate to `warp:transport-connect`, which handles the pooling logic.
-    (apply #'warp:transport-connect address final-options)))
-
-;;;###autoload
-(defun warp:transport-pool-return (connection)
-  "Returns a `CONNECTION` to its managing pool for reuse.
-This function should be called by client code after it has finished
-using a pooled `warp-transport-connection`. It marks the connection
-as available for other tasks in the pool. Direct `warp:transport-close`
-should generally be avoided for pooled connections unless permanent
-disposal is intended.
-
-Arguments:
-- `CONNECTION` (`warp-transport-connection`): The connection object to return
-  to its pool. This connection *must* have been acquired from a pool.
-
-Returns: (loom-promise): A promise resolving to `t` once the connection
-  has been successfully returned to its pool. Rejects if the connection
-  is not valid or not associated with a known pool.
-
-Signals:
-- `warp-transport-error`: If `CONNECTION` is not a valid pooled connection."
-  (unless (cl-typep connection 'warp-transport-connection)
-    (signal (warp:error! :type 'warp-transport-error
-                          :message "Invalid object provided for pool return: not a warp-transport-connection.")))
-
-  (let* ((pool-id (warp-transport-connection-connection-pool-id connection))
-         (conn-id (warp-transport-connection-id connection)))
-    (loom:with-mutex! warp-transport--registry-lock
-      (if-let ((internal-pool (and pool-id
-                                   ;; Ensure the pool actually exists in the registry.
-                                   (gethash pool-id
-                                            warp-transport--connection-pools)))
-               (_ (warp-pool-p internal-pool))) ; Verify it's a `warp-pool` instance.
-          (progn
-            (warp:log! :debug "transport-pool"
-                       "Returning conn %s to pool %s." conn-id pool-id)
-            ;; Submit the connection back to the pool.
-            (warp:pool-submit internal-pool (lambda () nil)
-                              :resource-to-return connection))
-        (progn
-          ;; If the pool no longer exists, close the connection directly
-          ;; to prevent resource leaks.
-          (warp:log! :warn "transport"
-                     "Cannot return conn %s to non-existent pool %S. Closing directly."
-                     conn-id pool-id)
-          (warp:transport-close connection)))))) ; Close directly if pool is gone.
-
-;;;###autoload
-(defun warp:transport-pool-shutdown (address &optional force)
-  "Shuts down the connection pool for a specific `ADDRESS`.
-This function permanently closes all connections within the specified
-pool and removes the pool from the global registry.
-
-Arguments:
-- `ADDRESS` (string): The target address whose connection pool should
-  be shut down.
-- `FORCE` (boolean, optional): If non-nil, forces immediate shutdown
-  of all connections in the pool, potentially interrupting active
-  operations.
-
-Returns: (loom-promise): A promise resolving to `t` upon successful
-  pool shutdown, or `nil` if no pool exists for the address. Rejects
-  on errors during shutdown.
-
-Side Effects:
-- Closes all connections within the specified pool.
-- Removes the pool from `warp-transport--connection-pools`."
-  (let ((pool-id (format "connpool-%s" (secure-hash 'sha256 address))))
-    (loom:with-mutex! warp-transport--registry-lock
-      (if-let (internal-pool (gethash pool-id
-                                       warp-transport--connection-pools))
-          (progn
-            (warp:log! :info "transport-pool"
-                       "Shutting down pool %s for %s (force=%s)."
-                       pool-id address force)
-            (braid! (warp:pool-shutdown internal-pool force) ; Delegate to warp-pool shutdown
-              (:then
-               (lambda (_res)
-                 (remhash pool-id warp-transport--connection-pools) ; Remove from global registry
-                 (warp:log! :info "transport-pool"
-                            "Pool %s for address %s shut down."
-                            pool-id address)
-                 t))
-              (:catch
-               (lambda (err)
-                 (warp:log! :error "transport-pool"
-                            "Pool shutdown %s failed: %S" pool-id err)
-                 (loom:rejected! err)))))
-        (warp:log! :warn "transport-pool" "No pool found for address %s to shut down." address)
-        (loom:resolved! nil))))) ; Resolve to nil if no pool was found.
-
-;;----------------------------------------------------------------------
-;;; Protocol Definition Macro
-;;----------------------------------------------------------------------
-
-;;;###autoload
-(defmacro warp:deftransport (name &rest body)
-  "Defines and registers a new communication transport protocol.
-This macro provides a declarative way to implement new transports
-(e.g., `:udp`, `:websocket`, custom IPC mechanisms) that adhere to
-the `warp-transport` interface. The provided functions will be stored
-in a `warp-transport-protocol` struct and made available globally.
-
-Example:
-  (warp:deftransport :pipe
-    :matcher-fn (lambda (addr) (s-starts-with-p \"ipc://\" addr))
-    :address-generator-fn (lambda (&key id host) (format \"ipc:///tmp/%s\" id))
-    :connect-fn #'my-pipe-connect-function
-    :listen-fn #'my-pipe-listen-function
-    :send-fn #'my-pipe-send-function
-    :receive-fn #'my-pipe-receive-function
-    :close-fn #'my-pipe-close-function
-    :health-check-fn #'my-pipe-health-check)
-
-Arguments:
-- `NAME` (keyword): A unique name for the protocol (e.g., `:tcp`, `:pipe`).
-- `BODY` (`&rest plist`): Keyword-function pairs defining the protocol's
-  implementation. These keys correspond to the slot names in
-  `warp-transport-protocol` (e.g., `:matcher-fn`, `:connect-fn`).
-  All non-optional slots in `warp-transport-protocol` must be provided.
-
-Returns: (keyword): The `NAME` of the registered protocol.
-
-Side Effects:
-- Calls `warp:transport-register-protocol` internally, adding the new
-  protocol to the global registry."
-  (declare (indent defun))
-  `(warp:transport-register-protocol ,name ,@body))
-
-;;----------------------------------------------------------------------
-;;; System Shutdown Hook
-;;----------------------------------------------------------------------
-
-(add-hook 'kill-emacs-hook
-          (lambda ()
-            (condition-case err
-                (let* ((default-config (make-transport-config))
-                       (shutdown-timeout
-                        (warp-transport-config-shutdown-timeout
-                         default-config))
-                       ;; Initiate asynchronous shutdown.
-                       (promise (warp:transport-shutdown shutdown-timeout)))
-                  ;; In `kill-emacs-hook`, we must block the Emacs process
-                  ;; until cleanup is complete. `loom:await` provides this.
-                  (warp:log! :info "transport" "Waiting for transport shutdown before Emacs exits...")
-                  (loom:await promise))
-              (error (message "Warp transport shutdown error on Emacs exit: %S"
-                              err)))))
 
 (provide 'warp-transport)
 ;;; warp-transport.el ends here

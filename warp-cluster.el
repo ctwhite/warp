@@ -957,7 +957,7 @@ Returns:
       ;; Monitors the health of individual workers and updates their
       ;; status in the state manager. It initiates ping checks and
       ;; reacts to worker disconnections.
-      :deps (:event-system :state-manager :rpc-system) ; <-- FIX: Removed :bridge
+      :deps (:event-system :state-manager :rpc-system) 
       :factory (lambda (es sm rpc)
                  (let ((orch (warp:health-orchestrator-create
                               :name ,(format "%s-health" (warp-cluster-id cluster)))))
@@ -1116,7 +1116,7 @@ Returns:
        (,(warp:env 'master-contact) . ,leader-contact) ; Initial contact.
        ;; Pass coordinator peer addresses for leader discovery.
        (,(warp:env 'coordinator-peers) . ,(s-join "," (plist-get coord-config-options :cluster-members)))
-       (,(warp:env 'log-channel) . ,leader-contact) ; FIX: Used leader-contact for consistency.
+       (,(warp:env 'log-channel) . ,leader-contact) 
        (,(warp:env 'cluster-id) . ,(warp-cluster-id cluster))
        (,(warp:env 'launch-id) . ,(plist-get token-info :launch-id))
        (,(warp:env 'launch-token) . ,(plist-get token-info :token)))
@@ -1337,8 +1337,8 @@ metrics, including `:avg-cluster-cpu-utilization`,
                (let ((total-cpu 0.0)
                      (total-mem 0.0)
                      (total-active-requests 0)
-                     (total-processed-requests 0) ; ADDED: For total processed requests
-                     (total-failed-requests 0)    ; ADDED: For total failed requests
+                     (total-processed-requests 0) 
+                     (total-failed-requests 0)    
                      (worker-count 0)
                      (workers (if pool-name
                                   (cl-remove-if-not (lambda (w) (string= (warp-managed-worker-pool-name w) pool-name))
@@ -1351,13 +1351,13 @@ metrics, including `:avg-cluster-cpu-utilization`,
                      (cl-incf total-cpu (gethash :cpu-utilization metrics 0.0))
                      (cl-incf total-mem (gethash :memory-utilization-mb metrics 0.0))
                      (cl-incf total-active-requests (gethash :active-request-count metrics 0))
-                     (cl-incf total-processed-requests (gethash :total-requests-processed metrics 0)) ; ADDED
-                     (cl-incf total-failed-requests (gethash :failed-request-count metrics 0)))) ; ADDED
+                     (cl-incf total-processed-requests (gethash :total-requests-processed metrics 0)) 
+                     (cl-incf total-failed-requests (gethash :failed-request-count metrics 0)))) 
                  `(:avg-cluster-cpu-utilization ,(if (> worker-count 0) (/ total-cpu worker-count) 0.0)
                    :avg-cluster-memory-utilization ,(if (> worker-count 0) (/ total-mem worker-count) 0.0)
                    :total-active-requests ,total-active-requests
-                   :total-requests-processed ,total-processed-requests ; ADDED
-                   :total-failed-requests ,total-failed-requests))))))) ; ADDED
+                   :total-requests-processed ,total-processed-requests 
+                   :total-failed-requests ,total-failed-requests))))))) 
 
 ;;;###autoload
 (defun warp:cluster-create (&rest args)

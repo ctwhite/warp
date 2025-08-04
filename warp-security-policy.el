@@ -148,7 +148,7 @@ Returns: (loom-promise): A promise that resolves to a plist of the
 Signals:
 - `warp-security-policy-unauthorized-access`: If validation fails for
   any reason (e.g., invalid signature, expired token, untrusted key)."
-  (braid! (loom:resolved! nil) ; Start with a resolved promise
+  (braid! (loom:resolved! nil)
     (:then (lambda (_)
              (unless (stringp jwt-string)
                (signal (warp:error!
@@ -316,8 +316,8 @@ Side Effects:
     "Authentication middleware generated from a security policy."
     (let* ((worker (warp-request-pipeline-context-worker context))
            (message
-            (warp-protocol-rpc-event-payload-message
-             (warp-request-pipeline-context-rpc-event-payload context)))
+            (warp-rpc-command-payload
+             (warp-request-pipeline-context-message context)))
            (metadata (warp-rpc-message-metadata message)))
       (if (warp:security-policy-requires-auth policy command)
           (let ((auth-hdr (plist-get metadata :Authorization)))
@@ -326,8 +326,11 @@ Side Effects:
                   (braid! (warp:security-policy-validate-auth
                            policy jwt-string (warp-worker-id worker))
                     (:then (lambda (claims)
-                             (setf (warp-request-pipeline-context-auth-claims
-                                    context)
+                             ;; Populate context with auth claims.
+                             (setf (plist-put
+                                    (warp-request-pipeline-context-metadata
+                                     context)
+                                    :auth-claims)
                                    claims)
                              (warp:trace-add-tag
                               :auth.principal
@@ -426,7 +429,7 @@ Arguments:
   or 'iss') to PEM-encoded public key strings.
 
 Returns: `t`."
-  (loom:with-mutex! warp--security-policy-registry-lock
+  (loom:with-mutex! warp--security-trusted-jwt-public-keys
     (clrhash warp--security-trusted-jwt-public-keys)
     (cl-loop for (key val) on keys-plist by #'cddr
              do (puthash key val warp--security-trusted-jwt-public-keys)))

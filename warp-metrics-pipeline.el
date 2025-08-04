@@ -147,8 +147,8 @@ or a monitoring dashboard. Exporters run in parallel.
 
 Arguments:
 - `EXPORTER`: An object that implements this generic function.
-- `METRIC-BATCH` (warp-metric-batch): The final, processed batch of metrics
-  ready for external transmission.
+- `METRIC-BATCH` (warp-metric-batch): The final, processed batch of
+  metrics ready for external transmission.
 
 Returns:
 - (loom-promise): A promise that should resolve (e.g., with `t`) on
@@ -161,8 +161,9 @@ Returns:
 (defun warp-metrics-pipeline--run-cycle (pipeline)
   "Run a single cycle of collection, processing, and exporting.
 This function orchestrates the asynchronous flow of a metric batch
-through all configured stages of the pipeline. It is the core operational
-logic, triggered periodically by the pipeline's background poller.
+through all configured stages of the pipeline. It is the core
+operational logic, triggered periodically by the pipeline's background
+poller.
 
 Arguments:
 - `PIPELINE` (warp-metrics-pipeline): The pipeline instance to run.
@@ -179,66 +180,66 @@ Side Effects:
   (let ((name (warp-metrics-pipeline-name pipeline)))
     (warp:log! :debug name "Starting metrics collection cycle...")
     (braid!
-        ;; Step 1: Collect metrics from all registered collectors in parallel.
-        ;; `loom:all` waits for all collector promises to resolve.
-        (loom:all (mapcar #'warp:metric-collector-collect
-                          (warp-metrics-pipeline-collectors pipeline)))
+     ;; Step 1: Collect metrics from all registered collectors in parallel.
+     ;; `loom:all` waits for all collector promises to resolve.
+     (loom:all (mapcar #'warp:metric-collector-collect
+                       (warp-metrics-pipeline-collectors pipeline)))
 
-      (:then (lambda (batches)
-               ;; Step 2: Merge all collected metrics into a single batch for
-               ;; processing. `cl-remove-if #'null` handles collectors that
-               ;; might resolve to nil or empty batches.
-               (let* ((all-metrics (cl-loop for batch in
-                                            (cl-remove-if #'null batches)
-                                            append (warp-metric-batch-metrics
-                                                    batch)))
-                      ;; Generate a unique batch ID for tracing.
-                      (merged-batch (make-warp-metric-batch
-                                     :metrics all-metrics
-                                     :batch-id (format "batch-%s-%06x" name
-                                                       (random (expt 2 24))))))
-                 (warp:log! :debug name "Collected %d metrics."
-                            (length all-metrics))
-                 merged-batch)))
+     (:then (lambda (batches)
+              ;; Step 2: Merge all collected metrics into a single batch for
+              ;; processing. `cl-remove-if #'null` handles collectors that
+              ;; might resolve to nil or empty batches.
+              (let* ((all-metrics (cl-loop for batch in
+                                           (cl-remove-if #'null batches)
+                                           append (warp-metric-batch-metrics
+                                                   batch)))
+                     ;; Generate a unique batch ID for tracing.
+                     (merged-batch (make-warp-metric-batch
+                                    :metrics all-metrics
+                                    :batch-id (format "batch-%s-%06x" name
+                                                      (random (expt 2 24))))))
+                (warp:log! :debug name "Collected %d metrics."
+                           (length all-metrics))
+                merged-batch)))
 
-      (:then (lambda (current-batch)
-               ;; Step 3: Pipe the merged batch sequentially through all
-               ;; registered processors. `cl-reduce` is used to chain the
-               ;; promises, ensuring that the output of one processor becomes
-               ;; the input for the next. The order of processors matters.
-               (cl-reduce (lambda (batch-promise processor)
-                            (braid! batch-promise
-                              (:then (lambda (b)
-                                       (when b ; Ensure batch is not nil
-                                         (warp:metric-processor-process
-                                          processor b))))))
-                          (warp-metrics-pipeline-processors pipeline)
-                          :initial-value (loom:resolved! current-batch))))
+     (:then (lambda (current-batch)
+              ;; Step 3: Pipe the merged batch sequentially through all
+              ;; registered processors. `cl-reduce` is used to chain the
+              ;; promises, ensuring that the output of one processor becomes
+              ;; the input for the next. The order of processors matters.
+              (cl-reduce (lambda (batch-promise processor)
+                           (braid! batch-promise
+                             (:then (lambda (b)
+                                      (when b ; Ensure batch is not nil
+                                        (warp:metric-processor-process
+                                         processor b))))))
+                         (warp-metrics-pipeline-processors pipeline)
+                         :initial-value (loom:resolved! current-batch))))
 
-      (:then (lambda (final-batch)
-               ;; Step 4: Send the final, processed batch to all exporters
-               ;; in parallel. `loom:all` ensures all export operations are
-               ;; initiated concurrently. Errors from individual exporters
-               ;; would be handled by their `loom:catch` clauses if present,
-               ;; or would cause this promise to reject if not handled.
-               (warp:log! :debug name "Exporting %d final metrics."
-                          (length (warp-metric-batch-metrics final-batch)))
-               (loom:all (mapcar #'(lambda (exporter)
-                                     (warp:metric-exporter-export
-                                      exporter final-batch))
-                                 (warp-metrics-pipeline-exporters pipeline)))))
+     (:then (lambda (final-batch)
+              ;; Step 4: Send the final, processed batch to all exporters
+              ;; in parallel. `loom:all` ensures all export operations are
+              ;; initiated concurrently. Errors from individual exporters
+              ;; would be handled by their `loom:catch` clauses if present,
+              ;; or would cause this promise to reject if not handled.
+              (warp:log! :debug name "Exporting %d final metrics."
+                         (length (warp-metric-batch-metrics final-batch)))
+              (loom:all (mapcar #'(lambda (exporter)
+                                    (warp:metric-exporter-export
+                                     exporter final-batch))
+                                (warp-metrics-pipeline-exporters pipeline)))))
 
-      ;; Centralized error handling for the entire cycle.
-      (:catch (lambda (err)
-                (warp:log! :error name "Metrics pipeline cycle failed: %S"
-                           err))))))
+     ;; Centralized error handling for the entire cycle.
+     (:catch (lambda (err)
+               (warp:log! :error name "Metrics pipeline cycle failed: %S"
+                          err))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;###autoload
-(cl-defun warp:metrics-pipeline-create (&key name collectors processors exporters
-                                            (collection-interval 30.0))
+(cl-defun warp:metrics-pipeline-create (&key name collectors processors
+                                            exporters (collection-interval 30.0))
   "Create a new, un-started metrics pipeline component.
 This factory function assembles the pipeline from the provided stage
 components and creates a dedicated `loom-poll` instance to manage its

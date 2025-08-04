@@ -29,7 +29,7 @@
 ;;     and user/group sandboxing are applied based on `warp-security-policy`.
 ;; -   **Communication**: Manages IPC between the main `warp-worker` and
 ;;     its sub-processes for task submission and result retrieval via
-;;     `warp-channel` and `warp-stream`.
+;;     `warp-channel` and `warp-rpc`.
 
 ;;; Code:
 
@@ -49,7 +49,7 @@
 (require 'warp-exec)
 (require 'warp-config)
 (require 'warp-env)
-(require 'warp-worker)
+(require 'warp-worker) ; Used for warp-worker--instance and warp-worker-config-config
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -82,8 +82,8 @@ Fields:
   scaled down.
 - `request-timeout` (float): Default timeout for a task submitted to the
   pool.
-- `max-resource-restarts` (integer): Max restarts before a sub-process is
-  permanently failed. This is passed to the underlying `warp-pool`."
+- `max-resource-restarts` (integer): Max restarts before a sub-process
+  is permanently failed. This is passed to the underlying `warp-pool`."
   (min-size 1
             :type integer
             :validate (>= $ 0)
@@ -158,12 +158,10 @@ Signals:
   (let* ((form (warp-sub-worker-task-payload-form task-payload))
          (args (warp-sub-worker-task-payload-args task-payload))
          (load-path (warp-sub-worker-task-payload-load-path task-payload))
-         (require-features (warp-sub-worker-task-payload-require-features
-                            task-payload))
+         (require-features
+          (warp-sub-worker-task-payload-require-features task-payload))
          (security-level (warp-sub-worker-task-payload-security-level
                           task-payload))
-         ;; The security policy execute-form expects a plist of options
-         ;; for `warp-exec`, where a :config key can pass the exec-config.
          (exec-options `(:config ,main-worker-exec-config)))
 
     ;; Apply load-path and require-features for this execution.
@@ -182,7 +180,7 @@ Signals:
 
 (defun warp--executor-pool-execute-shell-task (task-payload security-policy)
   "Executes a shell task payload in the sub-worker process.
-This function uses `warp:process-start` to run external shell commands,
+This function uses `warp:process-launch` to run external shell commands,
 applying sandboxing options as defined by the `security-policy`.
 
 Arguments:
@@ -195,21 +193,21 @@ Returns: (loom-promise): A promise resolving with the shell command's
   output on success.
 
 Signals: `warp-executor-pool-task-execution-error`."
-  (let* ((shell-command-args (warp-sub-worker-task-payload-shell-command-args
-                              task-payload))
+  (let* ((shell-command-args
+          (warp-sub-worker-task-payload-shell-command-args task-payload))
          (security-level (warp-sub-worker-task-payload-security-level
                           task-payload))
          (sandboxing-options (warp:security-policy-get-process-sandboxing
                               security-level)))
-    (apply #'warp:process-start
-           nil ; No Lisp form to evaluate
-           :process-type :shell
-           :command-args shell-command-args
-           sandboxing-options)))
+    (loom:await ; Await process launch and execution
+     (apply #'warp:process-launch
+            `(:process-type :shell
+              :command-args ,shell-command-args)
+            sandboxing-options))))
 
 (defun warp--executor-pool-execute-docker-task (task-payload security-policy)
   "Executes a Docker task payload in the sub-worker process.
-This function uses `warp:process-start` to run Docker commands,
+This function uses `warp:process-launch` to run Docker commands,
 applying sandboxing options as defined by the `security-policy`.
 
 Arguments:
@@ -226,19 +224,19 @@ Signals: `warp-executor-pool-task-execution-error`."
                         task-payload))
          (docker-run-args (warp-sub-worker-task-payload-docker-run-args
                            task-payload))
-         (docker-command-args (warp-sub-worker-task-payload-docker-command-args
-                               task-payload))
+         (docker-command-args
+          (warp-sub-worker-task-payload-docker-command-args task-payload))
          (security-level (warp-sub-worker-task-payload-security-level
                           task-payload))
          (sandboxing-options (warp:security-policy-get-process-sandboxing
                               security-level)))
-    (apply #'warp:process-start
-           nil ; No Lisp form
-           :process-type :docker
-           :docker-image docker-image
-           :docker-run-args docker-run-args
-           :docker-command-args docker-command-args
-           sandboxing-options)))
+    (loom:await ; Await process launch and execution
+     (apply #'warp:process-launch
+            `(:process-type :docker
+              :docker-image ,docker-image
+              :docker-run-args ,docker-run-args
+              :docker-command-args ,docker-command-args)
+            sandboxing-options))))
 
 (defun warp--executor-pool-sub-worker-execute-task (task-payload)
   "Executes a task received by a sub-worker from its parent worker.
@@ -272,21 +270,16 @@ Signals:
                          task-payload))
          (security-level (warp-sub-worker-task-payload-security-level
                           task-payload))
-         ;; Create a security policy instance for this sub-worker.
          (security-policy (warp:security-policy-create security-level))
-         ;; The security configuration for `warp-exec` needs to be passed.
-         ;; This is typically obtained from the main worker's config.
-         ;; Assuming `warp-worker--instance` holds the global worker config.
-         (main-worker-exec-config (warp-worker-config-config
-                                   warp-worker--instance)) ;; Corrected accessor
+         (main-worker-exec-config
+          (warp-worker-config-config warp-worker--instance))
          (execution-result nil)
          (execution-error nil))
 
-    (let* ((main-worker-id (getenv (warp:env 'cluster-id))) ; Parent worker ID
+    (let* ((main-worker-id (getenv (warp:env 'cluster-id)))
            (sub-worker-id (getenv (warp:env 'worker-id)))
            (op-name (format "executor-task-%S" process-type)))
       ;; Start a new trace span for this sub-worker task execution.
-      ;; This span will be a child of the span propagated from the main worker.
       (warp:trace-with-span (sub-span op-name
                                       :trace-id (when (warp-trace-span-p
                                                        trace-context)
@@ -304,15 +297,18 @@ Signals:
             (progn
               (pcase process-type
                 (:lisp (setq execution-result
-                             (loom:await (warp--executor-pool-execute-lisp-task
-                                          task-payload security-policy
-                                          main-worker-exec-config))))
+                             (loom:await
+                              (warp--executor-pool-execute-lisp-task
+                               task-payload security-policy
+                               main-worker-exec-config))))
                 (:shell (setq execution-result
-                              (loom:await (warp--executor-pool-execute-shell-task
-                                           task-payload security-policy))))
+                              (loom:await
+                               (warp--executor-pool-execute-shell-task
+                                task-payload security-policy))))
                 (:docker (setq execution-result
-                               (loom:await (warp--executor-pool-execute-docker-task
-                                            task-payload security-policy))))
+                               (loom:await
+                                (warp--executor-pool-execute-docker-task
+                                 task-payload security-policy))))
                 (t (error (warp:error!
                            :type 'warp-executor-pool-task-execution-error
                            :message "Unsupported process type for sub-worker."
@@ -350,14 +346,16 @@ Side Effects:
          (channel nil))
     (unless parent-ipc-address
       (error (warp:error! :type 'warp-executor-pool-error
-                          :message "Sub-worker needs parent IPC address (env VAR_MASTER_CONTACT).")))
+                          :message "Sub-worker needs parent IPC address \
+                                    (env VAR_MASTER_CONTACT).")))
 
     (warp:log! :info "sub-worker" "Sub-worker %s starting, connecting to %s."
                sub-worker-id parent-ipc-address)
-    (braid! (warp:channel parent-ipc-address :mode :connect)
+    (braid! (warp:channel sub-worker-ipc-addr :mode :connect)
       (:then (lambda (ch)
                (setq channel ch)
-               (warp:log! :info "sub-worker" "Connected to parent. Ready for tasks.")
+               (warp:log! :info "sub-worker"
+                          "Connected to parent. Ready for tasks.")
                ;; Listen for tasks from the parent via its subscription stream.
                (loom:await
                 (warp:stream-for-each
@@ -369,20 +367,22 @@ Side Effects:
                           (let ((task-payload (cadr message-envelope)))
                             (warp:log! :debug "sub-worker" "Received task.")
                             ;; Execute the task, capturing result/error.
-                            (braid! (warp--executor-pool-sub-worker-execute-task
-                                     task-payload)
+                            (braid!
+                             (warp--executor-pool-sub-worker-execute-task
+                              task-payload)
                               (:then (lambda (result)
                                        ;; Send result back to parent.
                                        (loom:await (warp:channel-send channel
                                                                       `(:result ,result))))
                                 (:catch (lambda (error-obj)
-                                         ;; Send error back to parent.
-                                         (loom:await (warp:channel-send channel
-                                                                        `(:error
-                                                                          ,(loom:error-wrap
-                                                                           error-obj))))))))
-                          (_ (warp:log! :warn "sub-worker" "Unexpected msg: %S"
-                                        message-envelope)))
+                                          ;; Send error back to parent.
+                                          (loom:await (warp:channel-send
+                                                       channel
+                                                       `(:error
+                                                         ,(loom:error-wrap
+                                                          error-obj))))))))))
+                         (_ (warp:log! :warn "sub-worker"
+                                       "Unexpected msg: %S" message-envelope)))
                      (error
                       (warp:log! :error "sub-worker"
                                  "Error processing incoming task: %S. %S"
@@ -415,31 +415,30 @@ Side Effects:
   (let* ((main-worker (warp-pool-context pool))
          (main-worker-id (warp-worker-id main-worker))
          (main-worker-rank (warp-worker-rank main-worker))
-         ;; Generate a unique IPC address for each sub-worker's channel.
          (sub-worker-ipc-addr (format "ipc:///tmp/%s-inbox"
                                       (warp-pool-resource-id resource)))
-         ;; Get the main worker's overall execution security level from its config.
          (main-worker-exec-security-level
-          (warp-worker-config-security-level (warp-worker-config main-worker)))
+          (warp-worker-config-security-level
+           (warp-worker-config main-worker)))
          (process-launch-args-plist
           (append `(:process-type :lisp
-                     :eval-string "(warp:worker-main)" ;; Sub-worker runs worker-main
+                     :eval-string "(warp:worker-main)"
                      :env `((,(warp:env 'is-worker-process) . "t")
-                            (,(warp:env 'ipc-base-dir) . ,temporary-file-directory)
-                            ;; Log server address for centralized logging from sub-worker.
-                            (,(warp:env 'log-channel) . ,(loom:log-get-server-address))
-                            ;; This is the IPC address for the sub-worker to connect back to parent.
-                            (,(warp:env 'master-contact) . ,sub-worker-ipc-addr)
+                            (,(warp:env 'ipc-base-dir)
+                             . ,temporary-file-directory)
+                            (,(warp:env 'log-channel)
+                             . ,(loom:log-get-server-address))
+                            (,(warp:env 'master-contact)
+                             . ,sub-worker-ipc-addr)
                             (,(warp:env 'worker-type) . "sub-worker")
                             (,(warp:env 'cluster-id) . ,main-worker-id)
-                            ;; Pass the security level to the sub-worker for its own Lisp exec policy.
-                            (,(warp:env 'security-level) . ,(symbol-name
-                                                              main-worker-exec-security-level))
-                            (,(warp:env 'worker-id) . ,(warp-pool-resource-id resource))
-                            (,(warp:env 'worker-rank) . ,(number-to-string
-                                                          main-worker-rank)))
+                            (,(warp:env 'security-level)
+                             . ,(symbol-name main-worker-exec-security-level))
+                            (,(warp:env 'worker-id)
+                             . ,(warp-pool-resource-id resource))
+                            (,(warp:env 'worker-rank)
+                             . ,(number-to-string main-worker-rank)))
                      :name ,(warp-pool-resource-id resource))
-                  ;; Apply OS-level sandboxing derived from security policy.
                   (warp:security-policy-get-process-sandboxing
                    main-worker-exec-security-level))))
 
@@ -448,7 +447,7 @@ Side Effects:
                (warp-pool-resource-id resource) sub-worker-ipc-addr
                (warp:security-policy-get-process-sandboxing
                 main-worker-exec-security-level))
-    (braid! (warp:process-launch process-launch-args-plist) ;; Updated call
+    (braid! (warp:process-launch process-launch-args-plist)
       (:then (lambda (proc)
                ;; Store the subprocess handle and its IPC address in custom-data
                ;; for later access (e.g., by the task executor or destructor).
@@ -518,10 +517,10 @@ Side Effects:
     (warp:log! :info (warp-pool-name pool) "Terminating sub-worker %s."
                sub-worker-id)
     (braid! (if (and sub-worker-proc (process-live-p sub-worker-proc))
-                (warp:process-kill sub-worker-proc)
-              ;; If process is already dead, just resolve.
-              (loom:resolved! nil)))
-      (:then (lambda (_) t)) ; Resolve with true
+                (warp:process-terminate
+                 (warp:process-handle-from-process sub-worker-proc))
+              (loom:resolved! nil))) ; If process already dead, just resolve.
+      (:then (lambda (_) t))
       (:catch (lambda (err)
                 (warp:log! :error (warp-pool-name pool)
                            "Error terminating sub-worker %s: %S"
@@ -564,12 +563,15 @@ Signals:
                                               `(:task ,task-payload)))
                ;; Then, subscribe to the channel to receive the result from
                ;; the sub-worker. Close channel after one message for this task.
-               (braid! (warp:stream-read (warp:channel-subscribe sub-worker-channel))
+               (braid! (warp:stream-read
+                        (warp:channel-subscribe sub-worker-channel))
                  (:then (lambda (response-envelope)
-                          (loom:await (warp:channel-close sub-worker-channel))
+                          (loom:await (warp:channel-close
+                                       sub-worker-channel))
                           response-envelope))
                  (:catch (lambda (err)
-                           (loom:await (warp:channel-close sub-worker-channel))
+                           (loom:await (warp:channel-close
+                                        sub-worker-channel))
                            (loom:rejected! err))))))
       (:then (lambda (response-envelope)
                (pcase (car response-envelope)
@@ -578,8 +580,9 @@ Signals:
                  (_ (loom:rejected!
                      (warp:error!
                       :type 'warp-executor-pool-error
-                      :message (format "Unexpected response from sub-worker: %S"
-                                       response-envelope)
+                      :message
+                      (format "Unexpected response from sub-worker: %S"
+                              response-envelope)
                       :details response-envelope))))))
       (:catch (lambda (err)
                 (warp:log! :error main-worker-id
@@ -631,26 +634,35 @@ Side Effects:
                     :name (format "%s-resource-pool" name)
                     :min-size (warp-executor-pool-config-min-size config)
                     :max-size (warp-executor-pool-config-max-size config)
-                    :resource-idle-timeout (warp-executor-pool-config-idle-timeout config)
-                    :context main-worker ;; Pass the main worker as context to the pool.
+                    :resource-idle-timeout (warp-executor-pool-config-idle-timeout
+                                            config)
+                    :context main-worker
                     :resource-factory-fn #'warp--executor-pool-resource-factory-fn
                     :resource-validator-fn #'warp--executor-pool-resource-validator-fn
                     :resource-destructor-fn #'warp--executor-pool-resource-destructor-fn
                     :task-executor-fn #'warp--executor-pool-task-executor-fn
-                    ;; Custom task cancellation logic: kill the sub-worker if a task is cancelled.
-                    :task-cancel-fn (lambda (resource task pool-ctx)
-                                      (let* ((sub-worker-data (warp-pool-resource-custom-data resource))
-                                             (sub-worker-proc (plist-get sub-worker-data :process))
-                                             (sub-worker-id (warp-pool-resource-id resource)))
-                                        (warp:log! :info (warp-pool-name pool-ctx)
-                                                   "Forcibly cancelling task %s by killing sub-worker %s."
-                                                   (warp-task-id task) sub-worker-id)
-                                        (when (and sub-worker-proc (process-live-p sub-worker-proc))
-                                          (delete-process sub-worker-proc))))
+                    ;; Custom task cancellation logic: kill the sub-worker if a
+                    ;; task is cancelled.
+                    :task-cancel-fn
+                    (lambda (resource task pool-ctx)
+                      (let* ((sub-worker-data
+                              (warp-pool-resource-custom-data resource))
+                             (sub-worker-proc
+                              (plist-get sub-worker-data :process))
+                             (sub-worker-id
+                              (warp-pool-resource-id resource)))
+                        (warp:log! :info (warp-pool-name pool-ctx)
+                                   "Forcibly cancelling task %s by killing \
+                                    sub-worker %s."
+                                   (warp-task-id task) sub-worker-id)
+                        (when (and sub-worker-proc
+                                   (process-live-p sub-worker-proc))
+                          (delete-process sub-worker-proc))))
                     ;; Pass max-resource-restarts to the underlying `warp-pool`'s
                     ;; internal config, as it handles resource lifecycle.
                     :internal-config-options `(:max-resource-restarts
-                                               ,(warp-executor-pool-config-max-resource-restarts config))))))
+                                               ,(warp-executor-pool-config-max-resource-restarts
+                                                 config))))))
     (warp:log! :info "executor-pool" "Executor pool '%s' created." name)
     (%%make-executor-pool-instance :name name
                                    :pool-obj pool-obj
@@ -661,8 +673,9 @@ Side Effects:
                                           &key timeout)
   "Submits a task to the local sub-process executor pool.
 The `task-payload` (a `warp-sub-worker-task-payload` object) is
-dispatched to an available sub-resource process in the pool for execution.
-The task will be executed in parallel with other tasks in the pool.
+dispatched to an available sub-resource process in the pool for
+execution. The task will be executed in parallel with other tasks in
+the pool.
 
 Arguments:
 - `EXECUTOR-POOL` (warp-executor-pool-instance): The executor pool
@@ -698,7 +711,8 @@ Signals:
   (let* ((pool-obj (warp-executor-pool-instance-pool-obj executor-pool))
          (config (warp-executor-pool-instance-config executor-pool))
          (task-timeout (or timeout
-                           (warp-executor-pool-config-request-timeout config))))
+                           (warp-executor-pool-config-request-timeout
+                            config))))
     (warp:log! :debug (warp-executor-pool-instance-name executor-pool)
                "Submitting task to executor pool (timeout: %.1fs)."
                task-timeout)

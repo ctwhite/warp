@@ -7,12 +7,12 @@
 ;; for creating sandboxed child processes with advanced features for
 ;; security, resource control, and cross-machine execution.
 ;;
-;; Its sole responsibility is to construct a valid command line, launch the
-;; process, and return a handle to it. It explicitly has **no knowledge**
-;; of application-level protocols (like worker handshakes or RPC). That
-;; higher-level logic belongs to modules that consume this primitive
-;; (e.g., `warp-managed-worker.el`). This strict separation of concerns
-;; keeps `warp-process` lean and reusable.
+;; Its sole responsibility is to construct a valid command line, launch
+;; the process, and return a handle to it. It explicitly has **no
+;; knowledge** of application-level protocols (like worker handshakes or
+;; RPC). That higher-level logic belongs to modules that consume this
+;; primitive (e.g., `warp-managed-worker.el`). This strict separation of
+;; concerns keeps `warp-process` lean and reusable.
 ;;
 ;; ## Key Features:
 ;;
@@ -136,8 +136,8 @@ Fields:
   representing the command and its arguments.
 - `docker-image` (string): For `:docker` processes, the name of the
   Docker image to use (e.g., `\"ubuntu:latest\"`).
-- `docker-run-args` (list): Extra arguments to pass directly to `docker run`
-  (e.g., `(\"-v\" \"/host:/container\")`).
+- `docker-run-args` (list): Extra arguments to pass directly to
+  `docker run` (e.g., `(\"-v\" \"/host:/container\")`).
 - `docker-command-args` (list): For `:docker` processes, the command
   and arguments to run *inside* the Docker container.
 - `remote-host` (string): If provided, the process will be launched on
@@ -203,9 +203,10 @@ Fields:
 ;;; Global State
 
 (defvar warp--process-launch-token-registry (make-hash-table :test 'equal)
-  "A temporary, in-memory registry mapping unique launch IDs to cryptographic
-challenges. Used for the one-time launch handshake between master and worker.
-Tokens are ephemeral and consumed upon verification."
+  "A temporary, in-memory registry mapping unique launch IDs to
+cryptographic challenges. Used for the one-time launch handshake
+between master and worker. Tokens are ephemeral and consumed upon
+verification."
   :type 'hash-table)
 
 (defvar warp--process-launch-token-lock (loom:lock "process-launch-tokens")
@@ -246,14 +247,24 @@ Signals:
     (unless (and exec (file-executable-p exec))
       (signal (warp:error!
                :type 'warp-process-exec-not-found
-               :message (format "Emacs executable not found or not executable: %S." exec))))
-    ;; Build the command with standard flags for a non-interactive, batch Emacs session.
+               :message
+               (format "Emacs executable not found or not executable: %S."
+                       exec))))
+    ;; Build the command with standard flags for a non-interactive,
+    ;; batch Emacs session.
     (append (list exec) '("-Q" "--batch" "--no-window-system")
-            ;; Append the master's load-path to the worker's to ensure code discovery.
-            (cl-loop for p in (process-config-default-lisp-load-path config)
-                     nconc `("-L" ,(shell-quote-argument p)))
+            ;; Append the master's load-path to the worker's to ensure code
+            ;; discovery. This is done inside the --eval argument to keep
+            ;; it within the Emacs process's Lisp environment.
+            `("--eval" ,(shell-quote-argument
+                         (format "(setq load-path (append \
+                                                  (list %s) load-path))"
+                                 (mapconcat #'prin1-to-string
+                                            (process-config-default-lisp-load-path config)
+                                            " "))))
             ;; Bootstrap the Warp framework within the Lisp worker and
-            ;; then execute the target `eval-string` (e.g., `(warp:worker-main)`).
+            ;; then execute the target `eval-string` (e.g.,
+            ;; `(warp:worker-main)`).
             `("--eval" ,(shell-quote-argument "(require 'warp-bootstrap)"))
             (when-let (eval-str (process-launch-options-eval-string
                                  launch-options-instance))
@@ -276,13 +287,15 @@ Signals:
 - `warp-process-unsupported-option`: If a Docker image is not specified."
   (unless (executable-find "docker")
     (signal (warp:error! :type 'warp-process-exec-not-found
-                         :message "Docker executable ('docker') not found in PATH.")))
+                         :message "Docker executable ('docker') not found \
+                                   in PATH.")))
   (unless (process-launch-options-docker-image launch-options-instance)
     (signal (warp:error!
              :type 'warp-process-unsupported-option
-             :message "Docker image must be specified for :docker process type.")))
+             :message "Docker image must be specified for :docker process \
+                       type.")))
   ;; Assemble the full `docker run ...` command.
-  (append '("docker" "run" "--rm") ; `--rm` automatically removes container on exit.
+  (append '("docker" "run" "--rm")
           (process-launch-options-docker-run-args launch-options-instance)
           (process-launch-options-extra-docker-args launch-options-instance)
           (list (process-launch-options-docker-image launch-options-instance))
@@ -304,8 +317,9 @@ Returns:
   an empty list if no security/resource options are requested.
 
 Signals:
-- `warp-process-security-enforcement-error`: If required tools (`systemd-run`,
-  `sudo`) are not found or misconfigured for the requested options."
+- `warp-process-security-enforcement-error`: If required tools
+  (`systemd-run`, `sudo`) are not found or misconfigured for the
+  requested options."
   (let ((prefix '())
         (user (process-launch-options-run-as-user launch-options-instance))
         (group (process-launch-options-run-as-group launch-options-instance))
@@ -320,24 +334,27 @@ Signals:
       (unless (executable-find "systemd-run")
         (signal (warp:error!
                  :type 'warp-process-security-enforcement-error
-                 :message "`systemd-run` not found for resource limits. Is systemd installed?")))
-      ;; `systemd-run` options: `--user` for user service, `--slice` for cgroup, `--memory` and `--cpu-quota`.
-      (push "--user" prefix) ; Run as a user service for non-root systemd-run
+                 :message "`systemd-run` not found for resource limits. \
+                           Is systemd installed?")))
+      ;; `systemd-run` options: `--user` for user service, `--slice` for
+      ;; cgroup, `--memory` and `--cpu-quota`.
+      (push "--user" prefix)
       (when slice (push (format "--slice=%s" slice) prefix))
       (when mem (push (format "--memory=%s" mem) prefix))
       (when cpu (push (format "--cpu-quota=%d" cpu) prefix))
       (push "systemd-run" prefix)
-      (push "--" prefix)) ; Separator for systemd-run command
+      (push "--" prefix))
     ;; If user/group change is requested, build a `sudo` prefix.
     (when (or user group)
       (unless (executable-find "sudo")
         (signal (warp:error!
                  :type 'warp-process-security-enforcement-error
-                 :message "`sudo` not found for user/group change. Is it installed and configured?")))
+                 :message "`sudo` not found for user/group change. \
+                           Is it installed and configured?")))
       (push "sudo" prefix)
-      (when user (push "-u" prefix) (push user prefix)) ; `-u <user>`
-      (when group (push "-g" prefix) (push group prefix)) ; `-g <group>`
-      (push "--" prefix)) ; Separator for sudo command
+      (when user (push "-u" prefix) (push user prefix))
+      (when group (push "-g" prefix) (push group prefix))
+      (push "--" prefix))
     (nreverse prefix)))
 
 (defun warp--process-build-command (launch-options-instance config)
@@ -378,9 +395,11 @@ Signals:
                    (funcall handler launch-options-instance)
                  (signal (warp:error!
                           :type 'warp-process-error
-                          :message (format "Unsupported process-type: %S. No custom handler registered."
+                          :message (format "Unsupported process-type: %S. \
+                                            No custom handler registered."
                                            process-type)))))))
-         ;; 2. Prepend any security-related command prefixes (e.g., `sudo`, `systemd-run`).
+         ;; 2. Prepend any security-related command prefixes (e.g., `sudo`,
+         ;; `systemd-run`).
          (security-prefix (warp--process-build-security-prefix
                            launch-options-instance))
          (final-cmd-list (append security-prefix base-cmd-list))
@@ -391,28 +410,27 @@ Signals:
     (if remote-host
         (apply #'warp:ssh-build-command remote-host
                :remote-command (string-join safe-cmd-list " ")
-               :pty t) ; Request a pseudo-terminal for interactive-like behavior
+               :pty t)
       safe-cmd-list)))
 
 (defun warp--process-cleanup-resources (proc)
   "Clean up all resources associated with a *local* Emacs process object.
-This function is typically registered as a process sentinel and called
-when a process exits. It ensures that any temporary buffers or timers
-created for the process are properly disposed of, preventing resource
-leaks in Emacs.
+This function is typically registered as a process sentinel for `proc`
+and called when `proc` exits. It ensures that any temporary buffers or
+timers created for the process are properly disposed of, preventing
+resource leaks in Emacs.
 
 Arguments:
 - `proc` (process): The Emacs process object to clean up.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Cancels any associated timeout timer.
 - Kills any temporary buffers created for stderr or filter output."
   (when-let (timer (process-get proc 'timeout-timer))
     (cancel-timer timer))
-  (dolist (prop '(stderr-buffer filter-buffer)) ; Properties where buffers might be stored
+  (dolist (prop '(stderr-buffer filter-buffer))
     (when-let (buffer (process-get proc prop))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
@@ -425,19 +443,19 @@ provided `warp-stream`. This enables higher-level modules to consume
 structured data from process stdout in a reactive manner.
 
 Arguments:
-- `proc` (process): The Emacs `process` object from which data is received.
+- `proc` (process): The Emacs `process` object from which data is
+  received.
 - `raw-chunk` (string): The raw binary data (chunk) received from stdout.
 - `stream` (warp-stream): The `warp-stream` to which decoded messages
   (Lisp objects) should be written.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
 - Reads from `proc`'s stdout and writes decoded messages to `stream`.
 - Accumulates partial messages in a temporary buffer attached to the process.
-- On a decoding failure, logs an error and errors the `stream`, signaling
-  a problem with the incoming data format."
+- On a decoding failure, logs an error and errors the `stream`,
+  signaling a problem with the incoming data format."
   (cl-block warp--process-stream-filter
     ;; Use a temporary buffer attached to the process to accumulate data.
     (let ((buffer (or (process-get proc 'filter-buffer)
@@ -446,19 +464,19 @@ Side Effects:
                         (process-put proc 'filter-buffer b) b))))
       (with-current-buffer buffer
         (goto-char (point-max))
-        (insert-before-markers raw-chunk) ; Append new data
+        (insert-before-markers raw-chunk)
         (goto-char (point-min))
         ;; Loop as long as there's enough data for a length prefix.
-        (while (>= (buffer-size) 4) ; Assuming uvarint prefix is at least 1 byte, plus 3 for potential 4-byte messages
+        (while (>= (buffer-size) 4)
           (let ((len-info (warp-protobuf--read-uvarint-from-string
                            (buffer-string) (point))))
             ;; `len-info` is `(payload-len . varint-len)`
             ;; Check if we successfully read a varint prefix and if the full
             ;; message payload has been received in the buffer.
             (if (and len-info
-                     (let* ((len (car len-info)) ; Actual payload length
-                            (varint-len (cdr len-info))) ; Length of the varint itself
-                       (<= (+ varint-len len) (buffer-size)))) ; Total message length
+                     (let* ((len (car len-info))
+                            (varint-len (cdr len-info)))
+                       (<= (+ varint-len len) (buffer-size))))
                 ;; If so, extract and decode the message.
                 (let* ((varint-len (cdr len-info))
                        (payload-len (car len-info))
@@ -468,21 +486,25 @@ Side Effects:
                                                                  p-end)))
                   ;; Remove the processed message from the buffer.
                   (delete-region (point) p-end)
-                  ;; Deserialize the binary payload and write to the output stream.
+                  ;; Deserialize the binary payload and write to the output
+                  ;; stream.
                   (condition-case decode-err
-                      (warp:stream-write stream (warp:deserialize p-binary))
+                      (loom:await (warp:stream-write stream
+                                                     (warp:deserialize p-binary)))
                     (error
                      (warp:log! :error "warp-process"
                                 "Stream decode error for process %s: %S"
                                 (process-name proc) decode-err)
                      ;; On decoding failure, signal an error to the stream.
-                     (warp:stream-error
-                      stream
-                      (warp:error!
-                       :type 'warp-process-stream-decode-error
-                       :message (format "Failed to decode incoming message from %s: %S"
-                                        (process-name proc) decode-err)
-                       :cause decode-err)))))
+                     (loom:await
+                      (warp:stream-error
+                       stream
+                       (warp:error!
+                        :type 'warp-process-stream-decode-error 
+                        :message
+                        (format "Failed to decode incoming message from %s: %S"
+                                (process-name proc) decode-err)
+                        :cause decode-err))))))
               ;; If not enough data for a full message, stop processing
               ;; and wait for the next chunk of `raw-chunk` input.
               (cl-return-from warp--process-stream-filter nil))))))))
@@ -501,8 +523,8 @@ is designed to be a one-time credential for a new worker to authenticate.
 Returns:
 - (plist): A plist with two keys:
   - `:launch-id` (string): A unique identifier for this launch attempt.
-  - `:token` (string): A random cryptographic challenge (hex string) that
-    the worker is expected to sign and return for verification."
+  - `:token` (string): A random cryptographic challenge (hex string)
+    that the worker is expected to sign and return for verification."
   (let* ((launch-id (format "launch-%s-%06x" (user-login-name)
                             (random (expt 2 24))))
          (challenge (format "%016x%016x" (random (expt 2 64))
@@ -535,9 +557,10 @@ Returns:
 - `t` if all verifications pass successfully, `nil` otherwise.
 
 Side Effects:
-- Consumes the `launch-id` from the token registry on first access (one-time use).
+- Consumes the `launch-id` from the token registry on first access
+  (one-time use).
 - Logs warnings for security failures (token mismatch, bad signature)."
-  (cl-block warp:process-verify-launch-token ; Use `cl-block` for early exit
+  (cl-block warp:process-verify-launch-token
     (let (stored-token)
       ;; Atomically retrieve and consume the one-time launch token.
       (loom:with-mutex! warp--process-launch-token-lock
@@ -547,20 +570,23 @@ Side Effects:
 
       ;; 1. Check if the token was valid and existed in the registry.
       (unless (and stored-token (string= stored-token received-token))
-        (warp:log! :warn "warp-process" "Launch token mismatch or already used for launch ID: %s."
+        (warp:log! :warn "warp-process"
+                   "Launch token mismatch or already used for launch ID: %s."
                    launch-id)
         (cl-return-from warp:process-verify-launch-token nil))
 
       ;; 2. Verify the worker's cryptographic signature.
       (let* ((data-to-verify (format "%s:%s" worker-id received-token))
-             (valid-p (ignore-errors ; Catch potential crypto errors
+             (valid-p (ignore-errors
                         (warp:crypto-verify-signature
                          data-to-verify
                          (warp:crypto-base64url-decode worker-sig)
                          worker-pub-key))))
         (unless valid-p
-          (warp:log! :warn "warp-process" "Worker signature failed verification for worker %s (launch ID: %s)."
-                    worker-id launch-id))
+          (warp:log! :warn "warp-process"
+                     "Worker signature failed verification for worker %s \
+                      (launch ID: %s)."
+                     worker-id launch-id))
         valid-p))))
 
 ;;;###autoload
@@ -575,9 +601,10 @@ Arguments:
 - `launch-options-plist` (plist): A property list containing parameters
   conforming to `process-launch-options`. This defines the process's
   type, command, environment, and resource/security constraints.
-- `:config-options` (plist, optional): A plist of options for the module's
-  `process-config` (e.g., `:emacs-executable`, `:master-private-key-path`).
-  These override global defaults for this launch.
+- `:config-options` (plist, optional): A plist of options for the
+  module's `process-config` (e.g., `:emacs-executable`,
+  `:master-private-key-path`). These override global defaults for this
+  launch.
 
 Returns:
 - (warp-process-handle): A handle to the newly launched process. This
@@ -595,19 +622,20 @@ Signals:
           (apply #'make-process-launch-options-config launch-options-plist))
          (cmd-list (warp--process-build-command launch-options module-config))
          (proc-name (or (process-launch-options-name launch-options)
-                        ;; Generate a default name if not provided.
                         (format "warp-proc-%S-%s"
                                 (process-launch-options-process-type
                                  launch-options)
                                 (format-time-string "%s%N"))))
          (full-env (append (process-launch-options-env launch-options)
                            ;; Ensure SHELL is set for robustness.
-                           (list `(SHELL . ,(or (getenv "SHELL") "/bin/sh")))))
+                           (list `(SHELL . ,(or (getenv "SHELL")
+                                                "/bin/sh")))))
          ;; Create an explicit process buffer (hidden) for stdout/stderr.
-         (process-buffer (generate-new-buffer (format "*%s-io*" proc-name)))
+         (process-buffer (generate-new-buffer
+                          (format "*%s-io*" proc-name)))
          ;; Start the actual Emacs process.
          (process (apply #'start-process proc-name process-buffer cmd-list)))
-    (set-process-query-on-exit-flag process nil) ; Prevent query on exit for background processes.
+    (set-process-query-on-exit-flag process nil)
     ;; Set a default sentinel for basic logging and resource cleanup.
     (set-process-sentinel
      process
@@ -711,10 +739,9 @@ whether it's running locally (as an Emacs `process` object) or remotely
 Arguments:
 - `HANDLE` (warp-process-handle): The handle of the process to terminate.
 
-Returns:
-- (loom-promise): A promise that resolves when the termination command
-  has been issued. For local processes, this implies the process is killed.
-  For remote processes, it resolves when the SSH command to kill is sent.
+Returns: (loom-promise): A promise that resolves to `t` when the
+  termination command has been issued and, for local processes, the
+  process is confirmed killed.
 
 Side Effects:
 - For local processes, calls `kill-process` and performs resource cleanup.
@@ -734,7 +761,13 @@ Side Effects:
           (warp:log! :info "warp-process"
                      "Terminating remote process '%s' (%S) on %s via '%s'."
                      proc-name proc-type remote-host remote-cmd)
-          (warp:ssh-exec remote-host remote-cmd))
+          (braid! (warp:ssh-exec remote-host remote-cmd)
+            (:then (lambda (_) t)) ; Resolve to `t` on success
+            (:catch (lambda (err)
+                      (warp:log! :error "warp-process"
+                                 "Failed to terminate remote process %s: %S"
+                                 proc-name err)
+                      (loom:rejected! err))))))
       ;; Local process: Use standard Emacs `kill-process`.
       (when-let ((proc (warp-process-handle-process handle)))
         (warp:log! :info "warp-process" "Terminating local process '%s' (%S)."
@@ -744,5 +777,56 @@ Side Effects:
         (warp--process-cleanup-resources proc)
         (loom:resolved! t)))))
 
-(provide 'warp-process)
-;;; warp-process.el ends here
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Module Initialization
+
+(defun warp--dummy-public-key-getter ()
+  "A dummy public key getter for `warp-exec`'s strict policies.
+In a real `warp-worker` environment, this would be replaced by a function
+that retrieves the actual public key material from the `key-manager`
+component. This placeholder allows the module to be loaded and compiled
+independently. **For production use, ensure this is replaced by a secure
+and functional key retrieval mechanism.**"
+  (warp:log! :warn "warp-exec" (concat "Dummy public key getter called. "
+                                       "For production, ensure a real \
+                                        implementation is provided by the \
+                                        worker environment (e.g., `key-manager`)."))
+  nil)
+
+;; Register the security strategies defined in this module with the
+;; central `warp-security-policy` system. This makes them available for
+;; use by components like the `warp-worker`.
+(warp:security-policy-register
+ :ultra-strict
+ "Maximum security with validation, monitoring, and signed forms."
+ (lambda (form _args config)
+   (warp-exec--ultra-strict-strategy-fn form config
+                                        #'warp--dummy-public-key-getter))
+ :requires-auth-fn (lambda (_cmd) t)
+ :auth-validator-fn #'warp--security-policy-jwt-auth-validator)
+
+(warp:security-policy-register
+ :strict
+ "Executes code using a dynamic, per-form whitelist with sandboxing."
+ (lambda (form _args config)
+   (warp-exec--strict-strategy-fn form config
+                                  #'warp--dummy-public-key-getter))
+ :requires-auth-fn (lambda (_cmd) t)
+ :auth-validator-fn #'warp--security-policy-jwt-auth-validator)
+
+(warp:security-policy-register
+ :moderate
+ "Executes code using a predefined whitelist of safe functions."
+ (lambda (form _args config) (warp-exec--moderate-strategy-fn form config))
+ :requires-auth-fn (lambda (_cmd) nil)
+ :auth-validator-fn #'warp--security-policy-no-auth-validator)
+
+(warp:security-policy-register
+ :permissive
+ "Executes code with minimal restrictions, for trusted sources only."
+ (lambda (form _args config) (warp-exec--permissive-strategy-fn form config))
+ :requires-auth-fn (lambda (_cmd) nil)
+ :auth-validator-fn #'warp--security-policy-no-auth-validator)
+
+(provide 'warp-exec)
+;;; warp-exec.el ends here
