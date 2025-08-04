@@ -87,14 +87,14 @@ Signals:
 - `warp-tcp-error`: If the address string is malformed."
   (let* ((stripped (if (string-prefix-p "tcp://" address)
                        (substring address (length "tcp://")) address))
-         (parts (split-string stripped ":" t)))
+         (parts (s-split ":" stripped t)))
     (unless (>= (length parts) 2)
       (error 'warp-tcp-error (format "Invalid TCP address: %s" address)))
     (let* ((port-str (car (last parts)))
-           (host-str (string-join (butlast parts) ":")))
+           (host-str (s-join ":" (butlast parts))))
       (cons host-str (string-to-number port-str)))))
 
-(defun warp-tcp--setup-new-client (server-proc server-connection client-registry)
+(defun warp-tcp--setup-server-side-client (server-proc server-connection client-registry)
   "Set up a new client connection accepted by the server.
 This function is called from the server's sentinel. It creates a new
 `warp-transport-connection` for the client, configures its filters and
@@ -131,21 +131,24 @@ Side Effects:
     (set-process-filter
      client-proc
      (lambda (_p raw-chunk)
-       (warp-transport--process-incoming-raw-data client-conn raw-chunk)))
+       (loom:await ; Await data processing
+        (warp-transport--process-incoming-raw-data client-conn raw-chunk))))
     ;; The sentinel handles unexpected disconnects, triggering the transport
     ;; layer's generic error and auto-reconnect logic.
     (set-process-sentinel
      client-proc
      (lambda (_p _e)
-       (warp-transport--handle-error
-        client-conn
-        (warp:error! :type 'warp-tcp-connection-error
-                     :message "Client disconnected."))))
+       (loom:await ; Await error handling
+        (warp-transport--handle-error
+         client-conn
+         (warp:error! :type 'warp-tcp-connection-error
+                      :message "Client disconnected."))))))
     ;; Register the new client and transition its state to connected.
     (puthash (warp-transport-connection-id client-conn) client-conn
              client-registry)
-    (warp:state-machine-emit (warp-transport-connection-state-machine
-                              client-conn) :success)
+    (loom:await ; Await state machine emit
+     (warp:state-machine-emit (warp-transport-connection-state-machine
+                               client-conn) :success))
     (warp:log! :info "warp-tcp" "Accepted client %s on server %s"
                (warp-transport-connection-id client-conn)
                (warp-transport-connection-id server-connection))))
@@ -183,13 +186,15 @@ Returns:
                        :message (format "TCP client process %s died."
                                         (process-name proc)))))
              ;; This generic handler manages state and reconnects.
-             (warp-transport--handle-error connection err))))
+             (loom:await ; Await error handling
+              (warp-transport--handle-error connection err)))))
 
         ;; The filter pushes incoming data to the transport layer's stream.
         (set-process-filter
          process
          (lambda (_proc raw-chunk)
-           (warp-transport--process-incoming-raw-data connection raw-chunk)))
+           (loom:await ; Await data processing
+            (warp-transport--process-incoming-raw-data connection raw-chunk))))
 
         ;; Return the raw process as the handle for this connection.
         process)
@@ -227,8 +232,9 @@ Returns:
                :sentinel
                (lambda (proc _event)
                  (when (eq (process-status proc) 'connect)
-                   (warp-tcp--setup-new-client
-                    proc server-connection client-registry))))))
+                   (loom:await ; Await client setup
+                    (warp-tcp--setup-server-side-client
+                     proc server-connection client-registry)))))))
         ;; The "raw connection" for a server is a plist containing its
         ;; listener process and the hash table that will store clients.
         `(:process ,server-proc :clients ,client-registry))
@@ -256,7 +262,7 @@ Returns:
           (warp:log! :info "warp-tcp" "Closing client connection: %s"
                      (warp-transport-connection-address connection))
           (when (process-live-p raw-conn)
-            (set-process-sentinel raw-conn nil) ; Prevent sentinel firing
+            (set-process-sentinel raw-conn nil)
             (delete-process raw-conn)))
       ;; --- This is a server connection ---
       (let ((server-proc (plist-get raw-conn :process))
@@ -265,7 +271,8 @@ Returns:
                    (warp-transport-connection-address connection))
         ;; Close all connected clients first.
         (maphash (lambda (_id client-conn)
-                   (warp:transport-close client-conn))
+                   (loom:await ; Await client connection close
+                    (warp:transport-close client-conn)))
                  clients)
         (clrhash clients)
         ;; Close the main server listener process.
@@ -323,8 +330,7 @@ Returns:
 Called on Emacs exit. The generic transport shutdown handles closing
 active connections, so no specific action is needed here.
 
-Returns:
-- `nil`."
+Returns: `nil`."
   (warp:log! :info "warp-tcp" "Running global TCP cleanup on exit.")
   nil)
 
@@ -354,4 +360,4 @@ Returns:
   :cleanup-fn #'warp-tcp-protocol--cleanup-fn)
 
 (provide 'warp-tcp)
-;;; warp-tcp.el ends here
+;;; warp-tcp.el ends here ;;;
