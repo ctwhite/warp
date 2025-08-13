@@ -3,9 +3,11 @@
 ;;; Commentary:
 ;;
 ;; This module provides a helper for constructing and managing SSH
-;; commands for remote execution. It abstracts away shell-quoting,
-;; identity file management, and common SSH options, providing a clean
-;; and secure interface for modules that launch processes on remote machines.
+;; commands for remote execution. It now integrates with the
+;; `warp-security-engine` to ensure that all remote commands are
+;; validated against a security policy before being executed. This
+;; prevents malicious code injection and ensures that only pre-approved
+;; commands can be run.
 ;;
 ;; ## Key Features:
 ;;
@@ -13,6 +15,9 @@
 ;;   arrays suitable for `call-process` or `make-process`.
 ;; - **Asynchronous Execution**: Provides `warp:ssh-exec` to run commands
 ;;   remotely and return a `loom-promise` for the result.
+;; - **Policy-Based Security**: Utilizes `warp-security-engine` to
+;;   validate and execute commands under a `:strict` policy, ensuring
+;;   only whitelisted forms can be run.
 ;; - **Argument Sanitization**: Ensures all arguments are properly
 ;;   shell-quoted to prevent injection vulnerabilities.
 ;; - **Authentication Options**: Supports specifying a remote user and
@@ -33,9 +38,11 @@
 (require 's)
 (require 'subr-x)
 (require 'loom)
+(require 'braid)
 
 (require 'warp-log)
 (require 'warp-error)
+(require 'warp-security-engine)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -172,25 +179,24 @@ Signals:
                  :details `(:path ,expanded-path))))
       expanded-path)))
 
-(defun warp-ssh--validate-command (remote-command)
-  "Validate the REMOTE-COMMAND specification.
+(defun warp-ssh--validate-secure-form (secure-form)
+  "Validate that the SECURE-FORM is a proper `warp-security-engine-secure-form`.
 
 Arguments:
-- `remote-command` (string): The shell command to execute remotely.
+- `secure-form` (warp-security-engine-secure-form): The object to validate.
 
 Returns:
-- (string): The validated and trimmed `remote-command`.
+- `t` if valid.
 
 Side Effects:
 - None.
 
 Signals:
-- `warp-ssh-command-error`: If the command is invalid."
-  (unless (and (stringp remote-command)
-               (not (s-empty? (s-trim remote-command))))
+- `warp-ssh-command-error`: If the form is not a `warp-security-engine-secure-form`."
+  (unless (warp-security-engine-secure-form-p secure-form)
     (signal (warp:error! :type 'warp-ssh-command-error
-                         :message "Remote command must be a non-empty string.")))
-  (s-trim remote-command))
+                         :message "Remote command must be a warp-security-engine-secure-form object.")))
+  t)
 
 (defun warp-ssh--build-connection-options ()
   "Build common SSH options based on `defcustom` values.
@@ -256,17 +262,18 @@ Side Effects:
 
 ;;;###autoload
 (cl-defun warp:ssh-build-command
-    (remote-host &key remote-user identity-file remote-command (pty nil))
+    (remote-host &key remote-user identity-file secure-form (pty nil))
   "Construct the full `ssh` command array for executing a command.
 This function generates a list of strings suitable for `make-process`.
-It safely combines all necessary options for authentication,
-connection behavior, and host key checking.
+It now requires a `secure-form` object to ensure the command is
+validated against a security policy.
 
 Arguments:
 - `REMOTE-HOST` (string): Hostname or IP of the remote server.
 - `:REMOTE-USER` (string): Username for SSH authentication.
 - `:IDENTITY-FILE` (string): Path to an SSH private key file.
-- `:REMOTE-COMMAND` (string): Shell command to execute remotely.
+- `:SECURE-FORM` (warp-security-engine-secure-form): The validated
+  Lisp form to be executed.
 - `:PTY` (boolean, optional): If `t`, request a pseudo-terminal
   (`-t`) for the SSH session. Defaults to `nil`.
 
@@ -278,7 +285,7 @@ Signals:
 - `warp-ssh-host-error`: If `REMOTE-HOST` is invalid.
 - `warp-ssh-error`: If `REMOTE-USER` is invalid.
 - `warp-ssh-key-file-error`: If `IDENTITY-FILE` is inaccessible.
-- `warp-ssh-command-error`: If `REMOTE-COMMAND` is invalid."
+- `warp-ssh-command-error`: If `SECURE-FORM` is invalid."
   ;; 1. Check for SSH availability first.
   (unless (warp:ssh-available-p)
     (signal (warp:error! :type 'warp-ssh-exec-not-found)))
@@ -287,12 +294,13 @@ Signals:
   (let ((v-host (warp-ssh--validate-host remote-host))
         (v-user (warp-ssh--validate-user remote-user))
         (v-identity (warp-ssh--validate-identity-file identity-file))
-        (v-command (warp-ssh--validate-command remote-command)))
-
-    ;; 3. Build SSH command components.
-    (let* ((user-host (if v-user (format "%s@%s" v-user v-host) v-host))
+        (v-form (warp-ssh--validate-secure-form secure-form)))
+    
+    (let* ((remote-command-string (prin1-to-string
+                                   (warp-security-engine-secure-form-form v-form)))
+           (user-host (if v-user (format "%s@%s" v-user v-host) v-host))
            (identity-args (when v-identity (list "-i" v-identity)))
-           (pty-arg (when pty '("-t"))) ; Add -t for pseudo-terminal
+           (pty-arg (when pty '("-t")))
            (base-options
             '("-o" "BatchMode=yes"
               "-o" "PasswordAuthentication=no"
@@ -304,81 +312,97 @@ Signals:
       ;; 4. Assemble the final command list.
       (append (list "ssh")
               identity-args
-              pty-arg ; Add PTY argument here
+              pty-arg
               base-options
               connection-opts
               host-key-opts
               (list user-host)
-              (list v-command)))))
+              (list remote-command-string)))))
 
 ;;;###autoload
-(cl-defun warp:ssh-exec (remote-host remote-command &key remote-user
-                                                         identity-file)
+(cl-defun warp:ssh-exec (remote-host secure-form &key remote-user identity-file)
   "Asynchronously execute a command on a remote host via SSH.
 This function provides a high-level, promise-based interface for remote
-execution. It builds the secure SSH command, launches the process, and
-returns a promise that settles with the command's output or an error.
+execution. It first uses the `security-manager-service` to validate the
+`secure-form` under a strict policy before attempting to execute it.
 
 Arguments:
 - `REMOTE-HOST` (string): Hostname or IP of the remote server.
-- `REMOTE-COMMAND` (string): The shell command to execute remotely.
+- `SECURE-FORM` (warp-security-engine-secure-form): A validated,
+  declarative representation of the command to execute.
 - `:REMOTE-USER` (string, optional): Username for SSH authentication.
 - `:IDENTITY-FILE` (string, optional): Path to an SSH private key file.
 
 Returns:
 - (loom-promise): A promise that resolves with stdout as a string on
-  success. On failure, it rejects with a `warp-ssh-error` containing
-  the stderr and exit code.
+  success. On failure, it rejects with a `warp-ssh-error` or
+  `warp-security-engine-violation` containing the error details.
 
 Side Effects:
 - Spawns an `ssh` subprocess.
 - Creates temporary buffers to capture stdout and stderr.
 
 Signals:
-- Propagates any validation errors from `warp:ssh-build-command`."
+- Propagates any validation errors from `warp-security-engine` or
+  `warp:ssh-build-command`."
   (loom:promise
    :name (format "ssh-exec-%s" remote-host)
    :executor
    (lambda (resolve reject)
-     (let* ((cmd-list (warp:ssh-build-command
-                       remote-host
-                       :remote-user remote-user
-                       :identity-file identity-file
-                       :remote-command remote-command))
-            (proc-name (format "ssh-%s" remote-host))
-            (stdout-buffer (generate-new-buffer
-                            (format "*%s-stdout*" proc-name)))
-            (stderr-buffer (generate-new-buffer
-                            (format "*%s-stderr*" proc-name)))
-            (proc (apply #'make-process
-                         :name proc-name
-                         :command cmd-list
-                         :stdout stdout-buffer
-                         :stderr stderr-buffer)))
+     (braid!
+       ;; 1. Use the security service to validate the form under a strict policy.
+       (let* ((cs (warp:get-component-system))
+              (security-svc (warp:component-system-get cs :security-manager-service)))
+         (loom:await (warp:security-manager-service-execute-form
+                      security-svc
+                      secure-form
+                      :strict)))
 
-       (set-process-sentinel
-        proc
-        (lambda (p _e)
-          (unwind-protect
-              (let ((exit-status (process-exit-status p)))
-                (if (zerop exit-status)
-                    ;; Success: resolve with the standard output.
-                    (funcall resolve (with-current-buffer stdout-buffer
-                                       (buffer-string)))
-                  ;; Failure: reject with a structured error.
-                  (funcall reject
-                           (warp:error!
-                            :type 'warp-ssh-command-error
-                            :message (format "SSH command failed with code %d"
-                                             exit-status)
-                            :details `(:exit-code ,exit-status
-                                       :stderr
-                                       ,(with-current-buffer stderr-buffer
-                                          (buffer-string)))))))
-            ;; Cleanup: kill the temporary buffers.
-            (when (buffer-live-p stdout-buffer) (kill-buffer stdout-buffer))
-            (when (buffer-live-p stderr-buffer)
-              (kill-buffer stderr-buffer)))))))))
+     (:then (validated-form-result)
+       ;; 2. If validation passes, build the command and execute it.
+       (let* ((cmd-list (warp:ssh-build-command
+                         remote-host
+                         :remote-user remote-user
+                         :identity-file identity-file
+                         :secure-form secure-form))
+              (proc-name (format "ssh-%s" remote-host))
+              (stdout-buffer (generate-new-buffer
+                              (format "*%s-stdout*" proc-name)))
+              (stderr-buffer (generate-new-buffer
+                              (format "*%s-stderr*" proc-name)))
+              (proc (apply #'make-process
+                           :name proc-name
+                           :command cmd-list
+                           :stdout stdout-buffer
+                           :stderr stderr-buffer)))
+
+         (set-process-sentinel
+          proc
+          (lambda (p _e)
+            (unwind-protect
+                (let ((exit-status (process-exit-status p)))
+                  (if (zerop exit-status)
+                      ;; Success: resolve with the standard output.
+                      (funcall resolve (with-current-buffer stdout-buffer
+                                         (buffer-string)))
+                    ;; Failure: reject with a structured error.
+                    (funcall reject
+                             (warp:error!
+                              :type 'warp-ssh-command-error
+                              :message (format "SSH command failed with code %d"
+                                               exit-status)
+                              :details `(:exit-code ,exit-status
+                                         :stderr
+                                         ,(with-current-buffer stderr-buffer
+                                            (buffer-string)))))))
+              ;; Cleanup: kill the temporary buffers.
+              (when (buffer-live-p stdout-buffer) (kill-buffer stdout-buffer))
+              (when (buffer-live-p stderr-buffer)
+                (kill-buffer stderr-buffer)))))))
+
+     (:catch (err)
+       ;; 3. If validation fails or a general error occurs, reject the promise.
+       (funcall reject err)))))
 
 (provide 'warp-ssh)
 ;;; warp-ssh.el ends here

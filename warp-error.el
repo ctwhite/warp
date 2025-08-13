@@ -1,41 +1,31 @@
-;;; warp-error.el --- Centralized Warp Error Definitions and Utilities -*- lexical-binding: t; -*-
+;;; warp-error.el --- Production-Grade Error Handling and Fault Tolerance -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
-;; This module serves as the **single, centralized source for all
-;; Warp-specific error definitions and utilities** within the Warp
-;; distributed computing framework. It leverages `loom-errors.el` to
-;; establish a consistent error hierarchy and provides a powerful macro
-;; for creating rich, context-aware error objects.
+;; This module provides a production-grade error handling and fault
+;; tolerance system for the Warp framework. It introduces a structured
+;; approach to defining and handling errors, integrating with retry
+;; policies and circuit breakers.
 ;;
-;; By consolidating error definitions and creation utilities here, we
-;; ensure:
-;;
-;; -   **Unified Error Hierarchy**: All Warp errors are descendants of
-;;     `warp-error`, providing clear type checking and handling paths.
-;; -   **Consistency**: Errors are signaled and handled uniformly across
-;;     all modules.
-;; -   **Traceability**: Error objects automatically capture detailed
-;;     context (worker ID, cluster ID, request details, async stack
-;;     traces), crucial for debugging distributed systems.
-;; -   **Simplified Creation**: The `warp:error!` macro streamlines the
-;;     process of creating comprehensive error objects and now
-;;     **automatically handles internal error logging and event emission.**
-;; -   **Interoperability**: `loom-error` objects (which `warp-error`
-;;     extends) are designed for serialization, allowing errors to be
-;;     reliably passed between different Emacs Lisp processes.
-;;
-;; All modules requiring Warp-specific error types or the `warp:error!`
-;; macro should `require 'warp-error`.
+;; This version has been updated with a new abstraction for defining
+;; declarative error handling strategies. The `warp:definalize-error-strategy`
+;; macro allows developers to define a comprehensive policy for how
+;; the system should react to different error types, including retries,
+;; backoff, and circuit breaking.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'loom)
+(require 'braid)
 (require 'loom-error)
 
-(require 'warp-log)   
-(require 'warp-event) 
+(require 'warp-log)
+(require 'warp-event)
+(require 'warp-circuit-breaker)
+
+(defvar warp-error-strategy-registry (make-hash-table :test 'eq)
+  "A registry for error handling strategies.")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -149,15 +139,11 @@ Side Effects:
                   (setq context-data (plist-put context-data :service-name
                                                 svc-name)))))
             ;; Correlation ID from the original message in rpc-event-payload
-            (when (fboundp 'warp-request-pipeline-context-rpc-event-payload)
-              (when-let* ((rpc-evt
-                           (warp-request-pipeline-context-rpc-event-payload ctx))
-                          (msg (when (fboundp 'warp-protocol-rpc-event-payload-message)
-                                 (warp-protocol-rpc-event-payload-message rpc-evt))))
-                (when (fboundp 'warp-rpc-message-correlation-id)
+            (when (fboundp 'warp-request-pipeline-current-event)
+              (when-let ((event warp-request-pipeline-current-event))
+                (when (fboundp 'warp-event-correlation-id)
                   (setq context-data (plist-put context-data :correlation-id
-                                                (warp-rpc-message-correlation-id
-                                                 msg))))))))
+                                                (warp-event-correlation-id event))))))))
         context-data)
     (error
      (warp:log! :warn "warp-error"
@@ -274,6 +260,51 @@ Example:
               :source-id (or (plist-get error-data :source-id) reporter-id)
               :distribution-scope :global))))
        created-error)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Error Strategy Abstraction
+
+(defmacro warp:definalize-error-strategy (name &rest options)
+  "Defines a declarative error handling strategy.
+
+This macro registers a named strategy that combines retry policies
+and circuit breaker configurations.
+
+Arguments:
+- `NAME` (symbol): The name of the strategy.
+- `OPTIONS` (plist): A property list of configurations:
+  - `:retry-policies` (alist): An alist mapping error types to retry policies.
+  - `:circuit-breaker` (plist): Configuration for the circuit breaker.
+
+Returns:
+- (symbol): The name of the defined strategy."
+  `(progn
+     (puthash ',name ',options warp-error-strategy-registry)
+     ',name))
+
+(defun warp:apply-error-strategy (strategy-name fn &rest args)
+  "Applies a named error handling strategy to a function call.
+
+This function wraps `FN` in the logic defined by `STRATEGY-NAME`.
+
+Arguments:
+- `STRATEGY-NAME` (symbol): The name of the error strategy.
+- `FN` (function): The function to call.
+- `&rest ARGS`: Arguments for `FN`.
+
+Returns:
+- (loom-promise): A promise for the result of `FN`."
+  (let* ((strategy (gethash strategy-name warp-error-strategy-registry))
+         (retry-policies (plist-get strategy :retry-policies))
+         (circuit-breaker-opts (plist-get strategy :circuit-breaker)))
+    (braid!
+      (warp:circuit-breaker-execute
+       (warp:circuit-breaker-get strategy-name circuit-breaker-opts)
+       (lambda ()
+         (loom:retry (lambda () (apply fn args))
+                     :policies retry-policies)))
+      (:then (result) result)
+      (:catch (err) (loom:rejected! err))))))
 
 (provide 'warp-error)
 ;;; warp-error.el ends here

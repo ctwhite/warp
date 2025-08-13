@@ -44,7 +44,16 @@
 (require 'warp-log)
 (require 'warp-error)
 (require 'warp-marshal)
-(require 'warp-config) 
+(require 'warp-config)
+(require 'warp-plugin)
+(require 'warp-service)
+(require 'warp-telemetry)
+(require 'warp-component)
+(require 'warp-ipc)
+
+;; Forward declarations for the telemetry client
+(cl-deftype telemetry-client () t)
+(cl-deftype request-pipeline-context () t)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -58,40 +67,43 @@
   'warp-trace-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Struct Definitions
+;;; Global State
+
+(defvar-local warp--trace-current-span nil
+  "Dynamically bound variable holding the currently active
+  `warp-trace-span`. This provides an implicit context for operations
+  that occur within a traced flow, allowing them to automatically
+  associate with the current span without explicit parameter passing.")
+
+(defvar-local warp--trace-sampler-registry (make-hash-table :test 'eq)
+  "A registry for named sampling functions.")
+
+(defvar-local warp--trace-exporter-registry (make-hash-table :test 'eq)
+  "A registry for named exporter components.")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Schema Definitions
 
 (warp:defschema warp-trace-span
     ((:constructor %%make-warp-trace-span)
      (:copier nil)
-     (:json-name "TraceSpan"))
+     (:json-name "TraceSpan")
+     (:generate-protobuf t))
   "Represents a single operation within a distributed trace.
   This is the core unit of a trace, capturing an operation's context,
   duration, and associated metadata.
 
   Fields:
-  - `trace-id` (string): Unique ID for the entire trace. All spans
-    belonging to the same end-to-end request share this ID.
+  - `trace-id` (string): Unique ID for the entire trace.
   - `span-id` (string): Unique ID for this specific span.
   - `parent-span-id` (string or nil): Optional ID of the parent span.
-    Establishes the causal relationship in the trace hierarchy.
-  - `operation-name` (string): A descriptive, human-readable name for
-    the operation represented by this span (e.g., \"RPC.Call\",
-    \"DB.Query\").
-  - `start-time` (float): Unix timestamp (float) when the span began
-    execution.
-  - `end-time` (float): Unix timestamp (float) when the span completed
-    execution.
-  - `tags` (plist or nil): Key-value pairs providing additional context
-    about the operation (e.g., `:http.method`, `:db.statement`,
-    `:error`).
-  - `logs` (list or nil): A list of plists, each representing a
-    structured log event that occurred within the span's lifetime. Each
-    log entry should include at least a `:timestamp` and `:message`.
-  - `status` (keyword): The current status of the span:
-    `:active` (in progress), `:ok` (completed successfully), or
-    `:error` (completed with an error).
-  - `duration` (float): The computed duration of the span in seconds.
-    This field is calculated when `warp:trace-end-span` is called."
+  - `operation-name` (string): A descriptive name for the operation.
+  - `start-time` (float): Unix timestamp (float) when the span began.
+  - `end-time` (float): Unix timestamp (float) when the span completed.
+  - `tags` (plist or nil): Key-value pairs providing additional context.
+  - `logs` (list or nil): A list of structured log events.
+  - `status` (keyword): The final status of the span.
+  - `duration` (float): The computed duration of the span in seconds."
   (trace-id nil :type string :json-key "traceId")
   (span-id nil :type string :json-key "spanId")
   (parent-span-id nil :type (or null string) :json-key "parentSpanId")
@@ -103,40 +115,29 @@
   (status :active :type keyword :json-key "status")
   (duration 0.0 :type float :json-key "duration"))
 
-(warp:defprotobuf-mapping warp-trace-span
-  `((trace-id 1 :string)
-    (span-id 2 :string)
-    (parent-span-id 3 :string)
-    (operation-name 4 :string)
-    (start-time 5 :double)
-    (end-time 6 :double)
-    (tags 7 :bytes)
-    (logs 8 :bytes)
-    (status 9 :string)
-    (duration 10 :double)))
-
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Global State
+;;; Struct Definitions
 
-(defvar-local warp--trace-current-span nil
-  "Dynamically bound variable holding the currently active
-  `warp-trace-span`. This provides an implicit context for operations
-  that occur within a traced flow, allowing them to automatically
-  associate with the current span without explicit parameter passing.")
+(cl-defstruct (warp-tracer (:constructor %%make-tracer))
+  "The central component for managing the tracing lifecycle.
+
+Fields:
+- `name` (string): The name of this tracer instance.
+- `sampler` (function): The sampling function that decides whether to
+  trace a new request. Signature: `(lambda (op-name trace-id))`
+- `exporters` (list): A list of exporter components that will process
+  completed spans.
+- `lock` (loom-lock): A mutex for thread-safe access to exporters.
+- `telemetry-client` (telemetry-client): The client for the unified
+  telemetry service."
+  (name nil :type string)
+  (sampler (cl-assert nil) :type function)
+  (exporters nil :type list)
+  (lock (loom:lock "tracer-lock") :type t)
+  (telemetry-client nil :type (or null telemetry-client)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Private Functions
-
-(defun warp--trace-generate-id ()
-  "Generates a unique 64-bit hexadecimal ID suitable for traces or spans.
-  This function uses Emacs' random number generator to create a high-
-  entropy identifier.
-
-  Arguments: None.
-
-  Returns:
-  - (string): A unique 16-character hexadecimal ID string."
-  (format "%016x" (logior (ash (abs (random)) 32) (abs (random)))))
 
 (defun warp--trace-set-tag (span key value)
   "Sets a tag (key-value pair) on a given trace span.
@@ -145,8 +146,8 @@
 
   Arguments:
   - `SPAN` (warp-trace-span): The `warp-trace-span` object to modify.
-  - `KEY` (keyword): The key of the tag (e.g., `:http.status_code`).
-  - `VALUE` (any): The value of the tag (can be string, number, boolean).
+  - `KEY` (keyword): The key of the tag.
+  - `VALUE` (any): The value of the tag.
 
   Returns: `nil`.
 
@@ -155,212 +156,319 @@
   (unless (warp-trace-span-p span)
     (error (warp:error! :type 'warp-trace-invalid-span
                         :message "Invalid span object for setting tag.")))
-  (plist-put! (warp-trace-span-tags span) key value))
+  (plist-put! (warp-trace-span-tags span) key value)
+  nil)
+
+(defun warp--trace-export-span (tracer span)
+  "Dispatches a completed span to all registered exporters.
+
+Why: This function provides the final step of the tracing lifecycle,
+sending a completed span to any registered exporter for processing.
+
+How: It iterates through the list of exporters and calls their
+`export` method. In this version, we send the span to the central
+telemetry pipeline for a unified observability stream.
+
+Arguments:
+- `TRACER` (warp-tracer): The tracer instance.
+- `SPAN` (warp-trace-span): The completed span to export.
+
+Returns: (loom-promise): A promise that resolves when all exporters
+  have processed the span."
+  (when-let (client (warp-tracer-telemetry-client tracer))
+    (loom:await (telemetry-client-emit-span client span))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
+;;;---------------------------------------------------------------------
+;;; Creation & Management
+;;;---------------------------------------------------------------------
+
 ;;;###autoload
-(cl-defun warp:trace-start-span
-    (operation-name &key parent-span trace-id parent-span-id tags)
-  "Starts a new trace span, representing a new operation in a trace.
-  If `parent-span` is provided (from the same process), the new span
-  becomes its child. If `trace-id` and `parent-span-id` are provided,
-  they are used to continue a trace that originated from a remote context
-  (e.g., propagated via RPC headers).
+(cl-defun warp:tracer-create (&key name sampler telemetry-client)
+  "Creates a new `warp-tracer` component.
 
-  Arguments:
-  - `OPERATION-NAME` (string): A descriptive name for the operation
-    this span represents (e.g., \"RPC.ClientCall\").
-  - `:parent-span` (warp-trace-span or nil, optional): The parent span
-    object from the current process. If provided, `trace-id` and
-    `parent-span-id` will be derived from it.
-  - `:trace-id` (string or nil, optional): An explicit trace ID to
-    associate with this span. Used when propagating context from a
-    remote system. If `parent-span` is also provided, `trace-id` will
-    override the parent's trace ID.
-  - `:parent-span-id` (string or nil, optional): An explicit parent
-    span ID. Used when propagating context from a remote system. If
-    `parent-span` is also provided, this will override the parent's
-    span ID.
-  - `:tags` (plist or nil, optional): An initial property list of
-    key-value pairs (tags) to associate with this span.
+Arguments:
+- `:name` (string): A name for this tracer instance.
+- `:sampler` (function): The sampling function to use.
+- `:telemetry-client` (telemetry-client): The client for the unified
+  telemetry service.
 
-  Returns:
-  - (warp-trace-span): The newly created `warp-trace-span` object, which
-    is in an `:active` state. This span must eventually be ended using
-    `warp:trace-end-span`."
-  (let* ((new-trace-id (cond (trace-id trace-id)
-                             (parent-span
-                              (warp-trace-span-trace-id parent-span))
-                             (t (warp--trace-generate-id))))
+Returns:
+- (warp-tracer): A new, configured tracer instance."
+  (%%make-tracer
+   :name (or name "default-tracer")
+   :sampler (or sampler (lambda (_op _id) t))
+   :exporters nil
+   :telemetry-client telemetry-client))
+
+;;;###autoload
+(cl-defun warp:tracer-start-span (tracer operation-name &key parent-span
+                                                             trace-id
+                                                             parent-span-id
+                                                             tags)
+  "Starts a new trace span, representing a new operation.
+
+Why: This function first consults the tracer's sampler to determine if a
+new trace should be recorded. It uses standard 128-bit UUIDs for Trace
+IDs and 64-bit random numbers for Span IDs to align with modern tracing
+conventions.
+
+Arguments:
+- `TRACER` (warp-tracer): The tracer instance.
+- `OPERATION-NAME` (string): A descriptive name for the operation.
+- `:parent-span` (warp-trace-span): The parent span from the current
+  process.
+- `:trace-id` (string): An explicit trace ID from a remote context.
+- `:parent-span-id` (string): An explicit parent span ID from a remote
+  context.
+- `:tags` (plist): An initial list of tags.
+
+Returns:
+- (warp-trace-span): The newly created `warp-trace-span` object."
+  (let* ((parent-trace-id (or trace-id
+                              (when parent-span
+                                (warp-trace-span-trace-id parent-span))))
+         (should-sample (funcall (warp-tracer-sampler tracer)
+                                 operation-name
+                                 parent-trace-id))
+         (new-trace-id (or parent-trace-id
+                           (warp:uuid-string (warp:uuid4))))
          (new-parent-span-id (or parent-span-id
                                  (when parent-span
                                    (warp-trace-span-span-id parent-span))))
-         (new-span (%%make-warp-trace-span
-                    :trace-id new-trace-id
-                    :span-id (warp--trace-generate-id)
-                    :parent-span-id new-parent-span-id
-                    :operation-name operation-name
-                    :start-time (float-time)
-                    :tags (copy-sequence tags)
-                    :status :active)))
-    (warp:log! :trace "warp-trace"
-               "Started span %s (trace: %s, parent: %s, op: %s)"
-               (warp-trace-span-span-id new-span)
-               new-trace-id
-               (or new-parent-span-id "none")
-               operation-name)
-    new-span))
+         (tags-hash (if tags (plist-to-hash-table tags)
+                      (make-hash-table))))
+    ;; If the sampler decides not to trace, mark the span as such.
+    (unless should-sample
+      (puthash :sampled nil tags-hash))
+
+    (%%make-warp-trace-span
+     :trace-id new-trace-id
+     ;; Use a 64-bit (16-char hex) random ID for the Span ID, which is a
+     ;; common convention in tracing systems like Jaeger and OpenTelemetry.
+     :span-id (format "%016x" (logior (ash (abs (random)) 32)
+                                      (abs (random))))
+     :parent-span-id new-parent-span-id
+     :operation-name operation-name
+     :start-time (float-time)
+     :tags (copy-sequence tags-hash)
+     :status :active)))
 
 ;;;###autoload
-(cl-defun warp:trace-end-span (span &key status error)
+(cl-defun warp:tracer-end-span (tracer span &key status error)
   "Ends a trace span, recording its duration and final status.
-  This function is crucial for ensuring that span metrics are complete.
-  It should always be called after an operation represented by a span
-  has completed, whether successfully or with an error.
 
-  Arguments:
-  - `SPAN` (warp-trace-span): The `warp-trace-span` object to end.
-  - `:status` (keyword or nil, optional): The explicit final status of
-    the span (`:ok` or `:error`). If `error` is non-nil, this defaults
-    to `:error`. If `error` is nil, it defaults to `:ok`.
-  - `:error` (error or nil, optional): An error object (`loom-error`
-    or standard Emacs `error`) if the operation represented by the span
-    ended in failure. If provided, `error.type` and `error.message` tags
-    will be added to the span.
+After ending the span, this function dispatches it to the
+`telemetry-service` for processing, but only if the span was sampled.
 
-  Returns:
-  - (warp-trace-span): The modified `warp-trace-span` object, now in
-    a completed state.
+Arguments:
+- `TRACER` (warp-tracer): The tracer instance.
+- `SPAN` (warp-trace-span): The span object to end.
+- `:status` (keyword): The explicit final status (`:ok` or `:error`).
+- `:error` (t): An error object if the operation failed.
 
-  Signals:
-  - `warp-trace-invalid-span`: If `SPAN` is not a valid span object."
-  (unless (warp-trace-span-p span)
-    (error (warp:error! :type 'warp-trace-invalid-span
-                        :message "Invalid span object for ending.")))
-  ;; Prevent ending a span more than once.
-  (when (eq (warp-trace-span-status span) :active)
+Returns:
+- (warp-trace-span): The modified, completed span object."
+  (when (and (warp-trace-span-p span)
+             (eq (warp-trace-span-status span) :active))
     (setf (warp-trace-span-end-time span) (float-time))
     (setf (warp-trace-span-duration span)
           (- (warp-trace-span-end-time span)
              (warp-trace-span-start-time span)))
     (setf (warp-trace-span-status span) (or status (if error :error :ok)))
     (when error
-      (warp--trace-set-tag span :error t)
-      (warp--trace-set-tag span :error.type (loom-error-type error))
-      (warp--trace-set-tag span :error.message (loom-error-message error)))
-    (warp:log! :trace "warp-trace"
-               "Ended span %s (op: %s, duration: %.3fs, status: %S)"
-               (warp-trace-span-span-id span)
-               (warp-trace-span-operation-name span)
-               (warp-trace-span-duration span)
-               (warp-trace-span-status span)))
+      (puthash :error t (warp-trace-span-tags span)))
+
+    ;; Only send the span to the pipeline if it was sampled for recording.
+    (when (gethash :sampled (warp-trace-span-tags span))
+      (loom:await (telemetry-client-emit-span
+                   (warp-tracer-telemetry-client tracer)
+                   span))))
   span)
 
 ;;;###autoload
-(cl-defmacro warp:trace-with-span ((span-var operation-name &rest args)
-                                    &rest body)
-  "Execute `BODY` within a new trace span, ensuring it is properly closed.
-  The `span-var` will be dynamically bound to the new `warp-trace-span`
-  object. The span is automatically started before `BODY` execution and
-  is guaranteed to be ended when `BODY` completes, even if an error,
-  non-local exit, or `throw` occurs. The current span context (`warp--trace-current-span`)
-  is also correctly managed for nested calls, ensuring proper parent-child
-  relationships.
+(cl-defmacro warp:trace-with-span ((span-var tracer operation-name &rest args)
+                                   &rest body)
+  "Executes `BODY` within a new trace span, ensuring it is properly
+closed.
 
-  Arguments:
-  - `SPAN-VAR` (symbol): A variable name to which the newly created
-    `warp-trace-span` object will be bound for use within `BODY`.
-  - `OPERATION-NAME` (string): A descriptive name for the operation
-    this span covers.
-  - `&rest ARGS` (plist): Additional keyword arguments passed directly
-    to `warp:trace-start-span` (e.g., `:tags`, `:trace-id`,
-    `:parent-span-id`). The `:parent-span` argument is automatically
-    derived from the `warp--trace-current-span` unless explicitly
-    overridden.
-  - `&rest BODY`: The forms to execute within the context of this span.
+Why: This macro is the primary, recommended way to instrument code. It
+handles the full span lifecycle: starting the span, binding it to a
+variable, setting it as the current dynamic context, executing the body,
+and guaranteeing the span is ended and exported, even if an error occurs.
 
-  Returns:
-  - The result of the last form in `BODY`.
+Arguments:
+- `SPAN-VAR` (symbol): A variable name for the new `warp-trace-span` object.
+- `TRACER` (warp-tracer): The tracer instance to use.
+- `OPERATION-NAME` (string): A name for the operation this span covers.
+- `&rest ARGS` (plist): Keyword arguments passed to
+  `warp:tracer-start-span`.
+- `&rest BODY`: The forms to execute within the context of this span.
 
-  Side Effects:
-  - Creates and starts a `warp-trace-span`.
-  - Modifies `warp--trace-current-span` dynamically.
-  - Ends the `warp-trace-span` upon completion or error of `BODY`.
-  - If an error occurs in `BODY`, the span's status is set to `:error`,
-    and the error details are added as tags, before re-signaling the
-    original error."
-  (declare (indent 2) (debug `(form ,@form)))
-  `(let ((,span-var (apply #'warp:trace-start-span ,operation-name
+Returns:
+- The result of the last form in `BODY`."
+  (declare (indent 3) (debug `(form ,@form)))
+  `(let ((,span-var (apply #'warp:tracer-start-span ,tracer ,operation-name
                            (append (list :parent-span warp--trace-current-span)
                                    ,args))))
      (unwind-protect
+         ;; Dynamically bind the new span as the current span for
+         ;; nested calls.
          (cl-letf (((symbol-value 'warp--trace-current-span) ,span-var))
            (condition-case err
                (progn ,@body)
-             (error
-              (warp:trace-end-span ,span-var :error err)
+             (error ; If an error occurs, end the span with error status.
+              (warp:tracer-end-span ,tracer ,span-var :error err)
               (signal (car err) (cdr err)))))
-       ;; This cleanup form runs regardless of how the body exits.
-       (when (eq (warp-trace-span-status ,span-var) :active) ; Ensure active before ending
-         (warp:trace-end-span ,span-var)))))
-
-;;;###autoload
-(defun warp:trace-current-span ()
-  "Returns the currently active `warp-trace-span` for the current
-  execution context. This allows sub-operations or nested calls to
-  retrieve the parent span for linking or adding context.
-
-  Arguments: None.
-
-  Returns:
-  - (warp-trace-span or nil): The `warp-trace-span` object currently
-    bound to `warp--trace-current-span`, or `nil` if no span is
-    active in the current dynamic scope."
-  warp--trace-current-span)
+       ;; This cleanup form runs regardless of how the body exits,
+       ;; ensuring the span is always ended.
+       (when (eq (warp-trace-span-status ,span-var) :active)
+         (warp:tracer-end-span ,tracer ,span-var)))))
 
 ;;;###autoload
 (defun warp:trace-add-tag (key value)
   "Adds a tag (key-value pair) to the currently active trace span.
-  If no span is active in the current dynamic scope (i.e.,
-  `warp:trace-current-span` returns `nil`), this operation is a no-op,
-  and no error is signaled.
 
-  Arguments:
-  - `KEY` (keyword): The key of the tag to add (e.g., `:http.status`).
-  - `VALUE` (any): The value associated with the tag.
+Why: This function should be called from within a `warp:trace-with-span`
+block. It allows a developer to enrich a span with additional context as
+the operation progresses.
 
-  Returns: `nil`."
-  (when-let (span (warp:trace-current-span))
-    (warp--trace-set-tag span key value)))
+:Arguments:
+- `key` (keyword): The name of the tag (e.g., `:db.query`).
+- `value` (any): The value of the tag.
+
+:Returns:
+- `t` on success.
+
+:Side Effects:
+- Modifies the `tags` plist of the dynamic `warp--trace-current-span`."
+  (when (and warp--trace-current-span
+             (warp-trace-span-p warp--trace-current-span))
+    (warp--trace-set-tag warp--trace-current-span key value)
+    t))
 
 ;;;###autoload
-(cl-defun warp:trace-add-log (message &key fields)
-  "Adds a structured log entry to the currently active trace span.
-  Log entries provide detailed events that occurred within the span's
-  timeframe. If no span is active, this operation is a no-op, and no
-  error is signaled.
+(defun warp:trace-add-log (message &key tags)
+  "Adds a structured log event to the currently active trace span.
 
-  Arguments:
-  - `MESSAGE` (string): The primary message for the log entry.
-  - `:FIELDS` (plist or nil, optional): An optional property list of
-    additional key-value pairs to provide structured context to the
-    log entry (e.g., `:event_type`, `:file_name`).
+Why: This is distinct from standard logging. It attaches log events
+directly to the span's timeline, which is crucial for debugging complex
+sequences of events within a single operation.
 
-  Returns: `nil`.
+:Arguments:
+- `message` (string): The log message string.
+- `:tags` (plist, optional): A plist of structured data to include.
 
-  Signals:
-  - `warp-trace-invalid-span`: If the active span object somehow
-    becomes invalid (unlikely in normal usage)."
-  (when-let (span (warp:trace-current-span))
-    (unless (warp-trace-span-p span)
-      (error (warp:error! :type 'warp-trace-invalid-span
-                          :message "Invalid span object for logging.")))
-    ;; Logs are added to the list in reverse order of appearance;
-    ;; tools typically display them in chronological order.
-    (push `(:timestamp ,(float-time) :message ,message :fields ,(or fields '()))
-          (warp-trace-span-logs span))))
+:Returns:
+- `t` on success.
+
+:Side Effects:
+- Appends a new log entry to the `logs` list of the active span."
+  (when (and warp--trace-current-span
+             (warp-trace-span-p warp--trace-current-span))
+    (let ((log-entry (list :timestamp (float-time)
+                           :message message
+                           :tags (if tags (plist-to-hash-table tags)
+                                   (make-hash-table)))))
+      (setf (warp-trace-span-logs warp--trace-current-span)
+            (append (warp-trace-span-logs warp--trace-current-span)
+                    (list log-entry)))
+      t)))
+
+;;;###autoload
+(defun warp:trace-get-context (span)
+  "Extracts the trace context from a span for network propagation.
+
+Why: This function serializes a span's essential context (`trace-id`,
+`span-id`) into a format suitable for injecting into network headers,
+message queues, or other RPC mechanisms. The receiving process can then
+use this context to create a child span, linking the two operations.
+
+:Arguments:
+- `span` (warp-trace-span): The span from which to extract the context.
+
+:Returns:
+- (plist): A plist containing the trace context, e.g.,
+  `(:trace-id ... :parent-span-id ...)`."
+  `(:trace-id ,(warp-trace-span-trace-id span)
+    :parent-span-id ,(warp-trace-span-span-id span)))
+
+;;;###autoload
+(defun warp:trace-extract-context (headers)
+  "Extracts trace context from network headers.
+
+Why: This is the inverse of `warp:trace-get-context`. It parses headers
+and returns a plist containing a trace ID and a parent span ID. This is
+the entry point for a distributed trace on a receiving process.
+
+:Arguments:
+- `headers` (plist): The incoming network headers.
+
+:Returns:
+- (plist): A plist containing the trace context, or `nil` if not found."
+  (when-let ((trace-id (plist-get headers :trace-id))
+             (parent-span-id (plist-get headers :parent-span-id)))
+    `(:trace-id ,trace-id :parent-span-id ,parent-span-id)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Tracing Plugin Definition
+;;;
+;;; This section defines the core tracing plugin. It encapsulates all
+;;; tracing-related components and logic into a single, self-contained unit.
+;;; It also uses the plugin system's `:contributions` key to declaratively
+;;; inject tracing middleware into the request pipeline.
+
+(warp:defplugin :tracing
+  "Provides distributed tracing for a Warp worker."
+  :version "2.0.0"
+  :dependencies '(telemetry)
+
+  :components
+  `((distributed-tracer
+     :doc "The central component for creating and managing trace spans."
+     :requires '(telemetry-pipeline)
+     :factory (lambda (pipeline)
+                (warp:tracer-create
+                 :name "default-tracer"
+                 :telemetry-client pipeline
+                 ;; Sampler can be overridden by config in a full implementation.
+                 :sampler (lambda (_op-name _trace-id) (<= (random 1.0) 0.1)))))) ;; Sample 10%
+
+  ;; Profiles declare which components this plugin activates for a runtime.
+  :profiles
+  `((:worker
+     :doc "Enables the tracing stack for a standard worker process."
+     :components '(distributed-tracer))) ;; Activates the component defined above.
+
+  ;; Contributions declaratively inject functionality into other systems.
+  :contributions
+  '(:request-pipeline
+    (:name :tracing
+     :middleware
+     (lambda (cmd ctx next)
+       "This middleware wraps incoming RPC requests in a server-side span.
+How: It extracts trace context from the message headers, uses it to
+start a new child span, and then calls the next middleware in the
+pipeline. It ensures the span is ended in an `unwind-protect` block
+to guarantee cleanup."
+       (let* ((system (warp-request-pipeline-context-worker-system ctx))
+              (tracer (warp:component-system-get system :distributed-tracer))
+              (message (warp-request-pipeline-context-message ctx))
+              (headers (warp-rpc-message-metadata message))
+              (parent-ctx (warp:trace-extract-context headers)))
+         (if tracer
+             (warp:trace-with-span (span tracer "RPC.Server"
+                                         :trace-id (plist-get parent-ctx :trace-id)
+                                         :parent-span-id (plist-get parent-ctx :span-id))
+               ;; Add relevant tags to the new server span.
+               (warp:trace-add-tag :rpc.command (warp-rpc-command-name
+                                                 (warp-rpc-message-payload message)))
+               (funcall next))
+           (funcall next))))
+     ;; Insert this stage right after the command is unpacked.           
+     :after :unpack-command)))
 
 (provide 'warp-trace)
 ;;; warp-trace.el ends here

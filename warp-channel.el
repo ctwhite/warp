@@ -20,20 +20,12 @@
 ;;   abstract `warp-transport` layer. This design allows a channel to
 ;;   operate seamlessly over different communication backends (e.g.,
 ;;   TCP, IPC pipes, WebSockets) simply by configuring the transport.
-;;   The channel itself has no knowledge of specific protocols; it
-;;   delegates address parsing and dispatch entirely to `warp-transport`.
-;;
-;; - **Symmetrical Data Handling**: Messages are automatically
-;;   serialized (e.g., to JSON or Protobuf) before being sent over a
-;;   transport, and then automatically deserialized on ingress before
-;;   being distributed to local subscribers. This simplifies message
-;;   passing for users, as they deal only with Lisp objects.
 ;;
 ;; - **Resilience**: The deep integration of `warp-circuit-breaker`
-;;   provides resilience against failing remote endpoints. If the
-;;   underlying transport to a peer experiences repeated failures,
-;;   the circuit breaker "trips," preventing continuous hammering
-;;   of a dead service and avoiding cascading failures.
+;;   provides resilience against failing remote endpoints. The background
+;;   sender that drains the outbound message queue is now implemented
+;;   using the generic `warp:defpolling-consumer` pattern, centralizing
+;;   resilient worker logic.
 ;;
 ;; - **Flow Control & Backpressure**: For transport-backed channels,
 ;;   an internal `send-queue` buffers outgoing messages. Configurable
@@ -41,10 +33,6 @@
 ;;   `:error`) prevent the channel from being overwhelmed by fast
 ;;   producers and manage resource consumption gracefully.
 ;;
-;; - **Observability**: Comprehensive runtime statistics
-;;   (`warp-channel-stats`) and structured logging provide deep
-;;   visibility into the channel's operational health, message flow,
-;;   and error rates.
 
 ;;; Code:
 
@@ -61,7 +49,9 @@
 (require 'warp-marshal)        
 (require 'warp-schema)         
 (require 'warp-config)         
-(require 'warp-state-machine)  
+(require 'warp-state-machine)
+(require 'warp-uuid)
+(require 'warp-patterns)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -134,9 +124,8 @@ Fields:
   periodic health checks. These checks apply to transport-backed
   channels and contribute to the associated circuit breaker's state.
 - `thread-pool` (warp-thread-pool or nil): Optional `warp-thread-pool`
-  for the background sender thread (`background-sender-thread`).
-  If `nil`, `warp:thread-pool-default` is used. This is not used for
-  in-memory channels.
+  for the background sender. If `nil`, `warp:thread-pool-default` is
+  used. Not used for in-memory channels.
 - `transport-options` (plist): Options passed directly to
   `warp:transport-connect` or `warp:transport-listen` for
   transport-backed channels (e.g., `:on-connect-fn`, `:on-close-fn`,
@@ -232,9 +221,9 @@ Fields:
   get its state and record failures/successes.
 - `health-check-poller` (loom-poll or nil): A `loom-poll` instance that
   periodically triggers health checks for transport-backed channels.
-- `background-sender-thread` (thread or nil): The `loom:thread` that
-  runs the `warp-channel--sender-loop` to continuously drain and send
-  messages from the `send-queue`."
+- `background-sender` (list or nil): A list containing the polling
+  consumer instance and its stop function, `(instance stop-fn)`, used
+  for draining the `send-queue`."
   (name (cl-assert nil) :type string)
   (id (cl-assert nil) :type string)
   (state-machine (cl-assert nil) :type warp-state-machine)
@@ -247,18 +236,10 @@ Fields:
   (transport-conn nil :type (or null warp-transport-connection))
   (circuit-breaker-id nil :type (or null string))
   (health-check-poller nil :type (or null loom-poll))
-  (background-sender-thread nil :type (or null thread)))
+  (background-sender nil :type (or null list)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Private Functions
-
-(defun warp-channel--generate-id ()
-  "Generate a unique identifier string for a new channel instance.
-This provides a simple, decentralized way to create reasonably unique
-IDs for channels, used for internal identification and logging.
-
-Returns: (string): A unique channel ID string (e.g., \"ch-00a3f7\")."
-  (format "ch-%06x" (random (expt 2 64))))
 
 (cl-defun warp-channel--handle-critical-error
     (channel error-type message &key cause details context)
@@ -373,7 +354,7 @@ Side Effects:
                  (:catch (lambda (err)
                            (push sub defunct-subscribers)
                            (warp:log! :warn channel-name
-                                      "Removing defunct subscriber '%s' due to \
+                                      "Removing defunct subscriber '%s' due to
                                        write error: %S"
                                       (warp-stream-name sub) err)))))
     ;; Atomically remove all identified defunct subscribers.
@@ -406,61 +387,53 @@ Side Effects:
   (warp-channel--distribute-message channel message)
   nil)
 
-(defun warp-channel--sender-loop (channel)
-  "Continuous loop to send messages from the channel's `send-queue` to
-the transport. This function runs in a dedicated background thread
-(`background-sender-thread`). It continuously reads messages from the
-channel's `send-queue` and attempts to send them asynchronously via the
-underlying `warp-transport` connection. It respects the channel's
-circuit breaker if configured, pausing sending when the circuit is open.
-The loop gracefully exits if the channel's state transitions to
-`:closing`, `:closed`, or `:error`, or if the underlying `send-queue`
-stream is closed.
+(defun warp-channel--start-sender (channel)
+  "Create and start the background polling consumer for the send-queue.
+This function uses the generic `warp:defpolling-consumer` macro to create a
+resilient worker that drains messages from the channel's `send-queue` and
+sends them over the transport.
 
 Arguments:
-- `channel` (`warp-channel`): The channel instance whose messages to send.
+- `CHANNEL` (`warp-channel`): The channel instance.
 
 Returns: `nil`.
 
 Side Effects:
-- Continuously reads messages from `warp-channel-send-queue`.
-- Calls `warp:transport-send` (potentially via `warp:circuit-breaker-execute`).
-- Updates `messages-sent` or `errors-count` statistics.
-- May log send-related errors."
-  (let* ((name (warp-channel-name channel))
-         (send-stream (warp-channel-send-queue channel))
-         (conn (warp-channel-transport-conn channel))
-         (cb-id (warp-channel-circuit-breaker-id channel))
-         (processor-fn
-          ;; This function is executed for each message read from the stream.
-          (lambda (message)
-            (let ((sender-fn (lambda ()
-                               (warp:transport-send conn message))))
-              (braid! (if cb-id
-                          ;; Use circuit breaker if enabled for this channel.
-                          (warp:circuit-breaker-execute cb-id sender-fn)
-                        ;; Otherwise, send directly.
-                        (funcall sender-fn))
-                (:then (lambda (_result)
-                         (warp-channel--update-stats channel 'messages-sent)))
-                (:catch (lambda (err)
-                          (warp:log! :error name
-                                     "Sender loop error sending message: %S"
-                                     err)
-                          (warp-channel--update-stats channel 'errors-count)
-                          ;; Important: resolve to nil so the stream-for-each
-                          ;; does not stop on individual send errors.
-                          (loom:resolved! nil))))))))
-
-    (warp:log! :debug name "Sender loop for channel '%s' starting." name)
-    ;; `warp:stream-for-each` continuously reads from the stream and applies
-    ;; the `processor-fn` until the stream is closed.
-    (braid! (warp:stream-for-each send-stream processor-fn)
-      (:finally (lambda ()
-                  (warp:log! :debug name
-                             "Sender loop for channel '%s' has terminated."
-                             name))))
-    nil))
+- Defines a new consumer type specific to this channel instance.
+- Creates, starts, and stores the consumer instance and its stop
+  function in the `background-sender` slot of the channel."
+  (let* ((consumer-name (intern (format "channel-sender-%s" (warp-channel-id channel))))
+         ;; 1. Define the consumer's behavior using `defpolling-consumer`.
+         (consumer-lifecycle
+          (warp:defpolling-consumer consumer-name
+            :concurrency 1
+            ;; The fetcher reads one message from the channel's send queue.
+            :fetcher-fn (lambda (ctx) (warp:stream-read (warp-channel-send-queue ctx)))
+            ;; The processor sends the message over the transport, using a circuit breaker.
+            :processor-fn (lambda (message ctx)
+                            (let* ((conn (warp-channel-transport-conn ctx))
+                                   (cb-id (warp-channel-circuit-breaker-id ctx))
+                                   (sender-fn (lambda () (warp:transport-send conn message))))
+                              (if cb-id
+                                  (warp:circuit-breaker-execute cb-id sender-fn)
+                                (funcall sender-fn))))
+            ;; On success, update the sent messages counter.
+            :on-success-fn (lambda (_item _result ctx)
+                             (warp-channel--update-stats ctx 'messages-sent))
+            ;; On failure, log the error and update the error counter.
+            :on-failure-fn (lambda (_item err ctx)
+                             (warp:log! :error (warp-channel-name ctx)
+                                        "Channel sender error sending message: %S"
+                                        err)
+                             (warp-channel--update-stats ctx 'errors-count)))))
+    ;; 2. Create and start the consumer instance.
+    (let ((factory (car consumer-lifecycle))
+          (start-fn (cadr consumer-lifecycle))
+          (stop-fn (caddr consumer-lifecycle)))
+      (let ((instance (funcall factory :context channel)))
+        (funcall start-fn instance)
+        ;; 3. Store the instance and its stop function for graceful shutdown.
+        (setf (warp-channel-background-sender channel) (list instance stop-fn))))))
 
 (defun warp-channel--setup-transport (channel mode)
   "Set up the underlying `warp-transport` connection for a channel.
@@ -486,15 +459,17 @@ Side Effects:
 - Calls `warp-channel--handle-critical-error` on transport setup failure."
   (let* ((name (warp-channel-name channel))
          (config (warp-channel-config channel))
-         (transport-options (warp-channel-config-transport-options config)))
+         (transport-options (warp-channel-config-transport-options config))
+         (transport-manager-client (warp:component-system-get nil :transport-manager-service)))
     (warp:log! :info name "Setting up transport in %S mode for channel."
                mode)
     (braid! (if (eq mode :listen)
-                ;; Start listening for incoming connections on the channel's
-                ;; address.
-                (apply #'warp:transport-listen name transport-options)
-              ;; Connect to a remote endpoint at the channel's address.
-              (apply #'warp:transport-connect name transport-options))
+                ;; Use the transport manager service to start a listener.
+                (apply #'warp-transport-manager-service-listen
+                       transport-manager-client name transport-options)
+              ;; Use the transport manager service to connect to a remote endpoint.
+              (apply #'warp-transport-manager-service-connect
+                     transport-manager-client name transport-options))
       (:then (lambda (transport-conn)
                ;; Store the established connection in the channel struct.
                (loom:with-mutex! (warp-channel-lock channel)
@@ -560,60 +535,6 @@ Side Effects:
       (warp:log! :debug (warp-channel-name channel)
                  "Skipping health check for in-memory channel (no transport)."))))
 
-(defun warp-channel--setup-monitoring (channel)
-  "Set up periodic health monitoring and a circuit breaker for a channel.
-If health checks are enabled in the channel's configuration, this function
-initializes a dedicated circuit breaker for the channel's transport
-communication and starts a `loom-poll` instance to perform periodic
-health checks on the underlying transport. This is crucial for proactive
-fault detection.
-
-Arguments:
-- `channel` (`warp-channel`): The channel for which to set up monitoring.
-
-Returns: `nil`.
-
-Side Effects:
-- Sets `warp-channel-circuit-breaker-id`.
-- Calls `warp:circuit-breaker-get` to initialize or retrieve the circuit
-  breaker instance.
-- Sets `warp-channel-health-check-poller` and registers a periodic task
-  with it."
-  (when (warp-channel-config-enable-health-checks
-         (warp-channel-config channel))
-    (loom:with-mutex! (warp-channel-lock channel)
-      ;; Assign a unique circuit breaker ID based on the channel name.
-      (setf (warp-channel-circuit-breaker-id channel)
-            (format "channel-cb-%s" (warp-channel-name channel)))
-
-      ;; Initialize the circuit breaker (or retrieve existing one by ID).
-      (let ((cb-options (warp-channel-config-circuit-breaker-config
-                          (warp-channel-config channel))))
-        (apply #'warp:circuit-breaker-get
-               (warp-channel-circuit-breaker-id channel)
-               (or cb-options '())))
-      (warp:log! :debug (warp-channel-name channel)
-                 "Circuit breaker '%s' initialized."
-                 (warp-channel-circuit-breaker-id channel))
-
-      ;; Create a dedicated `loom-poll` for periodic health checks.
-      (let* ((poller-name (format "%s-health-poller"
-                                  (warp-channel-name channel)))
-             (poller (loom:poll :name poller-name)))
-        (setf (warp-channel-health-check-poller channel) poller)
-
-        ;; Register the periodic health check task.
-        (loom:poll-register-periodic-task
-         poller
-         (intern (format "%s-health-check-task"
-                         (warp-channel-name channel)))
-         (lambda () (warp-channel--health-check-task channel))
-         :interval (warp-channel-config-health-check-interval
-                    (warp-channel-config channel))
-         :immediate t)
-        (warp:log! :debug (warp-channel-name channel)
-                   "Health check poller '%s' started." poller-name)))))
-
 (defun warp-channel--cleanup-monitoring (channel)
   "Cleans up health monitoring resources for the channel.
 This primarily involves shutting down the `loom-poll` instance that
@@ -643,31 +564,28 @@ Side Effects:
                            err)
                 (loom:rejected! err))))))
 
-(defun warp-channel--cleanup-sender-thread (channel)
-  "Cleans up the background sender thread for the channel.
-This function is called during channel shutdown for transport-backed
-channels. It signals the `background-sender-thread` to terminate.
-The sender loop typically exits naturally when its `send-queue` is closed.
+(defun warp-channel--cleanup-sender (channel)
+  "Cleans up the background sender consumer for the channel.
+This function is called during channel shutdown. It gracefully stops the
+polling consumer that drains the `send-queue`.
 
 Arguments:
 - `channel` (`warp-channel`): The channel to clean up.
 
-Returns: (loom-promise): A promise that resolves when the sender thread
-  is confirmed terminated (or after a short delay if direct join isn't
-  used).
+Returns: (loom-promise): A promise that resolves when the sender has
+  been stopped.
 
 Side Effects:
-- Stops the background sender thread.
-- Clears the `background-sender-thread` slot."
-  (when-let (sender-thread (warp-channel-background-sender-thread channel))
-    (warp:log! :debug (warp-channel-name channel)
-               "Signaling sender thread to terminate.")
-    ;; The `warp:stream-close` on `send-queue` (in `handle-fsm-transition`)
-    ;; will cause `warp:stream-for-each` in `warp-channel--sender-loop`
-    ;; to exit. We might need a short delay or explicit thread-join if
-    ;; we want to await its exit. For now, rely on `warp-thread-pool`'s
-    ;; shutdown to clean up, or natural exit.
-    (setf (warp-channel-background-sender-thread channel) nil)
+- Stops the background consumer.
+- Clears the `background-sender` slot."
+  (if-let (sender-def (warp-channel-background-sender channel))
+      (let ((instance (car sender-def))
+            (stop-fn (cadr sender-def)))
+        (warp:log! :debug (warp-channel-name channel)
+                   "Stopping background sender consumer.")
+        (funcall stop-fn instance)
+        (setf (warp-channel-background-sender channel) nil)
+        (loom:resolved! t))
     (loom:resolved! t)))
 
 (defun warp-channel--handle-fsm-transition (channel old-state new-state event-data)
@@ -689,7 +607,7 @@ Returns: (loom-promise): A promise that resolves when all side effects
 Side Effects:
 - Logs state transitions.
 - Initiates transport setup/teardown.
-- Starts/stops the `background-sender-thread`.
+- Starts/stops the `background-sender` consumer.
 - Starts/stops health monitoring (`loom-poll`).
 - Closes `send-queue` and all subscriber streams.
 - Removes channel from global registry on `:closed` state."
@@ -702,26 +620,18 @@ Side Effects:
                (pcase new-state
                  (:open
                   (warp:log! :info name "Channel is now OPEN and operational.")
-                  ;; For transport-backed channels, start the background
-                  ;; sender loop.
+                  ;; For transport-backed channels, start the background sender.
                   (when (warp-channel-transport-conn channel)
-                    (let ((thread-pool (warp-channel-config-thread-pool
-                                        (warp-channel-config channel))))
-                      (setf (warp-channel-background-sender-thread channel)
-                            ;; Submit the sender loop to a thread pool.
-                            (warp:thread-pool-submit
-                             (or thread-pool (warp:thread-pool-default))
-                             #'warp-channel--sender-loop channel
-                             nil :name (format "%s-sender-loop" name))))))
+                    (warp-channel--start-sender channel)))
                  (:closing
-                  (warp:log! :info name "Channel is transitioning to CLOSING \
-                                       state. Initiating cleanup.")
-                  ;; Clean up background threads and monitoring.
-                  (braid! (warp-channel--cleanup-sender-thread channel)
+                  (warp:log! :info name "Channel is transitioning to CLOSING 
+                                         state. Initiating cleanup.")
+                  ;; Clean up background consumer and monitoring.
+                  (braid! (warp-channel--cleanup-sender channel)
                     (:then (warp-channel--cleanup-monitoring channel)))
                   ;; Close the underlying transport connection.
                   (braid-when! (warp-channel-transport-conn channel)
-                    (:then (conn) (loom:await (warp:transport-close conn t)))) ; Force close here
+                    (:then (conn) (loom:await (warp:transport-close conn t)))) ; Force close
                   ;; Close the send queue to stop the sender loop naturally.
                   (braid-when! (warp-channel-send-queue channel)
                     (:then (send-q) (loom:await (warp:stream-close send-q))))
@@ -737,7 +647,7 @@ Side Effects:
                     (remhash name warp-channel--registry)))
                  (:error
                   (warp:log! :fatal name
-                             "Channel entered CRITICAL ERROR state. \
+                             "Channel entered CRITICAL ERROR state.
                               Check logs for details.")))
                t)))))
 
@@ -786,7 +696,7 @@ Returns: (loom-promise): A promise that resolves with the fully
 Side Effects:
 - Registers the new channel in `warp-channel--registry`.
 - Initializes a `warp-state-machine` for lifecycle management.
-- For transport-backed channels, starts a `background-sender-thread`
+- For transport-backed channels, starts a `background-sender` consumer
   and sets up health monitoring/circuit breakers."
   (let* ((mode (or (plist-get options :mode)
                    ;; Infer mode from name if not explicitly provided.
@@ -798,7 +708,7 @@ Side Effects:
          (channel-lock (loom:lock (format "channel-lock-%s" name)))
          (channel (%%make-channel
                    :name name
-                   :id (warp-channel--generate-id)
+                   :id (warp:uuid-string (warp:uuid4))
                    :config config
                    :stats (make-warp-channel-stats)
                    :lock channel-lock)))
@@ -1021,7 +931,7 @@ Signals:
                (format "Cannot subscribe to channel '%s': it is not open \
                         (current state: %S)."
                        (warp-channel-name channel)
-                       (warp:state-machine-current-state
+                       (warp-state-machine-current-state
                         (warp-channel-state-machine channel))))))
     ;; Check if the maximum subscriber limit has been reached.
     (when (>= (length (warp-channel-subscribers channel))

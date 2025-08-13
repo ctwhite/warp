@@ -3,7 +3,7 @@
 ;;; Commentary:
 ;;
 ;; This module provides a system monitoring component that periodically
-;; collects CPU and memory utilization metrics for the entire system and
+;; collects CPU and memory utilization telemetry for the entire system and
 ;; for specific processes.
 ;;
 ;; This version has been refactored into a self-contained component,
@@ -53,7 +53,7 @@
 
 Fields:
 - `collection-interval` (float): The interval in seconds for collecting
-  system-wide metrics.
+  system-wide telemetry.
 - `initial-watched-pids` (list): A list of process IDs to actively
   monitor from the start."
   (collection-interval 5.0 :type float :validate (> $ 0.0))
@@ -62,11 +62,11 @@ Fields:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Schema Definitions
 
-(warp:defschema warp-system-metrics
-    ((:constructor warp-system-metrics-create)
+(warp:defschema warp-system-telemetry
+    ((:constructor warp-system-telemetry-create)
      (:copier nil)
      (:json-name "SystemMetrics"))
-  "A structured snapshot of aggregated system-wide performance metrics.
+  "A structured snapshot of aggregated system-wide performance telemetry.
 
 Fields:
 - `total-cpu-utilization` (float): Sum of all process CPU percentages.
@@ -81,7 +81,7 @@ Fields:
 - `total-virtual-memory-kb` (integer): Sum of all virtual memory usage.
 - `total-resident-memory-kb` (integer): Sum of all resident set size memory.
 - `process-count` (integer): The total number of processes sampled.
-- `last-collection-time` (float): The timestamp of this metrics snapshot."
+- `last-collection-time` (float): The timestamp of this telemetry snapshot."
   (total-cpu-utilization 0.0 :type float :json-key "totalCpuUtil")
   (total-memory-utilization 0.0 :type float :json-key "totalMemUtil")
   (cumulative-user-cpu-seconds 0.0 :type float
@@ -98,11 +98,11 @@ Fields:
   (last-collection-time (float-time) :type float
     :json-key "lastCollectionTime"))
 
-(warp:defschema warp-process-metrics
-    ((:constructor warp-process-metrics-create)
+(warp:defschema warp-process-telemetry
+    ((:constructor warp-process-telemetry-create)
      (:copier nil)
      (:json-name "ProcessMetrics"))
-  "A structured snapshot of performance metrics for a single process.
+  "A structured snapshot of performance telemetry for a single process.
 
 Fields:
 - `pid` (integer): The process identifier.
@@ -145,22 +145,26 @@ Fields:
 (cl-defstruct (warp-system-monitor
                (:constructor %%make-system-monitor)
                (:copier nil))
-  "Manages the state and background collection of system metrics.
+  "Manages the state and background collection of system telemetry.
+
+This struct is the central component for system monitoring. It holds
+all the state for a single monitor instance, including its configuration,
+latest telemetry data, and the state of its background poller.
 
 Fields:
 - `name` (string): A unique name for this monitor instance.
 - `config` (system-monitor-config): The monitor's configuration.
 - `poll-instance` (loom-poll): `loom-poll` for background collection.
-- `system-metrics` (warp-system-metrics): Latest system metrics snapshot.
-- `process-metrics-registry` (hash-table): Maps PIDs to process metrics.
+- `system-telemetry` (warp-system-telemetry): Latest system telemetry snapshot.
+- `process-telemetry-registry` (hash-table): Maps PIDs to process telemetry.
 - `watched-pids` (hash-table): Hash table of PIDs to actively watch.
 - `lock` (loom-lock): `loom-lock` protecting thread-safe access to data.
 - `status` (keyword): Current status (`:active` or `:stopped`)."
   (name nil :type string)
   (config (cl-assert nil) :type system-monitor-config)
   (poll-instance nil :type (or null t))
-  (system-metrics nil :type (or null warp-system-metrics))
-  (process-metrics-registry (make-hash-table :test 'eq) :type hash-table)
+  (system-telemetry nil :type (or null warp-system-telemetry))
+  (process-telemetry-registry (make-hash-table :test 'eq) :type hash-table)
   (watched-pids (make-hash-table :test 'eq) :type hash-table)
   (lock (loom:lock "warp-system-monitor-data") :type t)
   (status :stopped :type keyword))
@@ -177,6 +181,9 @@ Arguments:
 
 Returns:
 - (float): The total time in seconds."
+  ;; The `process-attributes` function returns a `cons` cell for time,
+  ;; where the car is seconds and the cdr is microseconds. This function
+  ;; converts that pair into a single floating-point value.
   (if (and (consp time-pair)
            (numberp (car time-pair))
            (numberp (cdr time-pair)))
@@ -196,6 +203,8 @@ Returns:
 
 Signals:
 - `(warp-system-monitor-error)`: If listing processes fails."
+  ;; The core logic wraps `list-system-processes` and `process-attributes`
+  ;; with a `condition-case` to catch and report errors.
   (condition-case err
       (cl-loop for pid in (list-system-processes)
                for attrs = (ignore-errors (process-attributes pid))
@@ -205,15 +214,17 @@ Signals:
                                 :message "Failed to list system processes"
                                 :cause err)))))
 
-(defun warp-system-monitor--aggregate-system-metrics (all-attrs time)
-  "Aggregate raw process attributes into a system-wide metrics snapshot.
+(defun warp-system-monitor--aggregate-system-telemetry (all-attrs time)
+  "Aggregate raw process attributes into a system-wide telemetry snapshot.
 
 Arguments:
 - `ALL-ATTRS` (list): A list of raw process attribute plists.
 - `TIME` (float): The timestamp for this collection cycle.
 
 Returns:
-- (warp-system-metrics): A new system metrics object."
+- (warp-system-telemetry): A new system telemetry object."
+  ;; The function iterates over all process attributes and sums up
+  ;; key metrics to produce a system-wide view.
   (let ((cpu 0.0) (mem 0.0) (ucpu 0.0) (scpu 0.0) (minf 0)
         (majf 0) (vm 0) (rss 0) (count 0))
     (dolist (attrs all-attrs)
@@ -228,7 +239,7 @@ Returns:
       (cl-incf vm (or (plist-get attrs 'vsize) 0))
       (cl-incf rss (or (plist-get attrs 'rss) 0))
       (cl-incf count))
-    (warp-system-metrics-create
+    (warp-system-telemetry-create
      :total-cpu-utilization cpu :total-memory-utilization mem
      :cumulative-user-cpu-seconds ucpu :cumulative-system-cpu-seconds scpu
      :total-cumulative-minor-page-faults minf
@@ -236,16 +247,19 @@ Returns:
      :total-virtual-memory-kb vm :total-resident-memory-kb rss
      :process-count count :last-collection-time time)))
 
-(defun warp-system-monitor--extract-process-metrics (attrs time)
-  "Extract and convert raw attributes into a `warp-process-metrics` object.
+(defun warp-system-monitor--extract-process-telemetry (attrs time)
+  "Extract and convert raw attributes into a `warp-process-telemetry` object.
 
 Arguments:
 - `ATTRS` (plist): The raw attribute plist for a single process.
 - `TIME` (float): The timestamp for this collection cycle.
 
 Returns:
-- (warp-process-metrics): A new process metrics object."
-  (warp-process-metrics-create
+- (warp-process-telemetry): A new process telemetry object."
+  ;; This function maps the raw, system-specific process attributes
+  ;; (from `process-attributes`) to our structured `warp-process-telemetry`
+  ;; schema, performing any necessary data conversions.
+  (warp-process-telemetry-create
    :pid (plist-get attrs 'pid 0)
    :command-name (plist-get attrs 'comm)
    :process-state (plist-get attrs 'state)
@@ -265,45 +279,49 @@ Returns:
    :command-line-args (plist-get attrs 'args)
    :last-collection-time time))
 
-(defun warp-system-monitor--collect-metrics-task (monitor)
-  "The main periodic task for collecting all system and process metrics.
+(defun warp-system-monitor--collect-telemetry-task (monitor)
+  "The main periodic task for collecting all system and process telemetry.
 This function is executed by the background poller. It fetches data for
-all processes, aggregates system-wide metrics, and updates the metrics
+all processes, aggregates system-wide telemetry, and updates the telemetry
 for each individually watched process.
 
 Arguments:
 - `MONITOR` (warp-system-monitor): The monitor instance.
 
 Side Effects:
-- Modifies the `system-metrics` and `process-metrics-registry` fields
+- Modifies the `system-telemetry` and `process-telemetry-registry` fields
   of the `MONITOR` struct.
 
 Returns:
 - (loom-promise): A promise that resolves when the collection cycle is
   complete."
   (let* ((monitor-lock (warp-system-monitor-lock monitor))
+         ;; Use a mutex to safely access the list of PIDs to watch.
          (watched-pids (loom:with-mutex! monitor-lock
                          (hash-table-keys
                           (warp-system-monitor-watched-pids monitor)))))
     (braid! (warp-system-monitor--get-all-process-attributes)
       (:then (lambda (all-attrs)
                (let* ((current-time (float-time))
-                      (new-sys-metrics
-                       (warp-system-monitor--aggregate-system-metrics
+                      ;; First, aggregate system-wide metrics from all processes.
+                      (new-sys-telemetry
+                       (warp-system-monitor--aggregate-system-telemetry
                         all-attrs current-time))
+                      ;; Then, extract metrics for only the watched PIDs.
                       (new-proc-reg (make-hash-table :test 'eq)))
                  (dolist (pid watched-pids)
                    (when-let (attrs (cl-find-if (lambda (a)
                                                  (= (plist-get a 'pid) pid))
                                                all-attrs))
                      (puthash pid
-                              (warp-system-monitor--extract-process-metrics
+                              (warp-system-monitor--extract-process-telemetry
                                attrs current-time)
                               new-proc-reg)))
+                 ;; Use a mutex to atomically update the monitor's state.
                  (loom:with-mutex! monitor-lock
-                   (setf (warp-system-monitor-system-metrics monitor)
-                         new-sys-metrics)
-                   (setf (warp-system-monitor-process-metrics-registry
+                   (setf (warp-system-monitor-system-telemetry monitor)
+                         new-sys-telemetry)
+                   (setf (warp-system-monitor-process-telemetry-registry
                           monitor)
                          new-proc-reg))))))))
 
@@ -322,7 +340,7 @@ Arguments:
   options for the `system-monitor-config` struct.
 
 Side Effects:
-- Starts a background `loom-poll` instance to collect metrics periodically.
+- Starts a background `loom-poll` instance to collect telemetry periodically.
 
 Returns:
 - (warp-system-monitor): The new, active monitor instance."
@@ -333,7 +351,7 @@ Returns:
                    :config config
                    :poll-instance (loom:poll :name (format "%s-poll"
                                                            monitor-name))
-                   :system-metrics (warp-system-metrics-create)
+                   :system-telemetry (warp-system-telemetry-create)
                    :status :active)))
     ;; Populate initial watched PIDs from config.
     (dolist (pid (system-monitor-config-initial-watched-pids config))
@@ -341,10 +359,10 @@ Returns:
     ;; Register and start the periodic collection task.
     (loom:poll-register-periodic-task
      (warp-system-monitor-poll-instance monitor)
-     'collect-metrics
+     'collect-telemetry
      (lambda ()
        (loom:await ; Await collection task
-        (warp-system-monitor--collect-metrics-task monitor)))
+        (warp-system-monitor--collect-telemetry-task monitor)))
      :interval (system-monitor-config-collection-interval config)
      :immediate t)
     (loom:poll-start (warp-system-monitor-poll-instance monitor))
@@ -378,29 +396,29 @@ Returns:
                t)))))
 
 ;;;###autoload
-(defun warp:system-monitor-get-system-metrics (monitor)
-  "Return the latest aggregated system-wide performance metrics.
+(defun warp:system-monitor-get-system-telemetry (monitor)
+  "Return the latest aggregated system-wide performance telemetry.
 
 Arguments:
 - `MONITOR` (warp-system-monitor): The active monitor instance.
 
 Returns:
-- (warp-system-metrics): The latest system metrics snapshot.
+- (warp-system-telemetry): The latest system telemetry snapshot.
 
 Signals:
 - `(error)`: If the monitor is not active.
-- `(warp-system-monitor-uninitialized-error)`: If metrics have not yet
+- `(warp-system-monitor-uninitialized-error)`: If telemetry have not yet
   been collected."
   (unless (eq (warp-system-monitor-status monitor) :active)
     (error "Monitor is not active."))
   (loom:with-mutex! (warp-system-monitor-lock monitor)
-    (or (warp-system-monitor-system-metrics monitor)
+    (or (warp-system-monitor-system-telemetry monitor)
         (signal 'warp-system-monitor-uninitialized-error
-                "System metrics not yet available."))))
+                "System telemetry not yet available."))))
 
 ;;;###autoload
-(defun warp:system-monitor-get-process-metrics (monitor &optional pid)
-  "Return the latest performance metrics for a specific process.
+(defun warp:system-monitor-get-process-telemetry (monitor &optional pid)
+  "Return the latest performance telemetry for a specific process.
 
 Arguments:
 - `MONITOR` (warp-system-monitor): The active monitor instance.
@@ -408,7 +426,7 @@ Arguments:
   current Emacs process.
 
 Returns:
-- (warp-process-metrics): The metrics for the requested PID.
+- (warp-process-telemetry): The telemetry for the requested PID.
 
 Signals:
 - `(error)`: If the monitor is not active.
@@ -418,7 +436,7 @@ Signals:
   (let ((target-pid (or pid (emacs-pid))))
     (loom:with-mutex! (warp-system-monitor-lock monitor)
       (or (gethash target-pid
-                   (warp-system-monitor-process-metrics-registry monitor))
+                   (warp-system-monitor-process-telemetry-registry monitor))
           (signal 'warp-system-monitor-process-not-found
                   (format "Metrics for PID %d not found." target-pid))))))
 
@@ -455,4 +473,4 @@ Returns: `t`."
   t)
 
 (provide 'warp-system-monitor)
-;;; warp-system-monitor.el ends here ;;;
+;;; warp-system-monitor.el ends here

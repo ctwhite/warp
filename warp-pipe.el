@@ -1,38 +1,41 @@
-;;; warp-pipe.el --- Named Pipe (FIFO) Transport Implementation -*- lexical-binding: t; -*-
+;;; warp-pipe.el --- Named Pipe (FIFO) Transport Plugin -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
 ;; This module provides the concrete implementation for the `:pipe`
 ;; communication transport protocol within the Warp concurrency
-;; framework. It integrates with `warp-transport.el` to offer a
-;; standardized interface for creating and managing named pipes (FIFOs)
-;; for inter-process communication (IPC) on a single machine.
+;; framework. It is designed as a **self-contained plugin** that
+;; implements the `transport-protocol-service` interface. This plugin
+;;-centric approach is a cornerstone of Warp's architecture, allowing
+;; for a highly decoupled, extensible system where new transports can be
+;; added and managed without altering core framework code.
 ;;
-;; The implementation leverages standard shell commands (`mkfifo`, `cat`)
-;; and Emacs's process management primitives. It is fully integrated with
-;; the generic transport layer, inheriting features like state management,
-;; message queuing, automatic reconnect, and health checks.
+;; This implementation leverages standard UNIX-like shell commands (`mkfifo`,
+;; `cat`) and Emacs's built-in process management primitives to create and
+;; manage named pipes (FIFOs) for inter-process communication (IPC) on a
+;; single machine.
 ;;
-;; ## Key Features:
+;; ## Key Architectural Principles Applied:
 ;;
-;; - **Abstract Protocol Implementation:** Registers the `:pipe` protocol
-;;   with `warp-transport.el`, providing the full suite of transport
-;;   functions (`connect-fn`, `close-fn`, etc.).
+;; 1.  **Dependency Inversion Principle**: The core `warp-transport.el`
+;;     module depends on this plugin's abstract interface, not its concrete
+;;     implementation. This means `warp-transport`'s logic is agnostic to
+;;     whether it's using named pipes, TCP sockets, or any other transport.
 ;;
-;; - **Unified Connection Object:** This module does not use a custom
-;;   struct. All pipe-specific data (like reader/writer processes) is
-;;   stored within the generic `warp-transport-connection` object.
+;; 2.  **Open/Closed Principle**: This module can be extended (by adding new
+;;     protocol implementations) without modifying existing code. A new
+;;     transport, like a ZeroMQ or MQTT-based one, would simply be
+;;     implemented as another plugin that adheres to the same
+;;     `transport-protocol-service` contract.
 ;;
-;; - **Structured Data:** By integrating with the transport layer's
-;;   message stream, it transparently supports serialization and
-;;   deserialization of Lisp objects.
+;; 3.  **Encapsulation**: All of the protocol-specific details—such as how to
+;;     spawn the `cat` processes, manage the FIFO files, and handle I/O
+;;     errors—are fully encapsulated within this plugin. The external world
+;;     only interacts with it through its standardized service interface.
 ;;
-;; - **Automatic Cleanup:** Comprehensive resource management, including
-;;   automatic recovery from orphaned FIFO files on startup and cleanup
-;;   on Emacs exit.
+;; This design ensures that the system is robust, modular, and easy to
+;; maintain and extend.
 ;;
-;; - **Health Monitoring:** Provides a `health-check-fn` that verifies
-;;   process liveness and file integrity.
 
 ;;; Code:
 
@@ -44,20 +47,29 @@
 (require 'warp-error)
 (require 'warp-log)
 (require 'warp-transport)
+(require 'warp-transport-api)
+(require 'warp-plugin)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
 
 (define-error 'warp-pipe-error
-  "A generic error related to `warp-pipe` operations."
+  "A generic error related to `warp-pipe` operations.
+This is the base error for the `:pipe` transport and inherits from the
+generic `warp-transport-connection-error`, allowing for broad error
+handling at higher layers of the stack while providing a specific error type."
   'warp-transport-connection-error)
 
 (define-error 'warp-pipe-creation-error
-  "Error creating a named pipe (FIFO) file."
+  "Error creating a named pipe (FIFO) file.
+Signaled when the `mkfifo` command fails or is not available, or if a
+non-FIFO file with the same name already exists."
   'warp-pipe-error)
 
 (define-error 'warp-pipe-process-error
-  "The underlying pipe process (e.g., `cat`) failed or is not live."
+  "The underlying pipe process (e.g., `cat`) failed or is not live.
+This indicates a problem with the OS-level processes used for I/O, which
+are critical for the bidirectional communication to function."
   'warp-pipe-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -68,13 +80,18 @@
   :prefix "warp-pipe-")
 
 (defcustom warp-pipe-default-directory temporary-file-directory
-  "The default directory where named pipe (FIFO) files are created."
+  "The default directory where named pipe (FIFO) files are created.
+This is the standard location for all IPC sockets on the local filesystem.
+Choosing `temporary-file-directory` ensures that these files are not
+left in an unpredictable location and are typically cleaned up by the OS."
   :type 'directory
   :group 'warp-pipe)
 
 (defcustom warp-pipe-cleanup-orphans-on-startup t
   "If non-nil, automatically clean up orphaned FIFO files on Emacs
-startup. This helps prevent issues from previous unclean shutdowns."
+startup. This prevents issues from previous unclean shutdowns where
+a FIFO file was not properly deleted, which could cause subsequent
+connection attempts to fail."
   :type 'boolean
   :group 'warp-pipe)
 
@@ -87,6 +104,8 @@ startup. This helps prevent issues from previous unclean shutdowns."
 
 (defun warp-pipe--path-from-address (address)
   "Extract a valid file system path from an `ipc://` address string.
+This is a utility function used to convert a standardized `ipc://`
+address scheme into a concrete filesystem path that the OS understands.
 
 Arguments:
 - `ADDRESS` (string): The input address (e.g., \"ipc:///tmp/my-pipe\").
@@ -94,7 +113,8 @@ Arguments:
 Returns:
 - (string): The extracted file path (e.g., \"/tmp/my-pipe\")."
   (let ((path (substring address (length "ipc://"))))
-    ;; Handle Windows paths like "ipc:///C:/Users/..."
+    ;; Handle special case for Windows drive letters to convert
+    ;; `ipc:///C:/...` to `C:/...`.
     (if (and (eq system-type 'windows-nt)
              (string-prefix-p "/" path)
              (string-match-p "^/[a-zA-Z]:/" path))
@@ -103,6 +123,10 @@ Returns:
 
 (defun warp-pipe--create-fifo (path)
   "Create a named pipe (FIFO) at `PATH` using `mkfifo`.
+This function is a core part of the `:pipe` protocol's implementation.
+It ensures that the named pipe file exists before a connection attempt
+can proceed. It is idempotent, only creating the FIFO if it doesn't
+already exist.
 
 Arguments:
 - `PATH` (string): The absolute file path for the FIFO.
@@ -111,14 +135,14 @@ Returns: `t` on successful creation.
 
 Signals:
 - `warp-pipe-creation-error`: If `mkfifo` is not found, a non-FIFO
-  file already exists, or the command fails."
+  file with the same name already exists, or the command fails for
+  any other reason."
   (unless (executable-find "mkfifo")
     (error 'warp-pipe-creation-error "mkfifo executable not found."))
   (when (file-exists-p path)
     (unless (eq 'fifo (car (file-attributes path)))
       (error 'warp-pipe-creation-error
              (format "File at '%s' exists and is not a FIFO." path))))
-  ;; Only create the FIFO if it doesn't already exist.
   (unless (file-exists-p path)
     (let ((status (call-process "mkfifo" nil nil nil path)))
       (unless (zerop status)
@@ -133,10 +157,11 @@ Signals:
 (defun warp-pipe--get-optimized-cat-command ()
   "Determine the optimal `cat` command for unbuffered, low-latency I/O.
 Standard `cat` often uses line-buffering, which can introduce
-latency. This checks for `stdbuf` or `unbuffer` to disable it.
+unacceptable latency for streaming data. This function checks for `stdbuf`
+or `unbuffer` to disable buffering, improving performance.
 
 Returns:
-- (list): A list of strings for the command and its arguments."
+- (list): A list of strings representing the command and its arguments."
   (cond
    ((executable-find "stdbuf") '("stdbuf" "-i0" "-o0" "cat"))
    ((executable-find "unbuffer") '("unbuffer" "cat"))
@@ -145,6 +170,9 @@ Returns:
 
 (defun warp-pipe--cleanup-on-failure (path read-proc write-proc buffer)
   "Clean up partially created resources when connection fails.
+This is a robust error-handling utility for the `connect-or-listen`
+function. It ensures that any temporary processes or buffers are
+removed if the full connection handshake fails, preventing resource leaks.
 
 Arguments:
 - `PATH` (string): The path to the FIFO file.
@@ -160,17 +188,21 @@ Returns: `nil`."
     (delete-process write-proc))
   (when (and buffer (buffer-live-p buffer))
     (kill-buffer buffer))
-  ;; We don't delete the FIFO file on failure, as another process might be
-  ;; successfully using it. Orphaned FIFOs are handled on startup.
+  ;; The FIFO file is intentionally not deleted on failure, as another process
+  ;; might be successfully using it. Orphaned FIFOs are handled on startup.
   (warp:log! :debug "warp-pipe" "Cleanup complete for failed pipe.")
   nil)
 
 ;;----------------------------------------------------------------------
-;;; Protocol Implementation
+;;; Protocol Implementation Functions
 ;;----------------------------------------------------------------------
 
 (defun warp-pipe-protocol--matcher-fn (address)
-  "The `:matcher-fn` for the `:pipe` transport.
+  "The `matcher-fn` method for the `:pipe` transport.
+This function is part of the service contract. It determines if a given
+address string is intended for this protocol by checking for the `ipc://`
+scheme. The `warp-transport.el` dispatcher uses this function to
+dynamically resolve the correct service implementation.
 
 Arguments:
 - `ADDRESS` (string): The connection address.
@@ -179,9 +211,10 @@ Returns: `t` if the address starts with `ipc://`."
   (s-starts-with-p "ipc://" address))
 
 (defun warp-pipe--connect-or-listen (connection)
-  "Shared logic for both `:connect-fn` and `:listen-fn`.
-This function creates the FIFO file if needed, starts the `cat`
-processes for reading/writing, and sets up filters and sentinels.
+  "Shared logic for both `connect` and `listen` methods.
+This function encapsulates the core steps for establishing a bidirectional
+named pipe connection. This logic is the same regardless of whether the
+process is acting as a client or a server.
 
 Arguments:
 - `CONNECTION` (warp-transport-connection): The connection object.
@@ -195,7 +228,7 @@ Returns:
       ;; Step 1: Extract path from address and create the FIFO file system object.
       (:let ((extracted-path (warp-pipe--path-from-address <>)))
         (setq path extracted-path)
-        (loom:await (warp-pipe--create-fifo path))) ; Await mkfifo
+        (loom:await (warp-pipe--create-fifo path)))
 
       ;; Step 2: Start the two underlying `cat` processes. One process reads
       ;; from the pipe and writes to its stdout (which Emacs captures). The
@@ -261,7 +294,9 @@ Returns:
                          :cause err))))))))
 
 (defun warp-pipe-protocol--connect-fn (connection)
-  "The `:connect-fn` for the `:pipe` transport.
+  "The `connect` method for the `:pipe` transport.
+This function implements the `:connect` method of the `transport-protocol-service`
+interface, delegating the core logic to `warp-pipe--connect-or-listen`.
 
 Arguments:
 - `CONNECTION` (warp-transport-connection): The connection object.
@@ -271,7 +306,9 @@ Returns:
   (warp-pipe--connect-or-listen connection))
 
 (defun warp-pipe-protocol--listen-fn (connection)
-  "The `:listen-fn` for the `:pipe` transport.
+  "The `listen` method for the `:pipe` transport.
+This function implements the `:listen` method of the `transport-protocol-service`
+interface, delegating the core logic to `warp-pipe--connect-or-listen`.
 
 Arguments:
 - `CONNECTION` (warp-transport-connection): The connection object.
@@ -281,7 +318,11 @@ Returns:
   (warp-pipe--connect-or-listen connection))
 
 (defun warp-pipe-protocol--close-fn (connection _force)
-  "The `:close-fn` for the `:pipe` transport.
+  "The `close` method for the `:pipe` transport.
+This function implements the `:close` method of the `transport-protocol-service`
+interface. It shuts down the underlying Emacs processes that are managing
+the pipe's I/O, but intentionally leaves the FIFO file itself on the
+filesystem for later cleanup.
 
 Arguments:
 - `CONNECTION` (warp-transport-connection): The connection to close.
@@ -302,12 +343,13 @@ Returns:
         (delete-process proc)))
     (when (and buffer (buffer-live-p buffer))
       (kill-buffer buffer))
-    ;; The FIFO file is intentionally not deleted on close to allow the other
-    ;; end to disconnect gracefully. Orphaned files are cleaned on startup.
     (loom:resolved! t)))
 
 (defun warp-pipe-protocol--send-fn (connection data)
-  "The `:send-fn` for the `:pipe` transport.
+  "The `send` method for the `:pipe` transport.
+This function implements the `:send` method of the `transport-protocol-service`
+interface. It writes raw binary data directly to the Emacs process that
+is managing the pipe's output stream.
 
 Arguments:
 - `CONNECTION` (warp-transport-connection): The pipe connection.
@@ -326,7 +368,10 @@ Returns:
                     :message "Write process is not live or does not exist.")))))
 
 (defun warp-pipe-protocol--health-check-fn (connection)
-  "The `:health-check-fn` for the `:pipe` transport.
+  "The `health-check` method for the `:pipe` transport.
+This function implements the `:health-check` method of the `transport-protocol-service`.
+It verifies the liveness of the underlying processes and the integrity of
+the FIFO file, ensuring the transport is operational.
 
 Arguments:
 - `CONNECTION` (warp-transport-connection): The connection to check.
@@ -352,7 +397,10 @@ Returns:
 
 (defun warp-pipe--cleanup-orphans ()
   "Clean up orphaned FIFO files from previous, unclean shutdowns.
-This function is called when the module is loaded.
+This function is a critical part of the plugin's lifecycle management. It
+is called on plugin load and shutdown to ensure that any leftover FIFO
+files from previous crashes or forced exits are removed, preventing a
+`warp:pipe-creation-error` on subsequent runs.
 
 Arguments:
 - None.
@@ -371,25 +419,13 @@ Returns: `nil`."
                 (warp:log! :info "warp-pipe" "Deleted orphaned FIFO: %s" file))
             (error
              (warp:log! :warn "warp-pipe" "Failed to delete FIFO %s: %S"
-                        file err))))))))
-
-(defun warp-pipe-protocol--cleanup-fn ()
-  "The `:cleanup-fn` for the `:pipe` transport.
-This is registered as a `kill-emacs-hook`.
-
-Arguments:
-- None.
-
-Returns: `nil`."
-  (warp:log! :info "warp-pipe" "Running global pipe cleanup on exit.")
-  ;; The generic transport shutdown handles closing active connections. We
-  ;; just need to handle any leftover FIFO files.
-  (warp-pipe--cleanup-orphans)
-  nil)
+                        file err)))))))
 
 (defun warp-pipe-protocol--address-generator-fn (&key id host)
-  "The `:address-generator-fn` for the `:pipe` transport.
-Generates a default file-based IPC address.
+  "The `address-generator` method for the `:pipe` transport.
+This function implements a part of the `transport-protocol-service` API.
+It generates a default file-based IPC address using the configured
+`warp-pipe-default-directory`.
 
 Arguments:
 - `:id` (string): A unique ID for the address.
@@ -402,21 +438,27 @@ Returns:
            (or id (format "warp-pipe-%s" (random-string 8)))
            warp-pipe-default-directory)))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Protocol Registration
+;;;----------------------------------------------------------------------
+;;; Pipe Plugin Definition
+;;;----------------------------------------------------------------------
 
-(warp:deftransport :pipe
-  :matcher-fn #'warp-pipe-protocol--matcher-fn
-  :address-generator-fn #'warp-pipe-protocol--address-generator-fn
-  :connect-fn #'warp-pipe-protocol--connect-fn
-  :listen-fn #'warp-pipe-protocol--listen-fn
-  :close-fn #'warp-pipe-protocol--close-fn
-  :send-fn #'warp-pipe-protocol--send-fn
-  :health-check-fn #'warp-pipe-protocol--health-check-fn
-  :cleanup-fn #'warp-pipe-protocol--cleanup-fn)
-
-;; Ensure orphan cleanup runs on startup when this module is loaded.
-(warp-pipe--cleanup-orphans)
+(warp:defplugin :pipe-transport-plugin
+  "Provides the Named Pipe (FIFO) transport implementation for Warp."
+  :version "1.0.0"
+  :implements :transport-protocol-service
+  :init
+  (lambda (_context)
+    (when warp-pipe-cleanup-orphans-on-startup
+      (warp-pipe--cleanup-orphans))
+    (warp:register-transport-protocol-service-implementation
+     :pipe
+     `(:matcher-fn #'warp-pipe-protocol--matcher-fn
+       :connect-fn #'warp-pipe-protocol--connect-fn
+       :listen-fn #'warp-pipe-protocol--listen-fn
+       :close-fn #'warp-pipe-protocol--close-fn
+       :send-fn #'warp-pipe-protocol--send-fn
+       :health-check-fn #'warp-pipe-protocol--health-check-fn
+       :address-generator-fn #'warp-pipe-protocol--address-generator-fn))))
 
 (provide 'warp-pipe)
 ;;; warp-pipe.el ends here

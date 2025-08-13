@@ -28,14 +28,14 @@
 
 (require 'cl-lib)
 (require 'loom)
-(require 'braid) 
+(require 'braid)
 
 (require 'warp-log)
 (require 'warp-rpc)
 (require 'warp-circuit-breaker)
 (require 'warp-transport)
-(require 'warp-worker) 
-(require 'warp-security-policy) 
+(require 'warp-worker)
+(require 'warp-security-policy)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -57,10 +57,12 @@ resources like its network connection and circuit breaker.
 
 Fields:
 - `worker-id` (string): The unique string ID of the worker process.
+- `pool-name` (string): The name of the pool this worker belongs to.
 - `rank` (integer): The numerical rank of the worker, assigned at launch.
 - `connection` (warp-transport-connection or nil): The active
   `warp-transport-connection` to this worker. This is how the master
   communicates with the worker via RPC.
+- `inbox-address` (string or nil): The RPC address for this worker.
 - `last-heartbeat-time` (float): The timestamp (`float-time`) of the
   last heartbeat received from this worker. Used for liveness tracking.
 - `health-status` (symbol): The worker's current overall health status
@@ -82,8 +84,10 @@ Fields:
   worker. Used in some load balancing calculations, can be adjusted
   dynamically."
   (worker-id nil :type string :read-only t)
+  (pool-name "default" :type string :read-only t)
   (rank nil :type integer :read-only t)
   (connection nil :type (or null t))
+  (inbox-address nil :type (or null string))
   (last-heartbeat-time 0.0 :type float)
   (health-status :unknown :type symbol)
   (last-reported-metrics nil :type (or null hash-table))
@@ -96,7 +100,11 @@ Fields:
 ;;; Public API
 
 ;;;###autoload
-(cl-defun warp:managed-worker-create (&key worker-id (pool-name "default") rank connection inbox-address) 
+(cl-defun warp:managed-worker-create (&key worker-id
+                                           (pool-name "default")
+                                           rank
+                                           connection
+                                           inbox-address)
   "Creates a new `warp-managed-worker` instance.
 This is typically called by the `warp-bridge` when a new worker
 connects and is registered.
@@ -110,14 +118,15 @@ Arguments:
 
 Returns:
 - (warp-managed-worker): A new managed worker instance."
-  (warp:log! :info 
-              "managed-worker" "Creating managed worker: %s (Pool: %s)" 
-              worker-id pool-name)
-  (%%make-managed-worker :worker-id worker-id
-                         :pool-name pool-name ;; `pool-name` is used here in the constructor
-                         :rank rank
-                         :connection connection
-                         :inbox-address inbox-address))
+  (warp:log! :info "managed-worker"
+             "Creating managed worker: %s (Pool: %s)"
+             worker-id pool-name)
+  (make-warp-managed-worker
+   :worker-id worker-id
+   :pool-name pool-name
+   :rank rank
+   :connection connection
+   :inbox-address inbox-address))
 
 ;;;###autoload
 (defun warp:managed-worker-update-metrics (m-worker metrics-hash)
@@ -145,17 +154,55 @@ Signals:
     (error "metrics-hash must be a hash table for worker %s"
            (warp-managed-worker-worker-id m-worker)))
 
-  ;; Store the latest raw metrics hash reported by the worker.
+  ;; Store the latest raw metrics and update heartbeat time.
   (setf (warp-managed-worker-last-reported-metrics m-worker) metrics-hash)
+  (setf (warp-managed-worker-last-heartbeat-time m-worker) (float-time))
 
-  ;; Update health status from the worker-reported metrics. The key
-  ;; "health_status" is assumed to be present and holds a symbol.
+  ;; Compute and set assessed health instead of just trusting the worker's report.
   (setf (warp-managed-worker-health-status m-worker)
-        (gethash :health-status metrics-hash :unknown)) ; Using :health-status as key
+        (warp:managed-worker-assess-health m-worker)))
 
-  ;; Update last heartbeat time.
-  (setf (warp-managed-worker-last-heartbeat-time m-worker) (float-time)))
+;;;###autoload
+(defun warp:managed-worker-assess-health (m-worker)
+  "Compute overall health based on multiple factors from the master's perspective."
+  (let* ((self-reported (gethash :health-status
+                                 (warp-managed-worker-last-reported-metrics m-worker)
+                                 :unknown))
+         (heartbeat-age (- (float-time)
+                           (warp-managed-worker-last-heartbeat-time m-worker)))
+         (avg-latency (warp-managed-worker-observed-avg-rpc-latency m-worker))
+         (cb (warp-managed-worker-circuit-breaker m-worker))
+         (circuit-open-p (and cb (warp:circuit-breaker-open-p cb))))
+    (cond
+     ;; Circuit breaker is open - definitely unhealthy
+     (circuit-open-p :circuit-breaker-open)
+     ;; No recent heartbeat - likely disconnected
+     ((> heartbeat-age 60) :heartbeat-timeout)
+     ;; High latency indicates problems
+     ((> avg-latency 5.0) :high-latency)
+     ;; Otherwise trust self-reported status
+     (t self-reported))))
 
+;;;###autoload
+(defun warp:managed-worker-calculate-effective-weight (m-worker)
+  "Calculate dynamic weight based on current performance metrics."
+  (let* ((base-weight (warp-managed-worker-initial-weight m-worker))
+         (health (warp-managed-worker-health-status m-worker))
+         (latency (warp-managed-worker-observed-avg-rpc-latency m-worker))
+         (active-rpcs (warp-managed-worker-active-rpcs m-worker)))
+    (* base-weight
+       ;; Health modifier
+       (pcase health
+         (:healthy 1.0)
+         (:degraded 0.5)
+         ((or :unhealthy :heartbeat-timeout :circuit-breaker-open) 0.1)
+         (_ 0.1))
+       ;; Latency penalty (inverse relationship)
+       (if (> latency 0) (/ 1.0 (1+ latency)) 1.0)
+       ;; Load penalty (avoid overloaded workers)
+       (max 0.1 (/ 1.0 (1+ (* active-rpcs 0.1)))))))
+
+;;;###autoload
 (defun warp:managed-worker-record-rpc (m-worker rpc-latency success-p)
   "Update the master's RPC tracking for a worker after an RPC completes.
 This function updates the master's *own observations* of a
@@ -215,42 +262,6 @@ Returns:
 - (float): The observed average RPC latency in seconds. Returns 0.0 if
   no latency has been observed yet."
   (warp-managed-worker-observed-avg-rpc-latency m-worker))
-
-;;---------------------------------------------------------------------
-;;; RPC Handlers (Worker-side logic for commands from Master)
-;;---------------------------------------------------------------------
-
-(defun warp-handler-execute-lisp-form (command context)
-  "Handles the `:execute-lisp-form` RPC.
-Evaluates a provided Lisp form string within the worker's environment.
-This RPC is intended for remote debugging or dynamic changes. It uses
-`warp-security-policy` for sandboxed execution.
-
-Arguments:
-- `command` (warp-rpc-command): The incoming command, with `:form-string` in args.
-- `context` (plist): The RPC context, containing worker and system references.
-
-Returns:
-- (loom-promise): A promise that resolves with the result of the Lisp form evaluation."
-  (let* ((worker (plist-get context :worker)) ; Get worker instance from context
-         (system (warp-worker-component-system worker))
-         (policy (warp:component-system-get system :security-policy))
-         (form-string (plist-get (warp-rpc-command-args command) :form-string)))
-    (warp:log! :warn (warp-worker-worker-id worker) 
-               "Executing remote Lisp form: '%s'" 
-               form-string)
-    (braid! (warp:security-policy-execute-form policy (read-from-string form-string))
-      (:then (lambda (result)
-               (warp:log! :info (warp-worker-worker-id worker) 
-                          "Remote Lisp form executed. Result: %S" result)
-               result))
-      (:catch (lambda (err)
-                (warp:log! :error (warp-worker-worker-id worker) 
-                           "Failed to execute remote Lisp form: %S" err)
-                (loom:rejected! (
-                  warp:error! :type 'warp-worker-error
-                              :message (format "Remote Lisp execution failed: %S" err)
-                              :cause err)))))))
 
 (provide 'warp-managed-worker)
 ;;; warp-managed-worker.el ends here

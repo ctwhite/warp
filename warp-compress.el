@@ -3,26 +3,40 @@
 ;;; Commentary:
 ;;
 ;; This module provides a high-performance, component-based interface for
-;; data compression and decompression. It leverages the abstract `warp-pool`
-;; system to manage compression resources efficiently, providing automatic
-;; scaling, fault tolerance, and resource recycling.
+;; data compression and decompression. It leverages the foundational
+;; `warp-resource-pool` system to manage compression resources efficiently,
+;; providing automatic scaling, fault tolerance, and resource recycling.
 ;;
 ;; This module is designed to be instantiated as a `warp-compression-system`
-;; component within a larger system like `warp-cluster`.
+;; component within a larger system like `warp-cluster`. It serves as an
+;; excellent example of how to build a high-level, specialized component by
+;; composing low-level primitives.
 ;;
-;; Key Features:
+;; ## Architectural Role:
+;;
+;; The `warp-compression-system` component acts as a factory and a router. It
+;; manages a collection of `warp-resource-pool` instances, one for each
+;; supported compression algorithm. When a compression task arrives, the system
+;; dispatches it to the appropriate resource pool, which then handles
+;; checking out an available resource (e.g., a `gzip` process) to perform
+;; the operation.
+;;
+;; This design decouples the compression logic from the resource management,
+;; making it robust and scalable.
+;;
+;; ## Key Features:
 ;;
 ;; - **Component-Based:** All state is encapsulated in the
 ;;   `warp-compression-system` struct, eliminating global state.
 ;; - **Fully Asynchronous:** All I/O operations, including those with
 ;;   external commands like `gzip`, are non-blocking and promise-based.
-;; - **Resource Pooling:** Uses `warp-pool` to manage Python processes and
-;;   external compression tools efficiently.
+;; - **Resource Pooling:** Uses `warp-resource-pool` to manage Python processes
+;;   and external compression tools efficiently.
 ;; - **Algorithm Support:** Supports gzip, zlib, deflate, brotli, and lz4.
 ;; - **Circuit Breaker:** Prevents cascading failures during high error
-;;   rates, integrated via the `warp-pool`'s circuit breaker mechanism.
+;;   rates, integrated via the `warp-resource-pool`'s circuit breaker mechanism.
 ;; - **Metrics & Monitoring:** Comprehensive metrics available directly
-;;   from the `warp-pool`.
+;;   from the `warp-resource-pool`.
 
 ;;; Code:
 
@@ -35,7 +49,7 @@
 
 (require 'warp-log)
 (require 'warp-error)
-(require 'warp-pool)
+(require 'warp-resource-pool)
 (require 'warp-circuit-breaker)
 (require 'warp-config)
 
@@ -64,9 +78,9 @@
 (warp:defconfig compression-config
   "Configuration for a `warp-compression-system` component.
 
-Fields:
-- `default-level` (integer): Default compression level (1-9).
-- `default-timeout` (integer): Default timeout in seconds for operations."
+  Fields:
+  - `default-level` (integer): Default compression level (1-9).
+  - `default-timeout` (integer): Default timeout in seconds for operations."
   (default-level 6 :type '(integer :min 1 :max 9))
   (default-timeout 30 :type integer))
 
@@ -74,10 +88,10 @@ Fields:
                (:constructor %%make-compression-system))
   "A component encapsulating state for the compression service.
 
-Fields:
-- `config` (compression-config): The configuration object.
-- `pools` (hash-table): Maps algorithm names to `warp-pool` instances.
-- `command-cache` (hash-table): Caches availability of external commands."
+  Fields:
+  - `config` (compression-config): The configuration object.
+  - `pools` (hash-table): Maps algorithm names to `warp-resource-pool` instances.
+  - `command-cache` (hash-table): Caches availability of external commands."
   (config (cl-assert nil) :type compression-config)
   (pools (make-hash-table :test 'equal) :type hash-table)
   (command-cache (make-hash-table :test 'equal) :type hash-table))
@@ -89,46 +103,46 @@ Fields:
 ;;; Resource Management (Pool Callbacks)
 ;;----------------------------------------------------------------------
 
-(defun warp--compression-resource-factory (resource pool)
+(defun warp--compression-resource-factory (pool &rest args)
   "Factory function to create the underlying compression resource handle.
-This function is a callback for `warp-pool`. It acts as a dispatcher,
-creating different kinds of resources based on the algorithm of the
-pool that is requesting a new resource.
+  This function is a callback for `warp-resource-pool`. It acts as a dispatcher,
+  creating different kinds of resources based on the algorithm of the
+  pool that is requesting a new resource.
 
-Arguments:
-- `RESOURCE` (warp-pool-resource): The resource shell to populate.
-- `POOL` (warp-pool): The pool requesting the resource.
+  Arguments:
+  - `POOL` (warp-resource-pool): The pool requesting the resource.
+  - `ARGS` (list): Optional arguments passed from the pool.
 
-Returns:
-- (loom-promise): A promise that resolves with the resource handle
-  (e.g., a process object) or rejects on failure."
-  (let* ((system (warp-pool-custom-data pool))
-         (pool-name (warp-pool-name pool))
+  Returns:
+  - (loom-promise): A promise that resolves with the resource handle
+    (e.g., a process object) or rejects on failure."
+  (let* ((system (plist-get (warp-resource-pool-config pool) :custom-data))
+         (pool-name (symbol-name (warp-resource-pool-name pool)))
          (algorithm (intern (replace-regexp-in-string
-                             "warp-compress-\\(.+\\)" "\\1" pool-name))))
+                             "warp-compress-\\(.+\\)-pool" "\\1" pool-name))))
     (pcase algorithm
       ;; For zlib/deflate, the resource is a long-lived Python process.
       ((or 'zlib 'deflate)
-       (warp--create-python-process resource algorithm pool))
+       (warp--create-python-process algorithm pool))
       ;; For others, the "resource" is just the validated command name.
       ((or 'gzip 'brotli 'lz4)
        (warp--validate-command-resource system (symbol-name algorithm)))
       (_
-       (loom:rejected! (format "Unknown algorithm for factory: %S"
-                               algorithm))))))
+       (loom:rejected! (warp:error!
+                        :type 'warp-compression-pool-error
+                        :message (format "Unknown algorithm for factory: %S" algorithm)))))))
 
-(defun warp--create-python-process (resource algorithm pool)
+(defun warp--create-python-process (algorithm pool)
   "Create a persistent Python process for zlib/deflate operations.
 
-Arguments:
-- `RESOURCE` (warp-pool-resource): The resource shell to populate.
-- `ALGORITHM` (symbol): The compression algorithm (`zlib` or `deflate`).
-- `POOL` (warp-pool): The pool requesting the resource.
+  Arguments:
+  - `ALGORITHM` (symbol): The compression algorithm (`zlib` or `deflate`).
+  - `POOL` (warp-resource-pool): The pool requesting the resource.
 
-Returns:
-- (loom-promise): A promise resolving with the process object."
-  (let* ((process-name (format "warp-compress-%S-%S"
-                               algorithm (warp-pool-resource-id resource)))
+  Returns:
+  - (loom-promise): A promise resolving with the process object."
+  (let* ((resource-id (s-uuid))
+         (process-name (format "warp-compress-%S-%S" algorithm resource-id))
          (python-script (warp--generate-python-script))
          (process (start-process process-name nil
                                  "python3" "-u" "-c" python-script)))
@@ -138,122 +152,127 @@ Returns:
           ;; The sentinel notifies the pool if the process dies unexpectedly.
           (set-process-sentinel
            process
-           (lambda (proc event)
-             (when (warp-pool-resource-p resource)
-               (loom:await ; Await resource death handling
-                (warp:log! :warn "warp-compress" "Python process '%s' died: %s"
-                           (process-name proc) event)
-                (warp-pool-handle-resource-death
-                 resource event pool)))))
+           (lambda (p event)
+             (when (and (eq (warp-resource-pool-state pool) :active)
+                        (not (s-contains-p "finished" event)))
+               (warp:log! :warn "warp-compress" "Python process '%s' died: %s. Replacing."
+                          (process-name p) event)
+               (let* ((resource-handle (warp:pool-resource-handle-by-process pool p))
+                      (pooled-resource (warp:pool-resource-by-handle pool resource-handle)))
+                 (when pooled-resource
+                   (loom:await (warp:resource-pool-destroy-resource pool pooled-resource)))))))
           (loom:resolved! process))
-      (loom:rejected! "Failed to start Python process"))))
+      (loom:rejected! (warp:error!
+                       :type 'warp-compression-pool-error
+                       :message "Failed to start Python process")))))
 
 (defun warp--validate-command-resource (system command)
   "Validate that an external command is available in the system's PATH.
 
-Arguments:
-- `SYSTEM` (warp-compression-system): The compression system component.
-- `COMMAND` (string): The command name to check (e.g., \"gzip\").
+  Arguments:
+  - `SYSTEM` (warp-compression-system): The compression system component.
+  - `COMMAND` (string): The command name to check (e.g., \"gzip\").
 
-Returns:
-- (loom-promise): A promise that resolves with the command name if
-  available, or rejects otherwise."
+  Returns:
+  - (loom-promise): A promise that resolves with the command name if
+    available, or rejects otherwise."
   (if (warp--check-command-cached system command)
       (loom:resolved! command)
-    (loom:rejected! (format "Command not available: %s" command))))
+    (loom:rejected! (warp:error!
+                     :type 'warp-compression-pool-error
+                     :message (format "Command not available: %s" command)))))
 
 (defun warp--compression-resource-validator (resource pool)
   "Validate that a compression resource is healthy.
-This function is a `warp-pool` callback.
+  This function is a `warp-resource-pool` callback.
 
-Arguments:
-- `RESOURCE` (warp-pool-resource): The resource to validate.
-- `POOL` (warp-pool): The pool owning the resource.
+  Arguments:
+  - `RESOURCE` (t): The resource handle to validate.
+  - `POOL` (warp-resource-pool): The pool owning the resource.
 
-Returns:
-- (loom-promise): A promise that resolves to `t` if the resource is
-  healthy, `nil` otherwise."
-  (let* ((system (warp-pool-custom-data pool))
-         (handle (warp-pool-resource-resource-handle resource))
-         (pool-name (warp-pool-name pool))
+  Returns:
+  - (loom-promise): A promise that resolves to `t` if the resource is
+    healthy, or `nil` otherwise."
+  (let* ((pool-name (symbol-name (warp-resource-pool-name pool)))
          (algorithm (intern (replace-regexp-in-string
-                             "warp-compress-\\(.+\\)" "\\1" pool-name))))
+                             "warp-compress-\\(.+\\)-pool" "\\1" pool-name))))
     (pcase algorithm
       ((or 'zlib 'deflate)
-       (loom:resolved! (and (processp handle) (process-live-p handle))))
+       (loom:resolved! (and (processp resource) (process-live-p resource))))
       ((or 'gzip 'brotli 'lz4)
-       (loom:resolved! (warp--check-command-cached system
-                                                   (symbol-name algorithm))))
+       (let ((system (plist-get (warp-resource-pool-config pool) :custom-data)))
+         (loom:resolved! (warp--check-command-cached system (symbol-name algorithm)))))
       (_ (loom:resolved! nil)))))
 
-(defun warp--compression-resource-destructor (resource _pool)
+(defun warp--compression-resource-destructor (resource pool)
   "Clean up compression resources when they are removed from the pool.
-This function is a `warp-pool` callback.
+  This function is a `warp-resource-pool` callback.
 
-Arguments:
-- `RESOURCE` (warp-pool-resource): The resource to destroy.
-- `_POOL` (warp-pool): The pool owning the resource (unused).
+  Arguments:
+  - `RESOURCE` (t): The resource handle to destroy.
+  - `POOL` (warp-resource-pool): The pool owning the resource.
 
-Returns:
-- (loom-promise): A promise that resolves when cleanup is done."
-  (let ((handle (warp-pool-resource-resource-handle resource)))
-    ;; Only processes need explicit cleanup.
-    (when (and (processp handle) (process-live-p handle))
-      (delete-process handle))
+  Returns:
+  - (loom-promise): A promise that resolves when cleanup is done."
+  (let* ((pool-name (symbol-name (warp-resource-pool-name pool)))
+         (algorithm (intern (replace-regexp-in-string
+                             "warp-compress-\\(.+\\)-pool" "\\1" pool-name))))
+    (pcase algorithm
+      ((or 'zlib 'deflate)
+       (when (and (processp resource) (process-live-p resource))
+         (delete-process resource)))
+      (_ nil))
     (loom:resolved! t)))
 
 ;;----------------------------------------------------------------------
 ;;; Task Execution
 ;;----------------------------------------------------------------------
 
-(defun warp--compression-task-executor (task resource _pool)
+(defun warp--compression-task-executor (system resource-handle payload)
   "Execute a compression or decompression task using a resource.
-This function is the main task execution callback for `warp-pool`.
+  This function is the main task execution callback for `warp:with-pooled-resource`.
 
-Arguments:
-- `TASK` (warp-task): The task to execute.
-- `RESOURCE` (warp-pool-resource): The acquired resource.
-- `_POOL` (warp-pool): The pool (unused).
+  Arguments:
+  - `SYSTEM` (warp-compression-system): The component instance.
+  - `RESOURCE-HANDLE` (t): The acquired resource (a process or command name).
+  - `PAYLOAD` (plist): The task payload.
 
-Returns:
-- (loom-promise): A promise that settles with the task's result."
-  (let* ((payload (warp-task-payload task))
-         (operation (plist-get payload :operation))
+  Returns:
+  - (loom-promise): A promise that settles with the task's result."
+  (let* ((operation (plist-get payload :operation))
          (algorithm (plist-get payload :algorithm))
          (data (plist-get payload :data))
-         (level (plist-get payload :level))
-         (handle (warp-pool-resource-resource-handle resource)))
+         (level (plist-get payload :level)))
     (pcase algorithm
       ((or :zlib :deflate)
-       (warp--execute-python-task handle operation algorithm data level))
+       (warp--execute-python-task resource-handle operation algorithm data level))
       (:gzip (warp--execute-external-command-task "gzip" operation data level))
-      (:brotli (warp--execute-external-command-task "brotli" operation data
-                                                    level))
+      (:brotli (warp--execute-external-command-task "brotli" operation data level))
       (:lz4 (warp--execute-external-command-task "lz4" operation data level))
-      (_ (loom:rejected! (format "Unsupported algorithm: %S" algorithm))))))
+      (_ (loom:rejected! (warp:error!
+                          :type 'warp-compression-error
+                          :message (format "Unsupported algorithm: %S" algorithm)))))))
 
 (defun warp--execute-python-task (process operation algorithm data level)
   "Execute a task using a persistent Python subprocess.
-This function communicates with the Python process via line-delimited
-JSON messages over stdin/stdout.
+  This function communicates with the Python process via line-delimited
+  JSON messages over stdin/stdout.
 
-Arguments:
-- `PROCESS` (process): The live Python process handle.
-- `OPERATION` (symbol): `:compress` or `:decompress`.
-- `ALGORITHM` (symbol): `:zlib` or `:deflate`.
-- `DATA` (string): The raw binary string to process.
-- `LEVEL` (integer): The compression level.
+  Arguments:
+  - `PROCESS` (process): The live Python process handle.
+  - `OPERATION` (symbol): `:compress` or `:decompress`.
+  - `ALGORITHM` (symbol): `:zlib` or `:deflate`.
+  - `DATA` (string): The raw binary string to process.
+  - `LEVEL` (integer): The compression level.
 
-Returns:
-- (loom-promise): A promise resolving with the processed binary string."
+  Returns:
+  - (loom-promise): A promise resolving with the processed binary string."
   (let* ((request `((operation . ,(symbol-name operation))
                     (algorithm . ,(substring (symbol-name algorithm) 1))
                     (data . ,(base64-encode-string data))
                     ,@(when level `((level . ,level)))))
          (request-json (concat (json-encode request) "\n"))
          (response-promise (loom:promise)))
-    ;; The logic is to set a one-shot filter to read the single-line
-    ;; JSON response, send the request, and wait on the promise.
     (set-process-filter
      process
      (lambda (_proc output)
@@ -280,17 +299,17 @@ Returns:
 
 (defun warp--execute-external-command-task (command-name operation data level)
   "Asynchronously execute an external command (gzip, brotli, lz4).
-This function is fully non-blocking. It starts an external process and
-returns a promise that is settled by the process sentinel upon completion.
+  This function is fully non-blocking. It starts an external process and
+  returns a promise that is settled by the process sentinel upon completion.
 
-Arguments:
-- `COMMAND-NAME` (string): The name of the command (e.g., \"gzip\").
-- `OPERATION` (symbol): `:compress` or `:decompress`.
-- `DATA` (string): The raw binary string to process.
-- `LEVEL` (integer): The compression level.
+  Arguments:
+  - `COMMAND-NAME` (string): The name of the command (e.g., \"gzip\").
+  - `OPERATION` (symbol): `:compress` or `:decompress`.
+  - `DATA` (string): The raw binary string to process.
+  - `LEVEL` (integer): The compression level.
 
-Returns:
-- (loom-promise): A promise resolving with the processed binary string."
+  Returns:
+  - (loom-promise): A promise resolving with the processed binary string."
   (loom:promise
    :name (format "%s-%s" command-name operation)
    :executor
@@ -334,39 +353,30 @@ Returns:
 ;;----------------------------------------------------------------------
 
 (defun warp--compression-system-get-pool (system algorithm)
-  "Get or lazily create a `warp-pool` for an algorithm.
+  "Get or lazily create a `warp-resource-pool` for an algorithm.
 
-Arguments:
-- `SYSTEM` (warp-compression-system): The compression system component.
-- `ALGORITHM` (symbol): The algorithm for which to get a pool.
+  Arguments:
+  - `SYSTEM` (warp-compression-system): The compression system component.
+  - `ALGORITHM` (keyword): The algorithm for which to get a pool.
 
-Returns:
-- (warp-pool): The pool instance for the given algorithm."
+  Returns:
+  - (warp-resource-pool): The pool instance for the given algorithm."
   (let ((pool-key (symbol-name algorithm)))
     (or (gethash pool-key (warp-compression-system-pools system))
-        (let* ((pool
-                (warp:pool-builder
-                 ;; Pool configuration
-                 `(:pool
-                   :name ,(format "warp-compress-%S" algorithm)
-                   :resource-factory-fn
-                   ,#'warp--compression-resource-factory
-                   :resource-validator-fn
-                   ,#'warp--compression-resource-validator
-                   :resource-destructor-fn
-                   ,#'warp--compression-resource-destructor
-                   :task-executor-fn ,#'warp--compression-task-executor
-                   :max-queue-size 100
-                   ;; Pass the system instance to the pool's custom data slot
-                   ;; so factory functions can access it.
-                   :custom-data ,system)
-                 ;; Circuit breaker configuration
-                 `(:circuit-breaker
-                   :name ,(format "warp-compress-cb-%S" algorithm)
-                   :failure-threshold 5
-                   :recovery-timeout 30.0))))
-          (puthash pool-key pool (warp-compression-system-pools system))
-          pool))))
+        (let* ((pool-name (format "warp-compress-%S-pool" algorithm))
+               (pool-config
+                 `(:name ,(intern pool-name)
+                   :min-size 1
+                   :max-size 1
+                   :idle-timeout 300.0
+                   :max-wait-time 60.0
+                   :factory-fn ,#'warp--compression-resource-factory
+                   :destructor-fn ,#'warp--compression-resource-destructor
+                   :health-check-fn ,#'warp--compression-resource-validator
+                   :custom-data ,system)))
+          (let ((pool (warp:resource-pool-create pool-config)))
+            (puthash pool-key pool (warp-compression-system-pools system))
+            pool)))))
 
 ;;----------------------------------------------------------------------
 ;;; Utilities
@@ -375,12 +385,12 @@ Returns:
 (defun warp--check-command-cached (system command)
   "Check if an external shell `command` is available, using a cache.
 
-Arguments:
-- `SYSTEM` (warp-compression-system): The compression system component.
-- `COMMAND` (string): The command name to check.
+  Arguments:
+  - `SYSTEM` (warp-compression-system): The compression system component.
+  - `COMMAND` (string): The command name to check.
 
-Returns:
-- The command path if found, `nil` otherwise."
+  Returns:
+  - The command path if found, `nil` otherwise."
   (let* ((cache (warp-compression-system-command-cache system))
          (cached (gethash command cache)))
     (if cached
@@ -392,11 +402,11 @@ Returns:
 (defun warp--generate-python-script ()
   "Generate the Python script string for zlib/deflate processes.
 
-Arguments:
-- None.
+  Arguments:
+  - None.
 
-Returns:
-- (string): The Python script code."
+  Returns:
+  - (string): The Python script code."
   "
 import sys, zlib, base64, json
 
@@ -428,12 +438,16 @@ while True:
 (defun warp:compression-system-create (&rest config-options)
   "Create a new `warp-compression-system` component.
 
-Arguments:
-- `&rest CONFIG-OPTIONS` (plist): Configuration keys that override the
-  defaults defined in `compression-config`.
+  This factory function initializes the component and its configuration. The
+  individual resource pools for each compression algorithm are created lazily
+  on their first use, not at startup.
 
-Returns:
-- (warp-compression-system): A new, inactive compression system."
+  Arguments:
+  - `&rest CONFIG-OPTIONS` (plist): Configuration keys that override the
+    defaults defined in `compression-config`.
+
+  Returns:
+  - (warp-compression-system): A new, inactive compression system."
   (let ((config (apply #'make-compression-config config-options)))
     (%%make-compression-system :config config)))
 
@@ -441,32 +455,37 @@ Returns:
 (defun warp:compression-system-stop (system)
   "Shutdown the compression system and all its resource pools.
 
-Arguments:
-- `SYSTEM` (warp-compression-system): The component instance to stop.
+  This function iterates through all lazily created pools and shuts them down,
+  ensuring all resources (e.g., Python processes) are gracefully terminated.
 
-Returns:
-- (loom-promise): A promise that resolves when all pools are shut down.
+  Arguments:
+  - `SYSTEM` (warp-compression-system): The component instance to stop.
 
-Side Effects:
-- Shuts down all `warp-pool` instances managed by this system."
+  Returns:
+  - (loom-promise): A promise that resolves when all pools are shut down.
+
+  Side Effects:
+  - Shuts down all `warp-resource-pool` instances managed by this system."
   (let ((pools (warp-compression-system-pools system)))
-    (loom:all
-     (cl-loop for pool being the hash-values of pools
-              collect (loom:await ; Await pool shutdown
-                        (warp:pool-shutdown pool t)))) ; Force shutdown
-    (clrhash pools)))
+    (braid! (loom:all
+              (cl-loop for pool being the hash-values of pools
+                       collect (warp:resource-pool-shutdown pool))))
+    (:then (lambda (_) (clrhash pools) t))
+    (:catch (lambda (err)
+              (warp:log! :error "warp-compress" "Error during system stop: %S" err)
+              (loom:rejected! err))))))
 
 ;;;###autoload
 (defun warp:compression-available-p (system &optional algorithm)
   "Check if compression dependencies are available on the system.
 
-Arguments:
-- `SYSTEM` (warp-compression-system): The component instance.
-- `ALGORITHM` (keyword, optional): The specific algorithm to check. If
-  `nil` or `:all`, checks for all supported algorithms.
+  Arguments:
+  - `SYSTEM` (warp-compression-system): The component instance.
+  - `ALGORITHM` (keyword, optional): The specific algorithm to check. If
+    `nil` or `:all`, checks for all supported algorithms.
 
-Returns:
-- `t` if the required command(s) are available, `nil` otherwise."
+  Returns:
+  - `t` if the required command(s) are available, `nil` otherwise."
   (let ((alg (or algorithm :all)))
     (pcase alg
       (:gzip (warp--check-command-cached system "gzip"))
@@ -482,21 +501,25 @@ Returns:
 (defun warp:compress (system data &rest options)
   "Compress `DATA` using the pool-based compression system.
 
-Arguments:
-- `SYSTEM` (warp-compression-system): The component instance.
-- `DATA` (string): The raw binary string to compress.
-- `&rest OPTIONS` (plist): A plist of options:
-  - `:algorithm` (keyword): The compression algorithm to use. Defaults
-    to `:gzip`.
-  - `:level` (integer): The compression level (1-9).
-  - `:timeout` (integer): Timeout in seconds for the operation.
+  This function uses `warp:with-pooled-resource` to acquire a resource from
+  the appropriate pool, performs the compression task, and then automatically
+  returns the resource to the pool.
 
-Returns:
-- (loom-promise): A promise that resolves with the compressed binary string.
+  Arguments:
+  - `SYSTEM` (warp-compression-system): The component instance.
+  - `DATA` (string): The raw binary string to compress.
+  - `&rest OPTIONS` (plist): A plist of options:
+    - `:algorithm` (keyword): The compression algorithm to use. Defaults
+      to `:gzip`.
+    - `:level` (integer): The compression level (1-9).
+    - `:timeout` (integer): Timeout in seconds for the operation.
 
-Signals:
-- `warp-compression-error`: If data is not a string, the algorithm is
-  unsupported, or the underlying pool operation fails."
+  Returns:
+  - (loom-promise): A promise that resolves with the compressed binary string.
+
+  Signals:
+  - `warp-compression-error`: If data is not a string, the algorithm is
+    unsupported, or the underlying pool operation fails."
   (let* ((config (warp-compression-system-config system))
          (algorithm (or (plist-get options :algorithm) :gzip))
          (level (or (plist-get options :level)
@@ -507,36 +530,44 @@ Signals:
 
     (unless (stringp data)
       (signal 'warp-compression-error (list "Data must be a string")))
-    (unless (memq algorithm '(gzip zlib deflate brotli lz4))
-      (signal 'warp-compression-error (list "Unsupported algorithm"
-                                            algorithm)))
+    (unless (warp:compression-available-p system algorithm)
+      (signal 'warp-compression-error
+              (list "Compression algorithm not available on system" algorithm)))
 
-    (braid! (warp:pool-submit
-             pool
-             `(:operation compress :algorithm ,algorithm
-               :data ,data :level ,level)
-             :timeout timeout)
+    (braid! (warp:with-pooled-resource (resource pool)
+              (warp--compression-task-executor system resource
+                                               `(:operation compress
+                                                 :algorithm ,algorithm
+                                                 :data ,data
+                                                 :level ,level))))
       (:catch (lambda (err)
                 (warp:log! :error "warp-compress" "Compression failed: %S" err)
-                (signal 'warp-compression-error (list err)))))))
+                (loom:rejected! (warp:error!
+                                 :type 'warp-compression-error
+                                 :message "Compression failed."
+                                 :cause err)))))))
 
 ;;;###autoload
 (defun warp:decompress (system data &rest options)
   "Decompress `DATA` using the pool-based compression system.
 
-Arguments:
-- `SYSTEM` (warp-compression-system): The component instance.
-- `DATA` (string): The compressed binary string to decompress.
-- `&rest OPTIONS` (plist): A plist of options:
-  - `:algorithm` (keyword): The decompression algorithm. Defaults to `:gzip`.
-  - `:timeout` (integer): Timeout in seconds for the operation.
+  This function uses `warp:with-pooled-resource` to acquire a resource from
+  the appropriate pool, performs the decompression task, and then automatically
+  returns the resource to the pool.
 
-Returns:
-- (loom-promise): A promise resolving with the decompressed binary string.
+  Arguments:
+  - `SYSTEM` (warp-compression-system): The component instance.
+  - `DATA` (string): The compressed binary string to decompress.
+  - `&rest OPTIONS` (plist): A plist of options:
+    - `:algorithm` (keyword): The decompression algorithm. Defaults to `:gzip`.
+    - `:timeout` (integer): Timeout in seconds for the operation.
 
-Signals:
-- `warp-decompression-error`: If data is not a string, the algorithm is
-  unsupported, or the underlying pool operation fails."
+  Returns:
+  - (loom-promise): A promise resolving with the decompressed binary string.
+
+  Signals:
+  - `warp-decompression-error`: If data is not a string, the algorithm is
+    unsupported, or the underlying pool operation fails."
   (let* ((config (warp-compression-system-config system))
          (algorithm (or (plist-get options :algorithm) :gzip))
          (timeout (or (plist-get options :timeout)
@@ -545,19 +576,22 @@ Signals:
 
     (unless (stringp data)
       (signal 'warp-decompression-error (list "Data must be a string")))
-    (unless (memq algorithm '(gzip zlib deflate brotli lz4))
-      (signal 'warp-decompression-error (list "Unsupported algorithm"
-                                              algorithm)))
+    (unless (warp:compression-available-p system algorithm)
+      (signal 'warp-decompression-error
+              (list "Compression algorithm not available on system" algorithm)))
 
-    (braid! (warp:pool-submit
-             pool
-             `(:operation decompress :algorithm ,algorithm
-               :data ,data)
-             :timeout timeout)
+    (braid! (warp:with-pooled-resource (resource pool)
+              (warp--compression-task-executor system resource
+                                               `(:operation decompress
+                                                 :algorithm ,algorithm
+                                                 :data ,data))))
       (:catch (lambda (err)
                 (warp:log! :error "warp-compress" "Decompression failed: %S"
                            err)
-                (signal 'warp-decompression-error (list err)))))))
+                (loom:rejected! (warp:error!
+                                 :type 'warp-decompression-error
+                                 :message "Decompression failed."
+                                 :cause err)))))))
 
 (provide 'warp-compress)
 ;;; warp-compress.el ends here

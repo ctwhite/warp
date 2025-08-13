@@ -19,10 +19,11 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 's)
 
 (require 'warp-config)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Environment Variable Schema
 
 (warp:defconfig (warp-env-config :copier nil :suffix-p nil :no-constructor-p t)
@@ -32,8 +33,10 @@
 
   Fields:
   - `ipc-id` (string): The key for the unique identifier for this process.
+  - `worker-type` (string): The key for the worker's type.
   - `worker-id` (string): The key for the worker's unique identifier.
   - `worker-rank` (string): The key for a worker's assigned rank.
+  - `worker-name` (string): The key for the worker's logical name.
   - `worker-pool-name` (string): The key for the name of the worker's pool.
   - `master-contact` (string): The key for the master's network address.
   - `log-channel` (string): The key for the centralized log server address.
@@ -45,10 +48,13 @@
   - `worker-transport-options` (string): The key for serialized transport
     options for the worker's connection back to the master.
   - `coordinator-peers` (string): The key for the list of coordinator
-    peer addresses, enabling leader discovery."
+    peer addresses, enabling leader discovery.
+  - `worker-type` (string): The key for the name of the worker type to launch."
   (ipc-id "WARP_IPC_ID" :type string :read-only t)
+  (worker-type "WARP_WORKER_TYPE" :type string :read-only t)
   (worker-id "WARP_WORKER_ID" :type string :read-only t)
   (worker-rank "WARP_WORKER_RANK" :type string :read-only t)
+  (worker-name "WARP_WORKER_NAME" :type string :read-only t)
   (worker-pool-name "WARP_WORKER_POOL_NAME" :type string :read-only t)
   (master-contact "WARP_MASTER_CONTACT" :type string :read-only t)
   (log-channel "WARP_LOG_CHANNEL" :type string :read-only t)
@@ -59,12 +65,13 @@
   (launch-token "WARP_LAUNCH_TOKEN" :type string :read-only t)
   (worker-transport-options "WARP_WORKER_TRANSPORT_OPTIONS"
                             :type string :read-only t)
-  (coordinator-peers "WARP_COORDINATOR_PEERS" :type string :read-only t))
+  (coordinator-peers "WARP_COORDINATOR_PEERS" :type string :read-only t)
+  (worker-type "WARP_WORKER_TYPE" :type string :read-only t))
 
 (defvar warp--env-config (%%make-warp-env-config)
   "A singleton instance of `warp-env-config`.")
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;###autoload

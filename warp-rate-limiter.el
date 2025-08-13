@@ -34,6 +34,7 @@
 (require 'warp-protocol)
 (require 'warp-request-pipeline)
 (require 'warp-config)
+(require 'warp-plugin)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -238,6 +239,53 @@ Returns:
             :type 'warp-rate-limit-exceeded
             :message (format "Rate limit exceeded for client %s."
                              client-id))))))))
+
+;;;---------------------------------------------------------------------
+;;; Rate Limiter Plugin Definition
+;;;---------------------------------------------------------------------
+
+(warp:defplugin :rate-limiting
+  "Provides per-client request rate limiting for a Warp worker.
+When loaded, this plugin registers a `:rate-limiter` component and
+contributes middleware to the host's `request-pipeline`. This protects
+services from overload by rejecting requests from clients that exceed a
+configured request frequency."
+  :config-schema 'rate-limiter-config
+  :profiles
+  '((:worker
+     :components
+     ((rate-limiter
+       :doc "The stateful component for a single rate-limiter instance."
+       :requires (config)
+       ;; The factory uses the plugin's own config object, which is
+       ;; automatically instantiated and passed in the context.
+       :factory (lambda (cfg)
+                  (warp:rate-limiter-create
+                   :name "worker-rate-limiter"
+                   :config-options cfg))
+       :stop (lambda (limiter) (warp:rate-limiter-stop limiter))))
+     :contributions
+     '(:request-pipeline
+       (:name :rate-limiting
+              :middleware (lambda (_command context next)
+                            (let* ((limiter (warp:component-system-get
+                                             (warp-request-pipeline-context-worker-system
+                                              context)
+                                             :rate-limiter))
+                                   (message (warp-request-pipeline-context-message context))
+                                   (client-id (warp-rpc-message-sender-id message)))
+                              (if (warp--rate-limiter-check limiter client-id)
+                                  (funcall next)
+                                (progn
+                                  (warp:log! :warn (warp-rate-limiter-name limiter)
+                                             "Rate limit exceeded for client '%s'."
+                                             client-id)
+                                  (loom:rejected!
+                                   (warp:error!
+                                    :type 'warp-rate-limit-exceeded
+                                    :message (format "Rate limit exceeded for %s."
+                                                     client-id)))))))
+              :after :authenticate))))
 
 (provide 'warp-rate-limiter)
 ;;; warp-rate-limiter.el ends here ;;;

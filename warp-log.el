@@ -1,334 +1,302 @@
-;;; warp-log.el --- Component-based Distributed Logging for Warp -*- lexical-binding: t; -*-
+;;; warp-log.el --- Centralized Logging and Structured Output -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
-;; This module provides distributed logging capabilities for the Warp
-;; framework as a set of manageable components.
+;; This module provides a production-grade, centralized logging facility
+;; for the Warp framework. It is designed for high performance, structured
+;; output, and deep integration with the framework's observability tools.
 ;;
-;; It provides two primary components:
+;; This version is now fully integrated with the `warp-trace` module. It
+;; automatically captures the active `trace-id` and `span-id` and injects
+;; them into every log message. This provides **zero-effort log correlation**,
+;; allowing you to instantly filter and view all logs associated with a
+;; specific distributed transaction.
 ;;
-;; 1.  **`warp-log-server` (Master-side):** This component creates a core
-;;     `loom-log-server` and binds a `warp-channel` to a specified
-;;     address. All incoming `warp-log-entry` objects on this channel
-;;     are converted back to `loom-log-entry` structs and pushed into
-;;     the `loom-log-server`'s internal queue for processing.
+;; ## Key Features:
 ;;
-;; 2.  **`warp-log-client` (Worker-side):** This component configures the
-;;     default `loom-log-server` to act as a client. It intercepts
-;;     `loom:log!` calls, enriches the log entry with worker and trace
-;;     context, and sends it asynchronously over a `warp-channel` to the
-;;     master's log server.
+;; - **Structured Logging**: Log messages are emitted as structured data,
+;;   containing a timestamp, log level, source, and arbitrary key-value
+;;   metadata, ideal for machine parsing and log analysis tools.
 ;;
-;; This design makes logging a declarative part of a `warp-cluster` or
-;; `warp-worker`'s architecture, managed by the component system's lifecycle.
+;; - **Trace Correlation**: Automatically links every log entry to the active
+;;   distributed trace, providing seamless navigation between traces and logs.
+;;
+;; - **Decoupled Architecture**: Log generation is a distinct concern from
+;;   log consumption. The `warp:log!` macro sends logs to a central
+;;   `telemetry-service`, which can then route them to various backends.
+;;
+;; - **Asynchronous & Non-Blocking**: Log emission is a non-blocking
+;;   operation that writes to a background queue, ensuring that logging calls
+;;   do not impact application performance.
+;;
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 's)
+(require 'subr-x)
 (require 'loom)
 (require 'braid)
+(require 'ring)
 
-(require 'warp-channel)
-(require 'warp-env)
 (require 'warp-error)
-(require 'warp-marshal)
-(require 'warp-trace)
 (require 'warp-config)
+(require 'warp-component)
+(require 'warp-service)
+(require 'warp-telemetry)
+(require 'warp-trace)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Forward declaration for the telemetry client
+(cl-deftype telemetry-client () t)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
 
 (define-error 'warp-log-error
-  "A generic error related to the distributed logging system."
+  "A generic error for logging operations."
   'warp-error)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Configuration & Structs
+(define-error 'warp-log-level-error
+  "The provided log level is invalid."
+  'warp-log-error)
 
-(warp:defschema warp-log-entry
-    ((:json-name "WarpLogEntry"))
-  "A schema-defined struct for log entries sent over the wire.
-This provides a robust data contract for distributed logging.
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Global State
 
-Fields:
-- `timestamp` (float): The `float-time` when the log was created.
-- `level` (keyword): The severity of the log (e.g., `:info`).
-- `target` (string): The component or category of the log.
-- `message` (string): The formatted log message.
-- `extra-data` (plist): A property list for structured metadata."
-  (timestamp nil :type float :json-key "timestamp")
-  (level nil :type keyword :json-key "level")
-  (target nil :type string :json-key "target")
-  (message "" :type string :json-key "message")
-  (extra-data nil :type plist :json-key "extraData"))
+(defvar warp--log-level :info
+  "The current global log level. Messages at or above this level will be logged.")
 
-(warp:defprotobuf-mapping warp-log-entry
-  ((timestamp 1 :double)
-   (level 2 :string)
-   (target 3 :string)
-   (message 4 :string)
-   (extra-data 5 :bytes)))
+(defvar-local warp--log-telemetry-client nil
+  "A dynamic variable holding the `telemetry-client` for log emission.")
 
-(warp:defconfig log-server-config
-  "Configuration for a `warp-log-server` component.
+(defvar-local warp--log-context nil
+  "A dynamic variable for holding contextual data for log messages.
+This variable is bound by the `warp:with-log-context` macro. Its value is
+automatically merged into a log message's tags, enriching the log entry
+with context like request IDs or user sessions.")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Configuration
+
+(warp:defconfig log-config
+  "Defines the configuration settings for the logging system.
 
 Fields:
-- `name` (string): Name for the log server, used in logging.
-- `address` (string): Network/IPC address the server will listen on.
-- `level` (keyword): Minimum log level to process (e.g., `:info`).
-- `buffer-name` (string): Name of the Emacs buffer for log display.
-- `processing-interval` (float): Seconds between processing log batches."
-  (name "warp-log-server" :type string)
-  (address "ipc:///tmp/warp-log-server" :type string)
-  (level :debug :type keyword)
-  (buffer-name "*warp-log*" :type string)
-  (processing-interval 0.2 :type float))
+- `level` (keyword): The log level (`:debug`, `:info`, `:warn`, `:error`, `:fatal`).
+- `buffer-size` (integer): The number of log messages to buffer in memory
+  before they are processed by the telemetry pipeline.
+- `source` (string): The default source name for log messages."
+  (level :info :type keyword)
+  (buffer-size 1000 :type integer)
+  (source "unknown" :type string))
 
-(cl-defstruct (warp-log-server
-               (:constructor %%make-log-server))
-  "Stateful object for the distributed log server component.
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Private Functions (Loom Integration)
 
-Fields:
-- `config` (log-server-config): Static configuration for this server.
-- `loom-server` (loom-log-server): The underlying `loom-log-server` that
-  manages log processing and buffering.
-- `listener-channel` (warp-channel): The active `warp-channel` that is
-  listening for incoming log entries."
-  (config (cl-assert nil) :type log-server-config)
-  (loom-server nil :type (or null loom-log-server))
-  (listener-channel nil :type (or null t)))
+(defun warp-log--telemetry-send-raw-fn (log-entry)
+  "Sends a raw log entry to the telemetry service, enriched with context.
 
-(warp:defconfig log-client-config
-  "Configuration for a `warp-log-client` component.
+Why: This function is the pluggable 'transport' for the underlying `loom-log`
+system. It serves as the single integration point where a standard log
+entry is transformed into a rich, structured `warp-telemetry-log` object.
 
-Fields:
-- `server-address` (string): The network/IPC address of the master
-  log server. Read from the `WARP_LOG_CHANNEL` environment variable."
-  (server-address nil :type (or null string)
-                  :env-var (warp:env 'log-channel)))
+How: It takes a `loom-log-entry`, extracts its data, and then enriches
+it by merging in both the dynamic log context (from `warp:with-log-context`)
+and, crucially, the active distributed tracing context (`trace-id` and
+`span-id`).
 
-(cl-defstruct (warp-log-client
-               (:constructor %%make-log-client))
-  "Stateful object for the distributed log client component.
+:Arguments:
+- `log-entry` (loom-log-entry): The log entry object from the `loom-log` queue.
 
-Fields:
-- `config` (log-client-config): The static configuration for this client."
-  (config (cl-assert nil) :type log-client-config))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Private Functions
-
-(defun warp-log--server-process-incoming (server warp-entry)
-  "Processes a single incoming `warp-log-entry`.
-Converts a received `warp-log-entry` back into a standard
-`loom-log-entry` and enqueues it for processing.
-
-Arguments:
-- `SERVER` (loom-log-server): The server to enqueue the message to.
-- `WARP-ENTRY` (warp-log-entry): The log entry from the channel.
-
-Returns:
+:Returns:
 - `nil`.
 
-Side Effects:
-- Calls `loom:log-server-process-incoming-message`.
-- Logs a warning if a malformed message is received."
-  (condition-case err
-      (if (warp-log-entry-p warp-entry)
-          (let ((log-entry
-                 (make-loom-log-entry
-                  :timestamp (warp-log-entry-timestamp warp-entry)
-                  :level (warp-log-entry-level warp-entry)
-                  :target (warp-log-entry-target warp-entry)
-                  :message (warp-log-entry-message warp-entry)
-                  :extra-data (warp-log-entry-extra-data warp-entry))))
-            (loom:log-server-process-incoming-message server log-entry))
-        (warp:log! :warn "warp-log" "Received non-log-entry message: %S"
-                   warp-entry))
-    (error
-     (warp:log! :error "warp-log" "Error processing log: %S. Payload: %S"
-                err warp-entry))))
+:Side Effects:
+- Calls `telemetry-client-emit-log` to send the enriched log to the central
+  telemetry pipeline. This operation is asynchronous and non-blocking.
 
-(defun warp-log--client-send-raw-fn (server-address log-entry)
-  "The `send-raw-fn` for a worker's logger.
-This function intercepts a `loom-log-entry`, enriches it with worker and
-trace context, converts it to the `warp-log-entry` wire format, and
-sends it to the master server.
+:Signals: None."
+  (when-let ((client warp--log-telemetry-client))
+    ;; Initialize a hash table for all structured metadata tags.
+    (let ((tags (make-hash-table :test 'equal)))
+      
+      ;; 1. Add structured data from the original loom log entry.
+      (when-let (target (loom-log-entry-target log-entry))
+        (puthash "loom-target" (symbol-name target) tags))
+      (when-let (call-site (loom-log-entry-call-site log-entry))
+        (when-let (fn (loom-call-site-fn call-site))
+          (puthash "loom-fn" (symbol-name fn) tags))
+        (when-let (file (loom-call-site-file call-site))
+          (puthash "loom-file" file tags))
+        (when-let (line (loom-call-site-line call-site))
+          (puthash "loom-line" line tags)))
 
-Arguments:
-- `SERVER-ADDRESS` (string): Address of the master log server.
-- `LOG-ENTRY` (loom-log-entry): The original log entry.
+      ;; 2. Merge any dynamic context from `warp:with-log-context`.
+      (when (boundp 'warp--log-context)
+        (maphash (lambda (k v) (puthash k v tags)) warp--log-context))
+      
+      ;; 3. **Automatically inject distributed tracing context.**
+      ;; This is the core of trace/log correlation. If the log call is made
+      ;; within an active trace span, we stamp the log with its IDs.
+      (when (boundp 'warp--trace-current-span)
+        (when-let ((span warp--trace-current-span))
+          (puthash "trace_id" (warp-trace-span-trace-id span) tags)
+          (puthash "span_id" (warp-trace-span-span-id span) tags)))
+      
+      ;; 4. Emit the final, enriched log message to the telemetry pipeline.
+      (telemetry-client-emit-log
+       client
+       (loom-log-entry-level log-entry)
+       (loom-log-entry-message log-entry)
+       :source (warp:get-system-source)
+       :tags tags
+       :timestamp (loom-log-entry-timestamp log-entry)))))
 
-Returns:
-- `t` on successful send, `nil` on failure.
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Public API
 
-Side Effects:
-- Sends a `warp-log-entry` via `warp:channel-send`.
-- Prints to stderr if the send fails."
-  (condition-case err
-      (let* ((worker-id (warp:env-val 'ipc-id))
-             (worker-rank (warp:env-val 'worker-rank))
-             (extra-data (or (loom-log-entry-extra-data log-entry) '()))
-             (current-span (and (fboundp 'warp:trace-current-span)
-                                (warp:trace-current-span))))
-        (when worker-id
-          (setq extra-data (plist-put extra-data :worker-id worker-id)))
-        (when worker-rank
-          (setq extra-data (plist-put extra-data :worker-rank worker-rank)))
-        (when current-span
-          (setq extra-data (plist-put extra-data :trace-id
-                                      (warp-trace-span-trace-id
-                                       current-span)))
-          (setq extra-data (plist-put extra-data :span-id
-                                      (warp-trace-span-span-id
-                                       current-span))))
-        (let ((warp-entry
-               (make-warp-log-entry
-                :timestamp (loom-log-entry-timestamp log-entry)
-                :level (loom-log-entry-level log-entry)
-                :target (loom-log-entry-target log-entry)
-                :message (loom-log-entry-message log-entry)
-                :extra-data extra-data)))
-          ;; Call warp:channel-send. This is a fire-and-forget;
-          ;; its promise is not awaited by this synchronous function.
-          (warp:channel-send server-address warp-entry)
-          t))
-    (error
-     (message "Warp Log Send Error: Failed to send log to master: %S" err)
-     nil)))
+(defun warp:get-system-source ()
+  "Dynamically determine the source system for a log entry.
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Public API - Service Management
+Why: This function provides a consistent, top-level identifier for the
+process generating the log, which is critical for filtering and analysis
+in a distributed system.
 
-;;;---------------------------------------------------------------------
-;;; Log Server
-;;;---------------------------------------------------------------------
+How: It attempts to find the most specific runtime ID available by calling
+the generic `warp:runtime-id` function. This function works in any runtime
+context (worker, cluster, etc.). It provides a safe, generic fallback
+if no runtime context is found.
 
-(defun warp:log-server-create (&rest config-options)
-  "Factory for the `warp-log-server` component.
-Creates the state-holding struct for the log server but does not start it.
-
-Arguments:
-- `&rest CONFIG-OPTIONS` (plist): Configuration keys that override the
-  defaults defined in `log-server-config`.
-
-Returns:
-- (warp-log-server): A new, inactive log server component instance."
-  (let ((config (apply #'make-log-server-config config-options)))
-    (%%make-log-server :config config)))
-
-(defun warp:log-server-start (log-server-component)
-  "Starts the log server component's listener.
-This lifecycle function creates the `loom-log-server`, then creates and
-binds a `warp-channel` to the configured address, funneling all
-incoming messages into the `loom-log-server`.
-
-Arguments:
-- `LOG-SERVER-COMPONENT` (warp-log-server): The component instance.
-
-Returns:
-- (loom-promise): A promise that resolves to `t` on success.
-
-Side Effects:
-- Creates a `loom-log-server` and a `warp-channel` listener."
-  (let* ((config (warp-log-server-config log-server-component))
-         (address (log-server-config-address config))
-         (loom-server
-          (loom:log-start-server
-           :name (log-server-config-name config)
-           :level (log-server-config-level config)
-           :buffer-name (log-server-config-buffer-name config)
-           :processing-interval (log-server-config-processing-interval
-                                 config))))
-    (setf (warp-log-server-loom-server log-server-component) loom-server)
-    (braid! (warp:channel address :mode :listen)
-      (:then (lambda (channel)
-               (setf (warp-log-server-listener-channel log-server-component)
-                     channel)
-               (warp:log! :info "warp-log" "Log server listening on %s"
-                          address)
-               (warp:stream-for-each
-                (warp:channel-subscribe channel)
-                (lambda (entry)
-                  (warp-log--server-process-incoming loom-server entry)))
-               t))
-      (:catch (lambda (err)
-                (warp:log! :error "warp-log"
-                           "Failed to start log server: %S" err)
-                (loom:rejected! err))))))
-
-(defun warp:log-server-stop (log-server-component)
-  "Stops the log server component.
-This lifecycle function gracefully shuts down the `loom-log-server`
-and closes the `warp-channel` listener, releasing all resources.
-
-Arguments:
-- `LOG-SERVER-COMPONENT` (warp-log-server): The component instance.
-
-Returns:
-- `nil`.
-
-Side Effects:
-- Stops the `loom-log-server` and closes the `warp-channel`."
-  (when-let (server (warp-log-server-loom-server log-server-component))
-    (loom:log-shutdown-server server))
-  (when-let (channel (warp-log-server-listener-channel
-                      log-server-component))
-    (loom:await (warp:channel-close channel)))
-  (setf (warp-log-server-loom-server log-server-component) nil)
-  (setf (warp-log-server-listener-channel log-server-component) nil)
-  (warp:log! :info "warp-log" "Log server stopped.")
-  nil)
-
-;;;---------------------------------------------------------------------
-;;; Log Client
-;;;---------------------------------------------------------------------
-
-(defun warp:log-client-create (&rest config-options)
-  "Factory for the `warp-log-client` component.
-
-Arguments:
-- `&rest CONFIG-OPTIONS` (plist): Configuration keys that override the
-  defaults defined in `log-client-config`.
-
-Returns:
-- (warp-log-client): A new, inactive log client component instance."
-  (let ((config (apply #'make-log-client-config config-options)))
-    (%%make-log-client :config config)))
-
-(defun warp:log-client-start (log-client-component)
-  "Starts the log client component.
-This lifecycle function configures the default `loom-log-server` to
-redirect all its output to the remote master log server.
-
-Arguments:
-- `LOG-CLIENT-COMPONENT` (warp-log-client): The component instance.
-
-Returns:
-- `nil`.
-
-Side Effects:
-- Modifies the `send-raw-fn` of the default `loom-log-server` instance."
-  (let* ((config (warp-log-client-config log-client-component))
-         (server-address (log-client-config-server-address config))
-         (default-server (loom:log-default-server)))
-    (when server-address
-      (warp:log! :info "warp-log"
-                 "Configuring logger for remote sending to %s"
-                 server-address)
-      (setf (loom-log-server-send-raw-fn default-server)
-            (lambda (entry)
-              (warp-log--client-send-raw-fn server-address entry)))))
-  nil)
-
-;;;---------------------------------------------------------------------
-;;; Convenience Alias
-;;;---------------------------------------------------------------------
+:Arguments: None.
+:Returns:
+- (string): The unique identifier of the current runtime instance, or a
+  generic fallback like \"warp-system\".
+:Side Effects: None.
+:Signals: None."
+  (or (and (fboundp 'warp:runtime-id) (warp:runtime-id))
+      "warp-system"))
 
 ;;;###autoload
-(defalias 'warp:log! 'loom:log!
-  "A convenience alias for `loom:log!` for Warp-specific logging.")
+(defun warp:log-level-set (level)
+  "Set the global log level for the current process.
+
+Why: Provides a centralized control point for adjusting log verbosity
+across the entire application at runtime.
+
+How: This function is a wrapper around `loom:log-set-level`, ensuring all
+logging is configured via the central `loom-log` server.
+
+:Arguments:
+- `level` (keyword): The new log level. Must be one of
+  `:debug`, `:info`, `:warn`, `:error`, `:fatal`.
+
+:Returns:
+- The new `level`.
+
+:Side Effects:
+- Modifies the state of the default `loom-log-server`.
+
+:Signals:
+- `(warp-log-level-error)`: If an invalid level is provided."
+  (unless (memq level '(:debug :info :warn :error :fatal))
+    (error 'warp-log-level-error "Invalid log level: %S" level))
+  (loom:log-set-level level))
+
+;;;###autoload
+(cl-defmacro warp:log! (level source format-string &rest args)
+  "Log a structured message that is automatically correlated with trace context.
+
+Why: This macro is the primary, unified entry point for all logging in the
+Warp framework. It is designed to be highly efficient, non-blocking, and
+observability-aware.
+
+How: It delegates to the powerful `loom:log!` macro. The real work of
+enriching the log with context (including trace IDs) happens asynchronously
+in the `warp-log--telemetry-send-raw-fn` hook, ensuring that calls to
+`warp:log!` have minimal performance impact on the application's hot path.
+
+:Arguments:
+- `level` (keyword): The log level of the message (`:debug`, `:info`, etc.).
+- `source` (string): The source of the log message (e.g., \"allocator\").
+- `format-string` (string): A format string for the message.
+- `args` (any): Arguments for the format string.
+
+:Returns:
+- `nil`.
+
+:Side Effects:
+- Creates and enqueues a `loom-log-entry` for background processing.
+
+:Signals: None."
+  (declare (indent 2) (debug t))
+  ;; Delegate directly to the loom:log! macro. The magic happens
+  ;; in our custom `send-raw-fn`, which enriches the log entry later.
+  `(loom:log! ,level ,source ,format-string ,@args))
+
+;;;###autoload
+(defmacro warp:with-log-context (context-plist &rest body)
+  "Executes BODY with a dynamically-bound logging context.
+
+Why: This provides a clean way to add shared context to a group of log
+messages without repeating the data in every `warp:log!` call. It is
+perfect for tagging all logs within a specific request or transaction.
+
+How: It binds the `warp--log-context` dynamic variable, which is then
+automatically merged into the tags of each log entry by the
+`warp-log--telemetry-send-raw-fn` function.
+
+:Arguments:
+- `context-plist` (plist): A property list of data to attach to all
+  subsequent log messages (e.g., `'(:request-id "xyz-123")`).
+- `body` (forms): The code to execute within this logging context.
+
+:Returns:
+- The result of the last form in `body`.
+
+:Side Effects:
+- Dynamically binds the `warp--log-context` variable.
+
+:Signals: None."
+  (let ((context-hash (gensym)))
+    `(let ((,context-hash (plist-to-hash-table ,context-plist)))
+       (let ((warp--log-context (or warp--log-context ,context-hash)))
+         ,@body))))
+
+;;;###autoload
+(defun warp:log-init (telemetry-client log-config)
+  "Initializes the logging system with a telemetry client and config.
+
+Why: This function bootstraps the entire logging pipeline. It must be called
+once at startup to connect the logging frontend (`warp:log!`) to the
+telemetry backend.
+
+How: It is intended to be used as a component's `:start` hook. It
+configures the default `loom-log` server, setting its log level and, most
+importantly, hooking in our custom `warp-log--telemetry-send-raw-fn` to
+act as the transport.
+
+:Arguments:
+- `telemetry-client` (telemetry-client): The client for the telemetry service.
+- `log-config` (log-config): The logging configuration object.
+
+:Returns:
+- `t`.
+
+:Side Effects:
+- Sets the global `loom-log-default-server` and its `send-raw-fn` hook.
+- Binds the `warp--log-telemetry-client` for use by the sender function.
+
+:Signals: None."
+  ;; 1. Bind the telemetry client so our sender function can access it.
+  (setq warp--log-telemetry-client telemetry-client)
+  ;; 2. Get the default, shared loom log server instance.
+  (let ((log-server (loom:log-default-server)))
+    ;; 3. Configure the log server's log level from our application config.
+    (loom:log-set-level (log-config-level log-config) log-server)
+    ;; 4. Set the log server's pluggable transport hook to our enriching function.
+    (setf (loom-log-server-send-raw-fn log-server)
+          #'warp-log--telemetry-send-raw-fn))
+  t)
 
 (provide 'warp-log)
 ;;; warp-log.el ends here

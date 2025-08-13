@@ -52,7 +52,7 @@
 (require 'cl-lib) ; Common Lisp extensions for utilities like `cl-incf`, `cl-loop`
 (require 's)      ; String manipulation library for path normalization
 (require 'subr-x) ; Extended subroutines (for `pcase`)
-(require 'loom)   ; Asynchronous programming primitives (promises, mutexes, timers, polls)
+(require 'loom)   ; Asynchronous programming primitives (promises, mutexes, polls)
 (require 'braid)  ; Promise-based control flow DSL for flattening async chains
 
 (require 'warp-error) ; For custom error definitions
@@ -61,6 +61,7 @@
 (require 'warp-config) ; For defining structured configurations
 (require 'warp-redis) ; For Redis persistence backend (new dependency)
 (require 'warp-rpc)   ; Needed for `warp-rpc--generate-id` in some contexts
+(require 'warp-crypt) ; Needed for checksumming
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -92,6 +93,10 @@ This could be due to invalid observer patterns or callback issues."
   "The requested snapshot ID was not found in the manager's cache.
 This is typically raised during a `restore-snapshot` call for a
 non-existent snapshot."
+  'warp-state-manager-error)
+
+(define-error 'warp-state-manager-integrity-error
+  "Data integrity check failed (e.g., checksum mismatch)."
   'warp-state-manager-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -179,9 +184,9 @@ Fields:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Schema Definitions
 
-(warp:defschema warp-state-entry
-    ((:constructor make-warp-state-entry)
-     (:copier nil))
+(cl-defstruct (warp-state-entry
+                (:constructor make-warp-state-entry)
+                (:copier nil))
   "Represents a single state entry with its CRDT metadata.
 This is the core data unit managed by the state manager. Each piece
 of application data is wrapped in this structure to add the metadata
@@ -204,17 +209,44 @@ Fields:
   vector clock.
 - `deleted` (boolean): A tombstone flag. If `t`, this entry is logically
   deleted. Tombstones are crucial for ensuring deletions propagate
-  correctly in a distributed system (they don't disappear immediately)."
+  correctly in a distributed system (they don't disappear immediately).
+- `checksum` (string): A cryptographic checksum for data integrity."
   (value nil :type t)
   (vector-clock nil :type hash-table)
   (timestamp 0.0 :type float)
   (node-id nil :type string)
   (version 0 :type integer)
-  (deleted nil :type boolean))
+  (deleted nil :type boolean)
+  (checksum nil :type (or null string)))
 
-(warp:defschema warp-state-transaction
-    ((:constructor make-warp-state-transaction)
-     (:copier nil))
+(cl-defstruct (warp-state-backend
+                (:constructor %%make-state-backend)
+                (:copier nil))
+  "A generic interface for state persistence backends.
+This struct defines the contract that all persistence backends must
+adhere to. It decouples the state manager's core logic from the
+specific storage implementation, allowing for easy swapping between
+backends like Redis, a file-based WAL, or others.
+
+Fields:
+- `name` (string): The name of the backend (e.g., 'redis-backend').
+- `load-all-fn` (function): `(lambda ())` that returns a promise
+  resolving to a plist of all `(key . serialized-entry)` pairs from
+  the backend.
+- `persist-entry-fn` (function): `(lambda (key serialized-entry))`
+  that returns a promise to save a single entry.
+- `delete-entry-fn` (function): `(lambda (key))` that returns a promise
+  to permanently delete an entry from the backend.
+- `config` (plist): A plist of backend-specific configuration."
+  (name nil :type string)
+  (load-all-fn nil :type function)
+  (persist-entry-fn nil :type function)
+  (delete-entry-fn nil :type function)
+  (config nil :type plist))
+
+(cl-defstruct (warp-state-transaction
+                (:constructor make-warp-state-transaction)
+                (:copier nil))
   "A transaction context for performing atomic state updates.
 This structure holds the state of an in-flight transaction. It gathers
 a list of operations that are then applied all at once upon commit,
@@ -262,7 +294,7 @@ Fields:
 - `priority` (integer): The execution priority of the callback within
   the `warp-event` system (higher numbers execute first).
 - `active` (boolean): A flag to enable or disable the observer without
-  unregistering it."
+  un-registering it."
   (id nil :type string)
   (path-pattern nil :type t)
   (callback nil :type function)
@@ -301,8 +333,8 @@ Fields:
 ;;; Core Data Structures (for WAL)
 
 (cl-defstruct (warp-wal-entry
-               (:constructor make-warp-wal-entry)
-               (:copier nil))
+                (:constructor make-warp-wal-entry)
+                (:copier nil))
   "A structured Write-Ahead Log (WAL) entry.
 Using a dedicated struct instead of a plist improves type safety and
 clarity when serializing and deserializing log entries for persistence.
@@ -333,8 +365,8 @@ Fields:
   (checksum nil :type (or null string)))
 
 (cl-defstruct (warp-state-manager
-               (:constructor %%make-state-manager)
-               (:copier nil))
+                (:constructor %%make-state-manager)
+                (:copier nil))
   "The primary struct representing a state manager instance.
 This struct is the central container for all components of the state
 manager, including its in-memory data, configuration, persistence
@@ -373,14 +405,8 @@ Fields:
 - `event-system` (warp-event-system): A reference to the global
   `warp-event` system for emitting state change events and subscribing
   to cluster-level events.
-- `last-snapshot-time` (float): Tracks the `float-time` of the last
-  automatic snapshot. Used by the snapshot poller for file-based
-  persistence.
-- `metrics` (hash-table): A hash table for performance and usage metrics
-  (e.g., `:total-updates`, `:current-entries`).
-- `snapshot-poller` (loom-poll): The `loom-poll` instance for scheduling
-  automatic snapshots and other periodic maintenance tasks (e.g., GC).
-  Used only for file-based persistence."
+- `backend` (warp-state-backend): The configured persistence backend
+  that handles durable storage operations."
   (id nil :type string)
   (config nil :type state-manager-config)
   (state-data (make-hash-table :test 'equal) :type hash-table)
@@ -392,9 +418,7 @@ Fields:
   (node-id nil :type string)
   (state-lock (loom:lock "state-manager") :type loom-lock)
   (event-system nil :type (or null t))
-  (last-snapshot-time 0.0 :type float)
-  (metrics (make-hash-table :test 'equal) :type hash-table)
-  (snapshot-poller nil :type (or null t)))
+  (backend nil :type (or null warp-state-backend)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Private Functions
@@ -441,6 +465,21 @@ Returns:
           (emacs-pid)
           (random (expt 2 24))))
 
+(defun warp-state-manager--compute-entry-checksum (entry)
+  "Computes a cryptographic checksum for a state entry's value.
+This is a critical function for ensuring data integrity, especially
+for entries that are persisted to an external backend. The checksum
+is computed over a serialized representation of the value, allowing
+us to detect corruption or unexpected changes.
+
+Arguments:
+- `entry` (warp-state-entry): The entry whose value to checksum.
+
+Returns:
+- (string): The SHA-256 checksum of the value."
+  (let ((value (warp-state-entry-value entry)))
+    (warp:crypto-hash (prin1-to-string value) 'sha256)))
+
 ;;----------------------------------------------------------------------
 ;;; Path & Key Manipulation
 ;;----------------------------------------------------------------------
@@ -463,23 +502,23 @@ Signals:
 - `warp-state-manager-error`: If the path is `nil`, an empty string,
   an empty list, or contains invalid component types."
   (cond
-   ((null path)
-    (signal 'warp-state-manager-error (list "Path cannot be nil.")))
-   ((stringp path)
-    (if (string-empty-p path)
-        (signal 'warp-state-manager-error (list "Path string cannot be empty."))
-      (list path)))
-   ((symbolp path) (list path))
-   ((listp path)
-    (if (null path)
-        (signal 'warp-state-manager-error (list "Path list cannot be empty."))
-      (dolist (part path)
-        (unless (or (stringp part) (symbolp part) (numberp part))
-          (signal 'warp-state-manager-error
-                  (list "Invalid path component type. Must be string, \
+    ((null path)
+     (signal 'warp-state-manager-error (list "Path cannot be nil.")))
+    ((stringp path)
+     (if (string-empty-p path)
+         (signal 'warp-state-manager-error (list "Path string cannot be empty."))
+       (list path)))
+    ((symbolp path) (list path))
+    ((listp path)
+     (if (null path)
+         (signal 'warp-state-manager-error (list "Path list cannot be empty."))
+       (dolist (part path)
+         (unless (or (stringp part) (symbolp part) (numberp part))
+           (signal 'warp-state-manager-error
+                   (list "Invalid path component type. Must be string, \
                           symbol, or number." part))))
-      path))
-   (t (signal 'warp-state-manager-error (list "Invalid path type." path)))))
+       path))
+    (t (signal 'warp-state-manager-error (list "Invalid path type." path)))))
 
 (defun warp-state-manager--path-to-key (path)
   "Convert a user-provided path to a normalized string key.
@@ -537,7 +576,7 @@ Returns:
 ;;----------------------------------------------------------------------
 
 (defun warp-state-manager--path-matches-pattern-internal (path-list
-                                                           pattern-list)
+                                                         pattern-list)
   "The internal recursive engine for wildcard path matching.
 This function implements the core logic for matching a path (as a list
 of components) against a pattern (as a list of components) containing
@@ -677,9 +716,9 @@ Returns:
 ;;----------------------------------------------------------------------
 
 (defun warp-state-manager--internal-update (state-mgr path value
-                                            transaction-id
-                                            transaction-version node-id
-                                            remote-vector-clock)
+                                           transaction-id
+                                           transaction-version node-id
+                                           remote-vector-clock)
   "The core internal function for updating a state entry.
 This function encapsulates the entire CRDT update logic:
 1.  Creates a new `warp-state-entry` with the new value and metadata.
@@ -744,13 +783,14 @@ Side Effects:
       (puthash node-id new-version current-vector-clock))
 
     (let ((new-entry (make-warp-state-entry
-                      :value value
-                      :vector-clock current-vector-clock
-                      :timestamp timestamp
-                      :node-id node-id
-                      :version new-version
-                      :deleted nil)))
-
+                       :value value
+                       :vector-clock current-vector-clock
+                       :timestamp timestamp
+                       :node-id node-id
+                       :version new-version
+                       :deleted nil)))
+      (setf (warp-state-entry-checksum new-entry)
+            (warp-state-manager--compute-entry-checksum new-entry))
       ;; Store the new entry in the main state data (in-memory cache).
       (puthash key new-entry (warp-state-manager-state-data state-mgr))
 
@@ -765,7 +805,7 @@ Side Effects:
         (puthash :total-updates (1+ (gethash :total-updates metrics 0))
                  metrics))
 
-      ;; Persist the change to the configured backend (WAL or Redis).
+      ;; Persist the change to the configured backend.
       (loom:await (warp-state-manager--persist-entry state-mgr key new-entry))
 
       ;; Local operations are logged to the WAL for persistence only if
@@ -788,8 +828,8 @@ Side Effects:
       new-entry)))
 
 (defun warp-state-manager--internal-delete (state-mgr path transaction-id
-                                            transaction-version node-id
-                                            remote-vector-clock)
+                                           transaction-version node-id
+                                           remote-vector-clock)
   "The core internal function for deleting a state entry (creating a
 tombstone). This function performs a **logical deletion**. It doesn't
 remove the entry physically immediately but creates a special
@@ -838,13 +878,14 @@ Side Effects:
       (puthash node-id new-version current-vector-clock))
 
     (let ((tombstone-entry (make-warp-state-entry
-                            :value nil      ; Value is nil for a tombstone
-                            :vector-clock current-vector-clock
-                            :timestamp timestamp
-                            :node-id node-id
-                            :version new-version
-                            :deleted t))) ; Crucially, mark as deleted
-
+                             :value nil      ; Value is nil for a tombstone
+                             :vector-clock current-vector-clock
+                             :timestamp timestamp
+                             :node-id node-id
+                             :version new-version
+                             :deleted t))) ; Crucially, mark as deleted
+      (setf (warp-state-entry-checksum tombstone-entry)
+            (warp-state-manager--compute-entry-checksum tombstone-entry))
       ;; Store the tombstone in the main state data (in-memory cache),
       ;; potentially replacing a live entry.
       (puthash key tombstone-entry (warp-state-manager-state-data state-mgr))
@@ -921,59 +962,59 @@ Returns:
         )
     (case strategy
       (:last-writer-wins
-       ;; The most common strategy: the entry with the later timestamp wins.
-       ;; Node IDs are used as a tie-breaker to ensure determinism in case
-       ;; timestamps are identical (highly unlikely with float-time, but
-       ;; good practice).
-       (if (> (warp-state-entry-timestamp remote-entry)
-              (warp-state-entry-timestamp local-entry))
-           remote-entry
-         (if (< (warp-state-entry-timestamp remote-entry)
-                (warp-state-entry-timestamp local-entry))
-             local-entry
-           ;; Timestamps are identical; tie-break using a lexicographical
-           ;; comparison of node IDs to ensure a total, deterministic order.
-           (if (string> (warp-state-entry-node-id remote-entry)
-                        (warp-state-entry-node-id local-entry))
-               remote-entry
-             local-entry))))
+        ;; The most common strategy: the entry with the later timestamp wins.
+        ;; Node IDs are used as a tie-breaker to ensure determinism in case
+        ;; timestamps are identical (highly unlikely with float-time, but
+        ;; good practice).
+        (if (> (warp-state-entry-timestamp remote-entry)
+               (warp-state-entry-timestamp local-entry))
+            remote-entry
+          (if (< (warp-state-entry-timestamp remote-entry)
+                 (warp-state-entry-timestamp local-entry))
+              local-entry
+            ;; Timestamps are identical; tie-break using a lexicographical
+            ;; comparison of node IDs to ensure a total, deterministic order.
+            (if (string> (warp-state-entry-node-id remote-entry)
+                         (warp-state-entry-node-id local-entry))
+                remote-entry
+              local-entry))))
       (:vector-clock-precedence
-       ;; A more advanced strategy that respects causal history.
-       ;; If one clock causally precedes the other, the later (descendant)
-       ;; clock wins. If concurrent, fall back to last-writer-wins.
-       (cond
-         ;; If the remote clock is causally descended from the local,
-         ;; it means remote is a later update based on local's history.
-         ((warp-state-manager--vector-clock-precedes-p
-           (warp-state-entry-vector-clock local-entry)
-           (warp-state-entry-vector-clock remote-entry))
-          remote-entry)
-         ;; If the local clock is causally descended from the remote,
-         ;; it means local is a later update based on remote's history.
-         ((warp-state-manager--vector-clock-precedes-p
-           (warp-state-entry-vector-clock remote-entry)
-           (warp-state-entry-vector-clock local-entry))
-          local-entry)
-         ;; Otherwise, the updates are concurrent (neither precedes the other).
-         ;; Fall back to a deterministic tie-breaker like last-writer-wins.
-         (t (warp-state-manager--resolve-conflict
-             :last-writer-wins remote-entry local-entry))))
+        ;; A more advanced strategy that respects causal history.
+        ;; If one clock causally precedes the other, the later (descendant)
+        ;; clock wins. If concurrent, fall back to last-writer-wins.
+        (cond
+          ;; If the remote clock is causally descended from the local,
+          ;; it means remote is a later update based on local's history.
+          ((warp-state-manager--vector-clock-precedes-p
+            (warp-state-entry-vector-clock local-entry)
+            (warp-state-entry-vector-clock remote-entry))
+           remote-entry)
+          ;; If the local clock is causally descended from the remote,
+          ;; it means local is a later update based on remote's history.
+          ((warp-state-manager--vector-clock-precedes-p
+            (warp-state-entry-vector-clock remote-entry)
+            (warp-state-entry-vector-clock local-entry))
+           local-entry)
+          ;; Otherwise, the updates are concurrent (neither precedes the other).
+          ;; Fall back to a deterministic tie-breaker like last-writer-wins.
+          (t (warp-state-manager--resolve-conflict
+              :last-writer-wins remote-entry local-entry))))
       (:merge-values
-       ;; This strategy is a placeholder for future, type-specific merge
-       ;; logic (e.g., merging lists by union, or incrementing numeric
-       ;; values). For now, it falls back to last-writer-wins for safety.
-       (warp:log! :warn sm-id
-                  "':merge-values' strategy is a placeholder. Using \
-                   :last-writer-wins for conflict on entry from: %S."
-                  (warp-state-entry-node-id remote-entry))
-       (warp-state-manager--resolve-conflict
-        :last-writer-wins remote-entry local-entry))
+        ;; This strategy is a placeholder for future, type-specific merge
+        ;; logic (e.g., merging lists by union, or incrementing numeric
+        ;; values). For now, it falls back to last-writer-wins for safety.
+        (warp:log! :warn sm-id
+                   "':merge-values' strategy is a placeholder. Using \
+                    :last-writer-wins for conflict on entry from: %S."
+                   (warp-state-entry-node-id remote-entry))
+        (warp-state-manager--resolve-conflict
+         :last-writer-wins remote-entry local-entry))
       (t
-       ;; Fallback for unrecognized strategies to prevent unexpected behavior.
-       (warp:log! :warn sm-id
-                  "Unknown conflict resolution strategy: %s. Defaulting \
-                   to local entry." strategy)
-       local-entry))))
+        ;; Fallback for unrecognized strategies to prevent unexpected behavior.
+        (warp:log! :warn sm-id
+                   "Unknown conflict resolution strategy: %s. Defaulting \
+                    to local entry." strategy)
+        local-entry))))
 
 (defun warp-state-manager--vector-clock-precedes-p (clock-a clock-b)
   "Checks if vector clock `clock-a` causally precedes vector clock `clock-b`.
@@ -1011,7 +1052,7 @@ Returns:
       (unless at-least-one-less
         (maphash (lambda (node b-version)
                    (unless (gethash node clock-a) ; Node in B but not in A
-                     (when (> b-version 0)      ; and has a version > 0
+                     (when (> b-version 0)      ; and has a version > 0
                        (setq at-least-one-less t))))
                  clock-b))
 
@@ -1039,1030 +1080,74 @@ Returns:
     merged-clock))
 
 ;;----------------------------------------------------------------------
-;;; Persistence Backend
+;;; Persistence Backend-agnostic Functions
 ;;----------------------------------------------------------------------
+
+(defun warp-state-manager--load-state (state-mgr)
+  "Loads the entire state from the configured persistence backend.
+This function uses the state manager's backend to load all entries,
+deserializing them and populating the in-memory cache. It also correctly
+initializes the state manager's global vector clock from the loaded data.
+
+Arguments:
+- `STATE-MGR` (warp-state-manager): The state manager instance.
+
+Returns:
+- (loom-promise): A promise that resolves when state is loaded or rejects
+  on a backend error.
+
+Side Effects:
+- Populates `state-data` and updates `vector-clock`."
+  (let ((backend (warp-state-manager-backend state-mgr)))
+    (unless backend
+      (loom:resolved! nil))
+    (warp:log! :info (warp-state-manager-id state-mgr)
+               "Loading state from backend '%s'."
+               (warp-state-backend-name backend))
+    (braid! (funcall (warp-state-backend-load-all-fn backend))
+      (:then (state-alist)
+        (loom:with-mutex! (warp-state-manager-state-lock state-mgr)
+          (cl-loop for (key . serialized-entry) in state-alist do
+                   (let ((entry (warp:deserialize serialized-entry)))
+                     (puthash key entry
+                              (warp-state-manager-state-data state-mgr))
+                     (setf (warp-state-manager-vector-clock state-mgr)
+                           (warp-state-manager--merge-vector-clocks
+                            (warp-state-manager-vector-clock state-mgr)
+                            (warp-state-entry-vector-clock entry))))))
+        t)
+      (:catch (err)
+        (warp:log! :error (warp-state-manager-id state-mgr)
+                   "Failed to load state from backend: %S" err)
+        (loom:rejected!
+         (warp:error! :type 'warp-state-manager-persistence-error
+                      :message "Failed to load state from backend."
+                      :cause err))))))
 
 (defun warp-state-manager--persist-entry (state-mgr key entry)
   "Asynchronously persists a single state entry to the configured backend.
 This function acts as a write-through mechanism to the durable storage
-layer (Redis or file-based WAL). For Redis, it serializes the
-`warp-state-entry` and stores it. For file-based WAL, it buffers the
-entry for asynchronous flush.
+layer. It serializes the `warp-state-entry` and calls the backend's
+persistence function. A `nil` entry signifies a logical deletion.
 
 Arguments:
 - `STATE-MGR` (warp-state-manager): The state manager instance.
 - `KEY` (string): The normalized string key for the entry.
 - `ENTRY` (warp-state-entry or nil): The `warp-state-entry` to persist.
-  If `nil`, it signifies a logical deletion that should be made
-  permanent in the backend (e.g., `HDEL` in Redis).
 
 Returns:
 - (loom-promise): A promise that resolves when the persistence operation
   is complete. Rejects on persistence errors.
 
 Side Effects:
-- Interacts with `warp-redis` for Redis backend.
-- Buffers to `wal-entries` and triggers flush for file-based WAL."
-  (if-let (backend-config (state-manager-config-persistence-backend
-                           (warp-state-manager-config state-mgr)))
-      (pcase (plist-get backend-config :type)
-        (:redis
-         (let* ((redis-svc (plist-get backend-config :service))
-                (redis-key (format "%s:state"
-                                   (plist-get backend-config :key-prefix))))
-           (if entry
-               ;; Persist the entry by serializing it and setting it in the hash.
-               (warp:redis-hset redis-svc redis-key key
-                                (warp:serialize entry))
-               ;; A nil entry means a permanent deletion from the backend.
-               (warp:redis-hdel redis-svc redis-key key))))
-        (_ (warp:log! :warn (warp-state-manager-id state-mgr)
-                      "Unknown persistence backend type: %S. \
-                       Entry not persisted."
-                      (plist-get backend-config :type))
-           (loom:resolved! t)))
-    (loom:resolved! t))) ; Resolve immediately, actual persistence happens async.
-
-(defun warp-state-manager--load-from-backend (state-mgr)
-  "Loads the entire state from the configured persistent backend into
-the in-memory cache. This is called once on startup to rehydrate the
-state manager from a durable source of truth. For Redis, it fetches
-all hash entries and deserializes them.
-
-Arguments:
-- `STATE-MGR` (warp-state-manager): The state manager instance.
-
-Returns:
-- (loom-promise): A promise that resolves when the state is loaded and
-  the in-memory cache is populated. Rejects on backend errors.
-
-Side Effects:
-- Populates `state-data` and updates `vector-clock`."
-  (if-let (backend-config (state-manager-config-persistence-backend
-                           (warp-state-manager-config state-mgr)))
-      (pcase (plist-get backend-config :type)
-        (:redis
-         (let* ((redis-svc (plist-get backend-config :service))
-                (redis-key (format "%s:state"
-                                   (plist-get backend-config :key-prefix))))
-           (warp:log! :info (warp-state-manager-id state-mgr)
-                      "Attempting to load state from Redis backend: %s."
-                      redis-key)
-           (braid! (warp:redis-hgetall redis-svc redis-key)
-             (:then (state-plist) ; Returns a plist of (key value key value ...)
-               (warp:log! :info (warp-state-manager-id state-mgr)
-                          "Loaded %d entries from Redis backend."
-                          (/ (length state-plist) 2))
-               (loom:with-mutex! (warp-state-manager-state-lock state-mgr)
-                 (cl-loop for (key val) on state-plist by #'cddr do
-                          (let ((entry (warp:deserialize val)))
-                            (puthash key entry
-                                     (warp-state-manager-state-data state-mgr))
-                            ;; Merge each entry's vector clock into the
-                            ;; global clock.
-                            (setf (warp-state-manager-vector-clock state-mgr)
-                                  (warp-state-manager--merge-vector-clocks
-                                   (warp-state-manager-vector-clock state-mgr)
-                                   (warp-state-entry-vector-clock entry))))))
-               t) ; Resolve to t on success.
-             (:catch (err)
-               (warp:log! :error (warp-state-manager-id state-mgr)
-                          "Failed to load state from Redis backend: %S" err)
-               (loom:rejected!
-                (warp:error! :type 'warp-state-manager-persistence-error
-                             :message "Failed to load state from Redis."
-                             :cause err))))))
-    (loom:resolved! nil))) ; No backend configured, resolve immediately.
-
-(defun warp-state-manager--ensure-io-pool ()
-  "Initializes the global I/O thread pool if it doesn't exist.
-This function uses a `defvar` with a check to ensure the thread pool is
-created only once, providing a shared resource for all asynchronous
-disk I/O operations (WAL flushes and snapshot writes). This prevents
-blocking main Emacs threads on disk I/O. Only used for file-based
-persistence.
-
-Side Effects:
-- May create a new `loom-thread-pool` and assign it to the global
-  `warp-state-manager--io-pool` variable."
-  (unless warp-state-manager--io-pool
-    (setq warp-state-manager--io-pool
-          (loom:thread-pool-create :name "state-mgr-io" :size 2))
-    (warp:log! :info "state-manager" "Global I/O thread pool created.")))
-
-(defun warp-state-manager--_flush-wal-sync (state-mgr entries-to-write)
-  "The synchronous core logic for flushing WAL entries to disk.
-This private helper function performs the actual file I/O: writing a
-list of `warp-wal-entry` objects to the WAL file. It is called by
-both synchronous (`warp:state-manager-flush`) and asynchronous internal
-flush wrappers. Each entry is written as a distinct Lisp S-expression
-on a new line for easy parsing during recovery.
-
-Arguments:
-- `state-mgr` (warp-state-manager): The state manager instance.
-- `entries-to-write` (list): The list of `warp-wal-entry` objects to write.
-
-Returns:
-- `t` on success.
-
-Signals:
-- `warp-state-manager-persistence-error`: If the file write fails
-  (e.g., permissions, disk full)."
-  (let* ((config (warp-state-manager-config state-mgr))
-         (persist-dir (or (warp-state-manager-config-persistence-directory
-                           config)
-                          temporary-file-directory))
-         (wal-file (expand-file-name (format "%s.wal"
-                                              (warp-state-manager-id state-mgr))
-                                     persist-dir)))
-    (condition-case err
-        (progn
-          ;; Ensure the persistence directory exists.
-          (make-directory persist-dir t)
-          ;; Use `with-temp-buffer` to build the content in memory before
-          ;; writing to file, improving efficiency. `t` and `silent`
-          ;; append to the file without inserting into current buffer.
-          (with-temp-buffer
-            (dolist (entry entries-to-write)
-              (prin1 entry (current-buffer))
-              (insert "\n")))
-          (write-region (point-min) (point-max) wal-file t 'silent)
-          t)
-      (error
-       (warp:log! :error (warp-state-manager-id state-mgr)
-                  (format "Failed to flush WAL to %s: %S" wal-file err))
-       (signal 'warp-state-manager-persistence-error
-               (list "WAL flush failed" err))))))
-
-(defun warp-state-manager--flush-wal-async (state-mgr entries-to-flush)
-  "Asynchronously flushes a batch of WAL entries to disk.
-This offloads the disk I/O to a background thread from
-`warp-state-manager--io-pool`, preventing the main Emacs thread from
-blocking. It records success or failure for metrics.
-
-Arguments:
-- `state-mgr` (warp-state-manager): The state manager instance.
-- `entries-to-flush` (list): A list of `warp-wal-entry` objects to write.
-
-Returns:
-- (loom-promise): A promise that resolves to `t` on success or rejects
-  on failure, after the I/O operation completes."
-  (warp-state-manager--ensure-io-pool)
-  (let ((promise (loom:make-promise)))
-    (loom:thread-pool-submit
-     warp-state-manager--io-pool
-     (lambda ()
-       (condition-case err
-           (progn
-             (warp-state-manager--_flush-wal-sync state-mgr
-                                                  entries-to-flush)
-             (loom:promise-resolve promise t))
-         (error
-          (loom:promise-reject promise (warp:error!
-                                        :type 'warp-state-manager-persistence-error
-                                        :message
-                                        (format "Async WAL flush failed for %s: %S"
-                                                (warp-state-manager-id state-mgr)
-                                                err)
-                                        :cause err)))))
-     :name (format "wal-flush-task-%s" (warp-state-manager-id state-mgr)))
-    promise))
-
-(defun warp-state-manager--add-wal-entry (state-mgr entry-data)
-  "Adds a structured entry to the Write-Ahead Log (WAL) buffer.
-This function creates a `warp-wal-entry` struct from the provided
-operation data and pushes it onto the in-memory WAL buffer. When the
-buffer's size reaches the configured `wal-buffer-size`, it triggers an
-asynchronous flush to disk.
-
-Arguments:
-- `state-mgr` (warp-state-manager): The state manager instance.
-- `entry-data` (list): A property list describing the operation,
-  e.g., `(:type :update :path some-path :entry new-entry)`.
-
-Side Effects:
-- Appends a `warp-wal-entry` to the `wal-entries` list in `state-mgr`.
-- May trigger an asynchronous `warp-state-manager--flush-wal-async`
-  if the buffer is full."
-  (let* ((config (warp-state-manager-config state-mgr))
-         (current-entries (warp-state-manager-wal-entries state-mgr))
-         (wal-entry (make-warp-wal-entry
-                     :type (plist-get entry-data :type)
-                     :path (plist-get entry-data :path)
-                     :entry (plist-get entry-data :entry)
-                     :transaction-id (plist-get entry-data :transaction-id)
-                     :timestamp (warp-state-manager--current-timestamp)
-                     :sequence (1+ (length current-entries)))))
-    (push wal-entry (warp-state-manager-wal-entries state-mgr))
-    (when (>= (length (warp-state-manager-wal-entries state-mgr))
-              (warp-state-manager-config-wal-buffer-size config))
-      ;; Trigger an async flush when the buffer is full.
-      (loom:await (warp:state-manager-flush state-mgr))))) 
-
-(defun warp-state-manager--load-wal-file (state-mgr wal-file)
-  "Loads and replays state from a specific WAL file.
-This helper function reads a given WAL file line by line, parsing each
-line as a Lisp object (a `warp-wal-entry` struct or legacy plist) and
-replaying the operation onto the in-memory state. It includes robust
-error handling to skip corrupted or malformed entries, logging warnings
-for issues to ensure best-effort recovery.
-
-Arguments:
-- `state-mgr` (warp-state-manager): The state manager instance.
-- `wal-file` (string): The full path to the WAL file to load.
-
-Returns:
-- (integer): The number of entries that were successfully loaded and
-  replayed.
-
-Side Effects:
-- Populates the `state-data` and `vector-clock` in `state-mgr` by
-  applying the logged operations."
-  (let ((loaded-count 0)
-        (error-count 0))
-    (with-temp-buffer ; Use a temporary buffer to read file contents
-      (insert-file-contents-literally wal-file)
-      (goto-char (point-min))
-      (while (not (eobp)) ; Loop until end of buffer
-        (let ((line (buffer-substring-no-properties
-                     (line-beginning-position)
-                     (line-end-position))))
-          (when (and (not (string-empty-p line))
-                     (not (s-starts-with? ";" line)))
-            (condition-case entry-err
-                (let ((entry-list (read-from-string line)))
-                  ;; `read-from-string` returns (OBJ . POS), so we take `car`.
-                  (warp-state-manager--replay-wal-entry state-mgr
-                                                        (car entry-list))
-                  (cl-incf loaded-count))
-              (error
-               (cl-incf error-count)
-               (warp:log! :warn (warp-state-manager-id state-mgr)
-                          (format "Skipping corrupted WAL entry in '%s'. \
-                                   Error: %S. Line: \"%s\""
-                                  wal-file entry-err line))))))
-        (forward-line 1))) ; Move to the next line
-    (when (> error-count 0)
-      (warp:log! :warn (warp-state-manager-id state-mgr)
-                 (format "WAL loading from '%s' completed with %d corrupted \
-                          entries skipped."
-                         wal-file error-count)))
-    (warp:log! :info (warp-state-manager-id state-mgr)
-               (format "Loaded %d entries from WAL file %s."
-                       loaded-count wal-file))
-    loaded-count))
-
-(defun warp-state-manager--load-from-wal (state-mgr)
-  "Loads state from WAL files during initialization, with error recovery.
-This function attempts to load from the primary `.wal` file. If that
-fails due to corruption (e.g., a partial write or malformed data), it
-will try to load from a `.wal.backup` file if one exists, providing an
-extra layer of recovery robustness. This ensures the best possible
-state restoration, even after crashes.
-
-Arguments:
-- `state-mgr` (warp-state-manager): The state manager instance.
-
-Returns:
-- (integer): The total number of entries loaded.
-
-Side Effects:
-- Populates the `state-mgr` with data from the WAL file(s),
-  effectively reconstructing the state."
-  (let* ((config (warp-state-manager-config state-mgr))
-         (persist-dir (or (warp-state-manager-config-persistence-directory
-                           config)
-                          temporary-file-directory))
-         (wal-file (expand-file-name
-                    (format "%s.wal" (warp-state-manager-id state-mgr))
-                    persist-dir))
-         (backup-wal-file (concat wal-file ".backup")))
-
-    (cond
-      ((file-exists-p wal-file)
-       (condition-case err
-           (warp-state-manager--load-wal-file state-mgr wal-file)
-         (error
-           (warp:log! :error (warp-state-manager-id state-mgr)
-                      (format "Primary WAL file '%s' load failed: %S. \
-                               Trying backup."
-                              wal-file err))
-           ;; If primary WAL fails, try the backup.
-           (if (file-exists-p backup-wal-file)
-               (condition-case backup-err
-                   (warp-state-manager--load-wal-file state-mgr
-                                                      backup-wal-file)
-                 (error
-                   (warp:log! :error (warp-state-manager-id state-mgr)
-                              (format "Backup WAL file '%s' load also failed: %S. \
-                                       Starting with empty state."
-                                      backup-wal-file backup-err))
-                   0)) ; Both failed, return 0 loaded entries.
-             0)))) ; Primary failed, no backup, return 0.
-      ((file-exists-p backup-wal-file)
-       (warp:log! :info (warp-state-manager-id state-mgr)
-                  "Primary WAL not found. Loading from backup: %s."
-                  backup-wal-file)
-       (warp-state-manager--load-wal-file state-mgr backup-wal-file))
-      (t
-       (warp:log! :debug (warp-state-manager-id state-mgr)
-                  "No WAL file found to load. Starting with empty state.")
-       0))))
-
-(defun warp-state-manager--replay-wal-entry (state-mgr entry)
-  "Replays a single WAL entry to reconstruct state during recovery.
-This function takes a parsed WAL entry (either a `warp-wal-entry`
-struct or a legacy plist) and applies its recorded operation to the
-in-memory state. It primarily focuses on updates and deletes
-(tombstones), ensuring the state correctly reflects the logged
-operations, including all CRDT metadata. This is a critical step in
-crash recovery.
-
-Arguments:
-- `state-mgr` (warp-state-manager): The state manager instance.
-- `entry` (warp-wal-entry or list): The WAL entry to replay.
-
-Side Effects:
-- Modifies `state-mgr`'s `state-data` (by adding/replacing an entry)
-  and `vector-clock` (by merging/updating versions)."
-  (let* ((is-struct (warp-wal-entry-p entry))
-         (type (if is-struct (warp-wal-entry-type entry)
-                 (plist-get entry :type)))
-         (path (if is-struct (warp-wal-entry-path entry)
-                 (plist-get entry :path)))
-         (state-entry (if is-struct (warp-wal-entry-entry entry)
-                          (plist-get entry :entry))))
-
-    (when (and path state-entry) ; Ensure valid path and state entry
-      (let ((key (warp-state-manager--path-to-key path)))
-        (pcase type
-          ((or :update :delete)
-           ;; For both updates and deletes (tombstones), we just place the
-           ;; entry from the log directly into the state data. The entry
-           ;; itself contains all CRDT metadata (timestamp, vector clock,
-           ;; deleted flag) needed for correct state reconstruction.
-           (puthash key state-entry
-                    (warp-state-manager-state-data state-mgr))
-           ;; We also need to merge the entry's vector clock into the
-           ;; manager's global clock. This is crucial for maintaining the
-           ;; overall causal history of the store, even after a restart.
-           (setf (warp-state-manager-vector-clock state-mgr)
-                 (warp-state-manager--merge-vector-clocks
-                  (warp-state-manager-vector-clock state-mgr)
-                  (warp-state-entry-vector-clock state-entry))))
-          (_
-           (warp:log! :warn (warp-state-manager-id state-mgr)
-                      (format "Skipping unknown WAL entry type during replay: %s."
-                              type))))))))
-
-(defun warp-state-manager--create-snapshot (state-mgr snapshot-id)
-  "Creates and persists a snapshot of the current state.
-This function performs a **deep copy** of the entire in-memory state
-data (`state-data`) and its associated `vector-clock`, packages it into
-a `warp-state-snapshot` object, stores it in an in-memory cache, and
-writes it asynchronously to a file on disk if file-based persistence is
-enabled. This ensures data durability and enables faster recovery than
-replaying a long WAL from scratch.
-
-Arguments:
-- `state-mgr` (warp-state-manager): The state manager instance.
-- `snapshot-id` (string): A unique identifier for the snapshot.
-
-Returns:
-- (warp-state-snapshot): The created snapshot object.
-
-Side Effects:
-- Performs deep copying of state data (potentially memory-intensive).
-- Creates a snapshot file on disk asynchronously (if file-based
-  persistence is enabled).
-- Adds the snapshot to `state-mgr`'s `snapshots` hash table (in-memory cache).
-- Updates the `last-snapshot-time` field in `state-mgr`."
-  (let* ((timestamp (warp-state-manager--current-timestamp))
-         (state-copy (make-hash-table :test 'equal))
-         (vector-clock-copy (copy-hash-table
-                             (warp-state-manager-vector-clock state-mgr)))
-         (entry-count 0))
-
-    ;; Iterate over current state entries and deep copy them.
-    ;; This is a critical step to ensure the snapshot is immutable.
-    (maphash (lambda (key entry)
-               (puthash key (warp-state-manager--deep-copy-entry entry)
-                        state-copy)
-               (cl-incf entry-count))
-             (warp-state-manager-state-data state-mgr))
-
-    (let ((snapshot (make-warp-state-snapshot
-                     :id snapshot-id
-                     :timestamp timestamp
-                     :state-data state-copy
-                     :vector-clock vector-clock-copy
-                     :metadata (list :node-id
-                                     (warp-state-manager-node-id state-mgr)
-                                     :entry-count entry-count
-                                     :created-by
-                                     (warp-state-manager-id state-mgr)))))
-
-      ;; Store the snapshot in the in-memory cache.
-      (puthash snapshot-id snapshot (warp-state-manager-snapshots state-mgr))
-
-      ;; If file-based persistence is enabled, asynchronously write the
-      ;; snapshot to disk.
-      (when (warp-state-manager-config-persistence-enabled
-             (warp-state-manager-config state-mgr))
-        (loom:await
-         (warp-state-manager--persist-snapshot-file state-mgr snapshot)))
-
-      (warp:log! :info (warp-state-manager-id state-mgr)
-                 (format "Created snapshot '%s' with %d entries."
-                         snapshot-id entry-count))
-
-      (setf (warp-state-manager-last-snapshot-time state-mgr) timestamp)
-      snapshot)))
-
-(defun warp-state-manager--deep-copy-entry (entry)
-  "Creates a deep copy of a single `warp-state-entry`.
-This is a helper for snapshotting and other operations that require a
-completely independent copy of a state entry. It ensures that the
-copied entry and its mutable components (like `vector-clock`) are
-distinct objects from the original, preventing unintended side effects.
-
-Arguments:
-- `entry` (warp-state-entry): The state entry to copy.
-
-Returns:
-- (warp-state-entry): A deep copy of the `entry`."
-  (make-warp-state-entry
-   :value (warp-state-manager--deep-copy-value (warp-state-entry-value entry))
-   :vector-clock (copy-hash-table (warp-state-entry-vector-clock entry))
-   :timestamp (warp-state-entry-timestamp entry)
-   :node-id (warp-state-entry-node-id entry)
-   :version (warp-state-entry-version entry)
-   :deleted (warp-state-entry-deleted entry)))
-
-(defun warp-state-manager--deep-copy-value (value)
-  "Recursively creates a deep copy of a generic Lisp value.
-This function handles nested lists, vectors, and hash tables to ensure
-that a copied value shares no mutable structure with the original. This
-is essential for the integrity of snapshots and transactional rollbacks,
-where state needs to be preserved exactly as it was at a point in time.
-
-Arguments:
-- `value` (t): The value to copy. Can be any Lisp object.
-
-Returns:
-- (t): A deep copy of the `value`. For atomic types, it returns the
-  value itself. For unrecognized compound types, it returns the
-  reference (as deep copying arbitrary Lisp objects is complex and
-  potentially infinite)."
-  (cond
-    ((or (null value) (atom value)) value)
-    ((listp value) (mapcar #'warp-state-manager--deep-copy-value value))
-    ((vectorp value) (apply #'vector
-                             (mapcar #'warp-state-manager--deep-copy-value
-                                     (cl-coerce value 'list))))
-    ((hash-table-p value)
-     (let ((copy (make-hash-table :test (hash-table-test value)
-                                  :size (hash-table-count value))))
-       (maphash (lambda (k v)
-                  (puthash (warp-state-manager--deep-copy-value k)
-                           (warp-state-manager--deep-copy-value v)
-                           copy))
-                value)
-       copy))
-    ;; For other compound types (e.g., custom structs), we cannot safely
-    ;; deep-copy unless a specific copier is provided. We return the
-    ;; reference and assume it's either immutable or handled by the user.
-    (t value)))
-
-(defun warp-state-manager--persist-snapshot-file (state-mgr snapshot)
-  "Persists a snapshot object to a disk file asynchronously.
-The snapshot is serialized as a Lisp S-expression, making it both
-human-readable for debugging and machine-readable for restoration.
-The actual file writing is offloaded to the global I/O thread pool
-to avoid blocking Emacs's main thread. This is used for file-based
-persistence.
-
-Arguments:
-- `state-mgr` (warp-state-manager): The state manager instance.
-- `snapshot` (warp-state-snapshot): The snapshot object to persist.
-
-Returns:
-- (loom-promise): A promise that resolves to `t` on successful
-  persistence or rejects with a `warp-state-manager-persistence-error`
-  on failure."
-  (warp-state-manager--ensure-io-pool)
-  (let* ((config (warp-state-manager-config state-mgr))
-         (persist-dir (or (warp-state-manager-config-persistence-directory
-                           config)
-                          temporary-file-directory))
-         (snapshot-file (expand-file-name
-                         (format "%s-snapshot-%s.el"
-                                 (warp-state-manager-id state-mgr)
-                                 (warp-state-snapshot-id snapshot))
-                         persist-dir))
-         (promise (loom:make-promise)))
-    (loom:thread-pool-submit
-     warp-state-manager--io-pool
-     (lambda ()
-       (condition-case err
-           (progn
-             (make-directory persist-dir t) ; Ensure directory exists
-             (with-temp-file snapshot-file
-               (let ((print-level nil) (print-length nil)) ; Prevent truncation
-                 (insert (format ";;; Warp State Manager Snapshot: %s\n"
-                                 (warp-state-snapshot-id snapshot)))
-                 (insert (format ";;; Created: %s\n\n"
-                                 (format-time-string "%Y-%m-%d %H:%M:%S"
-                                                     (warp-state-snapshot-timestamp
-                                                      snapshot))))
-                 (prin1 snapshot (current-buffer))))
-
-             (warp:log! :debug (warp-state-manager-id state-mgr)
-                        (format "Persisted snapshot '%s' to %s."
-                                (warp-state-snapshot-id snapshot)
-                                snapshot-file))
-             (loom:promise-resolve promise t))
-         (error
-          (warp:log! :error (warp-state-manager-id state-mgr)
-                     (format "Failed to persist snapshot '%s' to %s: %S"
-                             (warp-state-snapshot-id snapshot)
-                             snapshot-file err))
-          (loom:promise-reject promise (warp:error!
-                                        :type 'warp-state-manager-persistence-error
-                                        :message
-                                        (format "Snapshot persistence failed: %S"
-                                                err)
-                                        :cause err)))))
-     :name (format "snapshot-persist-task-%s" (warp-state-manager-id state-mgr)))
-    promise))
-
-;;----------------------------------------------------------------------------
-;;; Transaction Management
-;;----------------------------------------------------------------------------
-
-(defun warp-state-manager--create-transaction (state-mgr)
-  "Creates and initializes a new transaction context.
-This factory function builds a `warp-state-transaction` object, giving
-it a unique ID and linking it back to the parent `state-mgr`. This link
-is essential for operations within the transaction to access the current
-state (e.g., for creating backup entries for rollbacks) and the node ID.
-This function is called internally by `warp:state-manager-transaction`.
-
-Arguments:
-- `state-mgr` (warp-state-manager): The state manager instance.
-
-Returns:
-- (warp-state-transaction): A new, ready-to-use transaction object."
-  (let ((tx-id (format "tx-%s-%d-%06x"
-                       (warp-state-manager-node-id state-mgr)
-                       (truncate (float-time))
-                       (random (expt 2 24)))))
-    (make-warp-state-transaction
-     :id tx-id
-     :operations nil
-     :timestamp (warp-state-manager--current-timestamp)
-     :node-id (warp-state-manager-node-id state-mgr)
-     :state-mgr state-mgr
-     :committed nil
-     :rolled-back nil)))
-
-(defun warp-state-manager--add-tx-operation (transaction operation)
-  "Adds an operation to a transaction's queue, storing a backup for
-rollback. Before adding an update or delete operation to the
-transaction's queue, this function inspects the current state
-(`state-mgr`'s `state-data`) and stores the pre-existing
-`warp-state-entry` (or `nil` if the key didn't exist) as a
-`:backup-entry`. This backup is what makes transactional rollbacks
-possible, as it allows reverting the state for that key.
-
-Arguments:
-- `transaction` (warp-state-transaction): The transaction context.
-- `operation` (list): A property list describing the operation,
-  e.g., `(:type :update :path ... :value ...)`.
-
-Returns:
-- (list): The updated list of operations within the `transaction`.
-
-Side Effects:
-- Modifies the `operations` list within the `transaction` object."
-  (let* ((state-mgr (warp-state-transaction-state-mgr transaction))
-         (path (plist-get operation :path))
-         (key (warp-state-manager--path-to-key path))
-         ;; Get the current entry for this key to serve as a backup.
-         ;; This snapshot is taken *before* the transaction's changes are applied.
-         (backup-entry (gethash key
-                                (warp-state-manager-state-data state-mgr))))
-    (let ((enhanced-op (append operation (list :backup-entry backup-entry))))
-      (let ((updated-ops (append (warp-state-transaction-operations transaction)
-                                 (list enhanced-op))))
-        (setf (warp-state-transaction-operations transaction) updated-ops)
-        updated-ops))))
-
-(defun warp-state-manager--commit-transaction (state-mgr transaction)
-  "Commits a transaction by applying all its queued operations atomically.
-This function iterates through the `operations` stored in the
-`transaction` and applies each one to the state manager's core data.
-Because this all happens within a single `loom-mutex` lock (held by
-`warp:state-manager-transaction`), the entire set of changes appears as
-a single, atomic operation to other concurrent threads. It also updates
-metrics and logs the commit.
-
-Arguments:
-- `state-mgr` (warp-state-manager): The state manager instance.
-- `transaction` (warp-state-transaction): The transaction to commit.
-
-Returns:
-- (boolean): `t` on successful commit.
-
-Side Effects:
-- Applies all pending operations to the `state-mgr`'s `state-data`.
-  This invokes `warp-state-manager--internal-update` and `delete`.
-- Marks the `transaction` as committed.
-- Removes the `transaction` from the `active-transactions` list."
-  (let ((tx-id (warp-state-transaction-id transaction))
-        (operations (warp-state-transaction-operations transaction))
-        (node-id (warp-state-transaction-node-id transaction)))
-
-    ;; Apply each operation in the transaction using internal update/delete
-    ;; functions, passing the transaction ID.
-    (dolist (op operations)
-      (let ((type (plist-get op :type))
-            (path (plist-get op :path))
-            (value (plist-get op :value)))
-        (pcase type
-          (:update
-           (loom:await ; Await internal update/delete as they are async.
-            (warp-state-manager--internal-update
-             state-mgr path value tx-id nil node-id nil)))
-          (:delete
-           (loom:await ; Await internal update/delete as they are async.
-            (warp-state-manager--internal-delete
-             state-mgr path tx-id nil node-id nil))))))
-
-    (setf (warp-state-transaction-committed transaction) t)
-    (remhash tx-id (warp-state-manager-active-transactions state-mgr))
-    (warp:log! :debug (warp-state-manager-id state-mgr)
-               (format "Committed transaction '%s' with %d operations."
-                       tx-id (length operations)))
-    t))
-
-(defun warp-state-manager--rollback-transaction (state-mgr transaction)
-  "Rolls back a transaction by reverting its operations.
-If a transaction fails (e.g., due to an error in `transaction-fn`),
-this function is called to undo any changes that might have been
-queued. It iterates through the `operations` *in reverse order* (to
-maintain logical consistency for dependencies and correct state
-restoration) and restores the `:backup-entry` that was saved for each
-operation, effectively resetting the state for affected keys to how it
-was before the transaction began.
-
-Arguments:
-- `state-mgr` (warp-state-manager): The state manager instance.
-- `transaction` (warp-state-transaction): The transaction to roll back.
-
-Returns:
-- (boolean): `t` on successful rollback.
-
-Side Effects:
-- Reverts changes made by the transaction to `state-mgr`'s `state-data`
-  by restoring backup entries or deleting newly created ones.
-- Marks the `transaction` as rolled back.
-- Removes the `transaction` from the `active-transactions` list."
-  (let ((tx-id (warp-state-transaction-id transaction))
-        (operations (reverse (warp-state-transaction-operations transaction))))
-
-    ;; Undo operations in reverse order. This is important to ensure that if
-    ;; an update was followed by a delete, the delete is undone first, then
-    ;; the update, maintaining a consistent state.
-    (dolist (op operations)
-      (let* ((path (plist-get op :path))
-             (key (warp-state-manager--path-to-key path))
-             (backup-entry (plist-get op :backup-entry)))
-        (if backup-entry
-            ;; If a backup exists, restore it. This means the key existed
-            ;; before the transaction started.
-            (puthash key backup-entry
-                     (warp-state-manager-state-data state-mgr))
-          ;; If there was no backup, it means the key was newly created within
-          ;; this transaction, so we remove it completely.
-          (remhash key (warp-state-manager-state-data state-mgr)))))
-
-    (setf (warp-state-transaction-rolled-back transaction) t)
-    (remhash tx-id (warp-state-manager-active-transactions state-mgr))
-    (warp:log! :debug (warp-state-manager-id state-mgr)
-               (format "Rolled back transaction '%s' with %d operations."
-                       tx-id (length operations)))
-    t))
-
-;;----------------------------------------------------------------------------
-;;; Event & Cluster Integration
-;;----------------------------------------------------------------------------
-
-(defun warp-state-manager--emit-state-change-event
-    (state-mgr path old-entry new-entry)
-  "Emits a `:state-changed` event through the `warp-event` system.
-This function is called after any successful state modification (update
-or delete). It packages details about the change (old and new values,
-path, CRDT metadata) into an event that observers can subscribe to,
-enabling a reactive architecture where components can react to data
-changes in a decoupled manner. Events are currently emitted with a
-`:local` distribution scope, but could be `:cluster` for broader sync.
-
-Arguments:
-- `state-mgr` (warp-state-manager): The state manager instance.
-- `path` (list): The list representation of the state path that changed.
-- `old-entry` (warp-state-entry or nil): The `warp-state-entry` object
-  before the change. `nil` if the entry was newly created.
-- `new-entry` (warp-state-entry or nil): The `warp-state-entry` object
-  after the change. `nil` if the entry was deleted (tombstone).
-
-Returns:
-- (loom-promise): A promise that resolves when the event has been emitted."
-  (when-let ((event-system (warp-state-manager-event-system state-mgr)))
-    (warp:emit-event-with-options
-     event-system
-     :state-changed
-     (list :path path
-           :old-value (and old-entry (warp-state-entry-value old-entry))
-           :new-value (and new-entry (warp-state-entry-value new-entry))
-           :metadata (list :old-entry old-entry
-                           :new-entry new-entry
-                           :timestamp (warp-state-manager--current-timestamp)
-                           :node-id (warp-state-manager-node-id state-mgr)))
-     :source-id (warp-state-manager-id state-mgr)
-     :distribution-scope :local)))
-
-(defun warp-state-manager--register-cluster-hooks (state-mgr)
-  "Registers event handlers for cluster integration.
-This function subscribes the state manager to cluster-wide events
-emitted by other Warp components, such as a node joining or a request
-for state synchronization. This allows the state manager to participate
-actively in a distributed environment by reacting to and fulfilling
-requests from other nodes.
-
-Arguments:
-- `state-mgr` (warp-state-manager): The state manager instance.
-
-Side Effects:
-- Creates event subscriptions in the `warp-event` system."
-  (when-let ((event-system (warp-state-manager-event-system state-mgr)))
-    ;; Subscribe to an event that fires when a new node joins the cluster.
-    ;; In a full CRDT system, this would trigger more complex sync logic
-    ;; (e.g., anti-entropy, pushing missing data to new node).
-    (warp:subscribe
-     event-system
-     :cluster-node-joined
-     (lambda (event)
-       (warp:log! :info (warp-state-manager-id state-mgr)
-                  (format "New cluster node joined: %s."
-                          (plist-get (warp-event-data event) :node-id)))))
-
-    ;; Subscribe to requests from other nodes asking for our state.
-    ;; This is a simplified example of how state can be queried across the
-    ;; cluster. Actual large-scale data transfer might use RPC or a
-    ;; dedicated transfer mechanism.
-    (warp:subscribe
-     event-system
-     :cluster-state-sync-request
-     (lambda (event)
-       (let* ((event-data (warp-event-data event))
-              (requesting-node (plist-get event-data :node-id))
-              (paths (plist-get event-data :paths))
-              (corr-id (warp-event-id event)))
-         (warp:log! :debug (warp-state-manager-id state-mgr)
-                    (format "State sync request from %s for paths: %S."
-                            requesting-node paths))
-         ;; Respond with an event containing the requested state data.
-         (let ((exported (warp:state-manager-export-state state-mgr paths)))
-           (warp:emit-event-with-options
-            event-system
-            :cluster-state-sync-response ; Event type for the response
-            (list :target-node requesting-node
-                  :state-entries exported)
-            :source-id (warp-state-manager-id state-mgr)
-            :correlation-id corr-id ; Maintain correlation for tracing
-            :distribution-scope :cluster))))))) ; Broadcast response within cluster
-
-;;----------------------------------------------------------------------------
-;;; Maintenance & Validation
-;;----------------------------------------------------------------------------
-
-(defun warp-state-manager--maybe-auto-snapshot-task (state-mgr)
-  "The task function executed by the snapshot poller.
-This function periodically checks if the time elapsed since the last
-snapshot exceeds the configured `snapshot-interval`. If so, it triggers
-the creation of a new automatic snapshot, ensuring regular persistence
-of the full state. It catches and logs any errors during snapshot
-creation to avoid disrupting the poller's schedule. Only active for
-file-based persistence.
-
-Arguments:
-- `state-mgr` (warp-state-manager): The state manager instance.
-
-Side Effects:
-- May call `warp-state-manager--create-snapshot`, which performs
-  deep copying and writes to disk asynchronously.
-- Updates `last-snapshot-time` field in `state-mgr` if a snapshot is
-  created."
-  (let ((config (warp-state-manager-config state-mgr)))
-    (when (and (warp-state-manager-config-persistence-enabled config)
-               (not (warp-state-manager-config-persistence-backend config)))
-      (condition-case err
-          (let* ((interval (warp-state-manager-config-snapshot-interval
-                             config))
-                 (last-snapshot (warp-state-manager-last-snapshot-time
-                                 state-mgr))
-                 (current-time (warp-state-manager--current-timestamp)))
-            (when (and (> interval 0) ; Only if auto-snapshotting is enabled
-                       (> (- current-time last-snapshot) interval))
-              (let ((snapshot-id (format "auto-%s-%d"
-                                         (warp-state-manager-node-id state-mgr)
-                                         (truncate current-time))))
-                ;; `create-snapshot` handles persistence and logging.
-                (loom:await 
-                 (warp:state-manager-snapshot state-mgr snapshot-id)))))
-        (error
-         (warp:log! :error (warp-state-manager-id state-mgr)
-                    (format "Failed to create automatic snapshot: %S."
-                            err)))))))
-
-(defun warp-state-manager--cleanup-tombstones (state-mgr &optional max-age)
-  "Cleans up old tombstone entries from the state manager.
-Tombstone entries (marked with `deleted: t`) are crucial for CRDTs to
-ensure deletions propagate correctly. However, they can accumulate
-over time, leading to unbounded memory growth. This function removes
-tombstones that are older than a specified `max-age` (defaulting to
-7 days), reclaiming memory used by logically deleted data.
-
-Arguments:
-- `state-mgr` (warp-state-manager): The state manager instance.
-- `max-age` (float, optional): Maximum age in seconds for tombstones to
-  be retained. Defaults to 7 days (`604800.0` seconds).
-
-Returns:
-- (integer): The number of tombstones that were removed.
-
-Side Effects:
-- Removes entries from `state-mgr`'s `state-data` hash table."
-  (let ((max-age (or max-age (* 7 24 60 60.0))) ; Default to 7 days
-        (current-time (warp-state-manager--current-timestamp))
-        (keys-to-remove nil))
-    (maphash (lambda (key entry)
-               (when (and (warp-state-entry-deleted entry)
-                          (> (- current-time
-                                (warp-state-entry-timestamp entry))
-                             max-age))
-                 (push key keys-to-remove)))
-             (warp-state-manager-state-data state-mgr))
-    (dolist (key keys-to-remove)
-      (remhash key (warp-state-manager-state-data state-mgr)))
-    (when keys-to-remove
-      (warp:log! :debug (warp-state-manager-id state-mgr)
-                 (format "Cleaned up %d old tombstone entries."
-                         (length keys-to-remove))))
-    (length keys-to-remove)))
-
-(defun warp-state-manager--validate-state-entry (entry)
-  "Validates that a state entry object is well-formed.
-This internal sanity check ensures that a `warp-state-entry` has all
-the required fields with the correct types (`vector-clock`, `timestamp`,
-`node-id`, `version`). This helps prevent corrupted or malformed data
-from being processed or stored, ensuring data integrity.
-
-Arguments:
-- `entry` (warp-state-entry): The entry to validate.
-
-Returns:
-- (boolean): `t` if the entry is valid.
-
-Signals:
-- `warp-state-manager-error`: If any required field is missing or invalid."
-  (unless (warp-state-entry-p entry)
-    (signal 'warp-state-manager-error
-            (list "Invalid state entry type." entry)))
-  (unless (hash-table-p (warp-state-entry-vector-clock entry))
-    (signal 'warp-state-manager-error
-            (list "Entry missing vector clock." entry)))
-  (unless (numberp (warp-state-entry-timestamp entry))
-    (signal 'warp-state-manager-error
-            (list "Entry missing timestamp." entry)))
-  (unless (stringp (warp-state-entry-node-id entry))
-    (signal 'warp-state-manager-error
-            (list "Entry missing node-id." entry)))
-  (unless (integerp (warp-state-entry-version entry))
-    (signal 'warp-state-manager-error
-            (list "Entry missing version." entry)))
-  t) ; All checks passed
-
-(defun warp-state-manager--get-state-size (state-mgr)
-  "Calculates the approximate memory usage of the state manager.
-This function provides a rough, heuristic-based estimate of memory
-consumption for monitoring and debugging purposes. It iterates over
-all stored entries and estimates their size based on type. It is not
-an exact measurement but is useful for tracking trends and identifying
-potential memory leaks.
-
-Arguments:
-- `state-mgr` (warp-state-manager): The state manager instance.
-
-Returns:
-- (integer): Approximate size in bytes."
-  (let ((total-size 0))
-    ;; Estimate size of the main state data hash table.
-    ;; Add a baseline overhead per entry and approximate value size.
-    (maphash (lambda (key entry)
-               (cl-incf total-size (+ (length key) 200)) ; Key string + entry overhead
-               (let ((value (warp-state-entry-value entry)))
-                 (cl-incf total-size ; Rough estimate of value size
-                          (cond ((stringp value) (length value))
-                                ((numberp value) 8) ; Common size for numbers
-                                ((symbolp value) (length (symbol-name value)))
-                                ((listp value) (* (length value) 50)) ; List elements overhead
-                                (t 100))))) ; Default for other types
-             (warp-state-manager-state-data state-mgr))
-    ;; Estimate sizes of other internal structures.
-    (cl-incf total-size (* (hash-table-count
-                            (warp-state-manager-vector-clock state-mgr))
-                           50))
-    (cl-incf total-size (* (hash-table-count
-                            (warp-state-manager-observers state-mgr))
-                           100))
-    (maphash (lambda (_id snapshot)
-               (cl-incf total-size (* (hash-table-count
-                                       (warp-state-snapshot-state-data
-                                        snapshot))
-                                      250))) ; Snapshot entry overhead
-             (warp-state-manager-snapshots state-mgr))
-    total-size))
-
-(defun warp-state-manager--validate-crdt-invariants (state-mgr)
-  "Performs a self-check on the CRDT data invariants.
-This is a debugging and health-check utility to verify that the
-internal CRDT state is consistent. It checks critical properties
-like:
-1. The global vector clock must include the current node's entry.
-2. No individual entry's vector clock should have versions strictly
-   greater than the corresponding versions in the manager's global clock.
-Violations of these invariants indicate potential corruption or logic
-bugs, often stemming from incorrect update or merge procedures.
-
-Arguments:
-- `state-mgr` (warp-state-manager): The state manager instance.
-
-Returns:
-- (boolean): `t` if all invariants hold.
-
-Signals:
-- `warp-state-manager-error`: If an invariant is violated, indicating
-  a serious internal inconsistency."
-  (let ((global-clock (warp-state-manager-vector-clock state-mgr))
-        (node-id (warp-state-manager-node-id state-mgr)))
-    ;; Invariant 1: The global clock must know about the current node.
-    (unless (gethash node-id global-clock)
-      (signal 'warp-state-manager-error
-              (list "Global vector clock missing current node's entry."
-                    node-id)))
-    ;; Invariant 2: No entry's clock can be ahead of the global clock.
-    ;; This means the global clock must be a "supremum" (least upper
-    ;; bound) of all entry clocks.
-    (maphash (lambda (key entry)
-               (let ((entry-clock (warp-state-entry-vector-clock entry)))
-                 (maphash (lambda (node version)
-                            (when (> version (gethash node global-clock 0))
-                              (signal 'warp-state-manager-error
-                                      (list "Entry vector clock ahead of global."
-                                            key node version))))
-                          entry-clock)))
-             (warp-state-manager-state-data state-mgr))
-    t))
-
-(defun warp-state-manager--setup-performance-monitoring (state-mgr)
-  "Sets up internal hooks for basic performance monitoring.
-This function subscribes to the manager's own `:state-changed` events
-to update simple metrics like operations per second. This is an
-example of how the event system can be used for introspection and
-self-monitoring. More advanced monitoring would involve dedicated
-metric collection systems.
-
-Arguments:
-- `state-mgr` (warp-state-manager): The state manager instance.
-
-Side Effects:
-- Creates a subscription in the `warp-event` system to `state-changed`
-  events, which updates `:operations-this-second` and
-  `:last-operation-time` metrics in `state-mgr`'s `metrics` hash table."
-  (when-let ((event-system (warp-state-manager-event-system state-mgr)))
-    (warp:subscribe
-     event-system
-     :state-changed
-     (lambda (_event) ; Event data is not directly used for this metric.
-       (let* ((metrics (warp-state-manager-metrics state-mgr))
-              (current-ops (gethash :operations-this-second metrics 0)))
-         (puthash :operations-this-second (1+ current-ops) metrics)
-         (puthash :last-operation-time
-                  (warp-state-manager--current-timestamp)
-                  metrics)))
-     :priority 1000))) ; High priority to capture changes early
+- Calls `persist-entry-fn` on the state manager's backend."
+  (let ((backend (warp-state-manager-backend state-mgr)))
+    (if backend
+        (if entry
+            (funcall (warp-state-backend-persist-entry-fn backend)
+                     key (warp:serialize entry))
+          (funcall (warp-state-backend-delete-entry-fn backend) key))
+      (loom:resolved! t))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
@@ -2120,7 +1205,7 @@ Side Effects:
 
   ;; 1. Create the base instance and apply configuration.
   (let* ((config (apply #'make-state-manager-config
-                         (append (list :name name) config-options)))
+                        (append (list :name name) config-options)))
          (id (or (state-manager-config-name config)
                  (warp-state-manager--generate-id)))
          (node-id (or (state-manager-config-node-id config)
@@ -2134,27 +1219,27 @@ Side Effects:
                (state-manager-config-persistence-backend config))
       (error "Cannot enable both file-based persistence and a backend \
               simultaneously."))
+
+    ;; 3. Initialize the persistence backend.
+    (when-let ((backend-config (state-manager-config-persistence-backend config)))
+      (setf (warp-state-manager-backend state-mgr)
+            (warp:state-backend-create backend-config)))
     
     (warp-state-manager--validate-config config) ; Placeholder for actual validation
 
-    ;; 3. Initialize core metrics counters.
+    ;; 4. Initialize core metrics counters.
     (let ((metrics (warp-state-manager-metrics state-mgr)))
       (puthash :created-time (warp-state-manager--current-timestamp)
                metrics))
 
-    ;; 4. Load state from persistence (Redis Backend or File-based WAL).
-    (if (state-manager-config-persistence-backend config)
-        (loom:await (warp-state-manager--load-from-backend state-mgr))
-      (when (state-manager-config-persistence-enabled config)
-        (warp:log! :info (warp-state-manager-id state-mgr)
-                   "Attempting to load state from WAL files.")
-        (warp-state-manager--load-from-wal state-mgr)))
+    ;; 5. Load state from persistence (Backend or File-based WAL).
+    (loom:await (warp-state-manager--load-state state-mgr))
 
-    ;; 5. Register event handlers for cluster integration, allowing the
+    ;; 6. Register event handlers for cluster integration, allowing the
     ;; state manager to react to and participate in a distributed environment.
     (warp-state-manager--register-cluster-hooks state-mgr)
 
-    ;; 6. Set up automatic snapshotting and periodic garbage collection tasks
+    ;; 7. Set up automatic snapshotting and periodic garbage collection tasks
     ;; IF file-based persistence is enabled.
     (when (and (warp-state-manager-config-persistence-enabled config)
                (not (warp-state-manager-config-persistence-backend config)))
@@ -2168,7 +1253,7 @@ Side Effects:
           (loom:poll-register-periodic-task
            poller 'auto-snapshot-task
            `(lambda () (warp-state-manager--maybe-auto-snapshot-task
-                         ,state-mgr))
+                        ,state-mgr))
            :interval (state-manager-config-snapshot-interval config)
            :immediate t) ; Run the first snapshot check immediately
           ;; Schedule periodic garbage collection in the same poller for
@@ -2181,7 +1266,7 @@ Side Effects:
            :interval 3600 ; Run GC task every hour.
            :immediate nil))))
 
-    ;; 7. Perform an initial internal health check on startup to report
+    ;; 8. Perform an initial internal health check on startup to report
     ;; any immediate issues in the logs.
     (let ((health (warp:state-manager-health-check state-mgr)))
       (unless (eq (plist-get health :status) :healthy)
@@ -2189,7 +1274,7 @@ Side Effects:
                    (format "State manager created with health issues: %S."
                            health))))
 
-    ;; 8. Set up basic performance monitoring.
+    ;; 9. Set up basic performance monitoring.
     (warp-state-manager--setup-performance-monitoring state-mgr)
 
     (warp:log! :info id (format "State manager '%s' created with node-id: %s."
@@ -2254,8 +1339,7 @@ Side Effects:
                (warp-state-manager-config state-mgr))
           (warp:log! :info (warp-state-manager-id state-mgr)
                      "Flushing remaining WAL entries on destroy.")
-          (loom:await (warp:state-manager-flush state-mgr)))) 
-
+          (loom:await (warp:state-manager-flush state-mgr))))
       (:then (_)
         ;; 3. Cleanly unsubscribe all registered observers.
         ;; This prevents callbacks from firing on a defunct manager.
@@ -2388,29 +1472,18 @@ Side Effects:
                               default
                             (warp-state-entry-value entry))))
       ;; Cache miss: attempt to load from persistent backend if configured.
-      (if-let (backend-config (state-manager-config-persistence-backend
-                               (warp-state-manager-config state-mgr)))
-          (braid!
-            (pcase (plist-get backend-config :type)
-              (:redis
-               (let* ((redis-svc (plist-get backend-config :service))
-                      (redis-key (format "%s:state" (plist-get backend-config :key-prefix))))
-                 (warp:log! :debug log-target "Cache miss for key %s. Fetching from Redis." key)
-                 (warp:redis-hget redis-svc redis-key key)))
-              (_ (warp:log! :warn log-target "Unknown backend type for get: %S. \
-                                              Returning default."
-                             (plist-get backend-config :type))
-                 (loom:resolved! nil)))
-            (:then (serialized-entry)
-              (if serialized-entry
-                  (let ((loaded-entry (warp:deserialize serialized-entry)))
+      (if-let (backend (warp-state-manager-backend state-mgr))
+          (braid! (funcall (warp-state-backend-load-all-fn backend) key)
+            (:then (loaded-entry)
+              (if loaded-entry
+                  (let ((entry (warp:deserialize loaded-entry)))
                     (warp:log! :debug log-target "Loaded entry for key %s from backend." key)
                     ;; Populate cache with loaded entry.
                     (loom:with-mutex! (warp-state-manager-state-lock state-mgr)
-                      (puthash key loaded-entry (warp-state-manager-state-data state-mgr)))
-                    (if (warp-state-entry-deleted loaded-entry)
+                      (puthash key entry (warp-state-manager-state-data state-mgr)))
+                    (if (warp-state-entry-deleted entry)
                         default
-                      (warp-state-entry-value loaded-entry)))
+                      (warp-state-entry-value entry)))
                 (progn
                   (warp:log! :debug log-target "Key %s not found in backend. Returning default." key)
                   default)))
@@ -2490,7 +1563,11 @@ Returns:
 
 Signals:
 - `warp-state-manager-error`: If `state-mgr` is invalid or `path` is
-  malformed."
+  malformed.
+
+Side Effects:
+- Acquires a mutex lock briefly to update query-related metrics and for
+  potential cache writes during a read-through."
   (unless (warp-state-manager-p state-mgr)
     (signal 'warp-state-manager-error
             (list "Invalid state manager object." state-mgr)))
@@ -2499,8 +1576,8 @@ Signals:
   (let* ((key (warp-state-manager--path-to-key path))
          (entry (gethash key (warp-state-manager-state-data state-mgr)))
          (log-target (warp-state-manager-id state-mgr)))
+    ;; Update metrics inside the lock to ensure thread-safety.
     (loom:with-mutex! (warp-state-manager-state-lock state-mgr)
-      ;; Update metrics for existence checks.
       (let ((metrics (warp-state-manager-metrics state-mgr)))
         (puthash :total-queries (1+ (gethash :total-queries metrics 0))
                  metrics)))
@@ -2512,47 +1589,33 @@ Signals:
                      key)
           (loom:resolved! (not (warp-state-entry-deleted entry))))
       ;; Cache miss: attempt to load from persistent backend if configured.
-      (if-let (backend-config (state-manager-config-persistence-backend
-                               (warp-state-manager-config state-mgr)))
-          (braid!
-            (pcase (plist-get backend-config :type)
-              (:redis
-               (let* ((redis-svc (plist-get backend-config :service))
-                      (redis-key (format "%s:state"
-                                         (plist-get backend-config :key-prefix))))
-                 (warp:log! :debug log-target "Cache miss for existence check \
-                                               of key %s. Fetching from Redis." key)
-                 (warp:redis-hget redis-svc redis-key key)))
-              (_ (warp:log! :warn log-target "Unknown backend type for existence \
-                                              check: %S. Returning nil."
-                             (plist-get backend-config :type))
-                 (loom:resolved! nil)))
-            (:then (serialized-entry)
-              (if serialized-entry
-                  (let ((loaded-entry (warp:deserialize serialized-entry)))
+      (if-let (backend (warp-state-manager-backend state-mgr))
+          (braid! (funcall (warp-state-backend-load-all-fn backend) key)
+            (:then (loaded-entry)
+              (if loaded-entry
+                  (let ((entry (warp:deserialize loaded-entry)))
                     (warp:log! :debug log-target "Loaded entry for existence \
-                                                  check of key %s from backend." key)
+                                                   check of key %s from backend." key)
                     ;; Populate cache with loaded entry.
                     (loom:with-mutex! (warp-state-manager-state-lock state-mgr)
-                      (puthash key loaded-entry
-                               (warp-state-manager-state-data state-mgr)))
-                    (not (warp-state-entry-deleted loaded-entry)))
+                      (puthash key entry (warp-state-manager-state-data state-mgr)))
+                    (not (warp-state-entry-deleted entry)))
                 (progn
                   (warp:log! :debug log-target "Key %s not found in backend for \
-                                                existence check. Returning nil." key)
+                                                 existence check. Returning nil." key)
                   nil)))
             (:catch (err)
               (warp:log! :error log-target "Failed to load key %s from backend \
-                                            for existence check: %S" key err)
+                                             for existence check: %S" key err)
               (loom:rejected!
                (warp:error! :type 'warp-state-manager-persistence-error
-                            :message (format "Backend read failed for key %s \
-                                              during existence check." key)
+                            :message (format "Backend bulk read failed for \
+                                              key %s." key)
                             :cause err))))
         ;; No backend configured, return nil immediately.
         (progn
           (warp:log! :trace log-target "No backend configured for existence \
-                                        check. Returning nil for key %s." key)
+                                         check. Returning nil for key %s." key)
           (loom:resolved! nil))))))
 
 ;;----------------------------------------------------------------------
@@ -2620,10 +1683,10 @@ Side Effects:
                             (format "Bulk update completed: %d/%d successful."
                                     success-count (length updates)))
                  success-count)
-        (:catch (err)
-          (warp:log! :error log-target "Error during bulk update persistence: %S"
-                     err)
-          (loom:rejected! err)))))))
+          (:catch (err)
+            (warp:log! :error log-target "Error during bulk update persistence: %S"
+                       err)
+            (loom:rejected! err)))))))
 
 ;;;###autoload
 (defun warp:state-manager-bulk-get (state-mgr paths &optional default)
@@ -2674,42 +1737,28 @@ Side Effects:
               (warp:log! :trace log-target "Bulk get cache hit for key: %s."
                          key)
               (push (loom:resolved! (cons path (if (warp-state-entry-deleted entry)
-                                                   default
-                                                 (warp-state-entry-value entry))))
+                                                    default
+                                                  (warp-state-entry-value entry))))
                     promises))
           ;; Cache miss: attempt to fetch from backend.
-          (if-let (backend-config (state-manager-config-persistence-backend
-                                   (warp-state-manager-config state-mgr)))
-              (braid!
-                (pcase (plist-get backend-config :type)
-                  (:redis
-                   (let* ((redis-svc (plist-get backend-config :service))
-                          (redis-key (format "%s:state"
-                                             (plist-get backend-config :key-prefix))))
-                     (warp:log! :debug log-target "Bulk get cache miss for key %s. \
-                                                   Fetching from Redis." key)
-                     (warp:redis-hget redis-svc redis-key key)))
-                  (_ (warp:log! :warn log-target "Unknown backend type for bulk \
-                                                  get: %S. Skipping key."
-                                 (plist-get backend-config :type))
-                     (loom:resolved! nil)))
-                (:then (serialized-entry)
-                  (if serialized-entry
-                      (let ((loaded-entry (warp:deserialize serialized-entry)))
+          (if-let (backend (warp-state-manager-backend state-mgr))
+              (braid! (funcall (warp-state-backend-load-all-fn backend) key)
+                (:then (loaded-entry)
+                  (if loaded-entry
+                      (let ((entry (warp:deserialize loaded-entry)))
                         (warp:log! :debug log-target "Bulk loaded entry for key %s \
-                                                      from backend." key)
+                                                       from backend." key)
                         ;; Populate cache with loaded entry.
                         (loom:with-mutex! (warp-state-manager-state-lock state-mgr)
-                          (puthash key loaded-entry
-                                   (warp-state-manager-state-data state-mgr)))
-                        (not (warp-state-entry-deleted loaded-entry)))
+                          (puthash key entry (warp-state-manager-state-data state-mgr)))
+                        (not (warp-state-entry-deleted entry)))
                     (progn
                       (warp:log! :debug log-target "Key %s not found in backend \
-                                                    for bulk get. Returning default." key)
+                                                     for bulk get. Returning default." key)
                       nil)))
                 (:catch (err)
                   (warp:log! :error log-target "Failed to bulk load key %s \
-                                                from backend: %S" key err)
+                                                 from backend: %S" key err)
                   (loom:rejected!
                    (warp:error! :type 'warp-state-manager-persistence-error
                                 :message (format "Backend bulk read failed for \
@@ -2718,7 +1767,7 @@ Side Effects:
             ;; No backend configured, resolve to default.
             (progn
               (warp:log! :trace log-target "No backend configured for bulk get. \
-                                            Returning default for key %s." key)
+                                             Returning default for key %s." key)
               (push (loom:resolved! (cons path default)) promises))))))
     (loom:all promises)))
 
@@ -2760,7 +1809,7 @@ Signals:
                (when (not (warp-state-entry-deleted entry))
                  (if pattern-optimized
                      (when (warp-state-manager--key-matches-optimized-pattern
-                            key pattern-optimized)
+                              key pattern-optimized)
                        (push key keys))
                    ;; If no pattern is provided, add all active keys.
                    (push key keys))))
@@ -2807,7 +1856,7 @@ Signals:
                        (value (warp-state-entry-value entry)))
                    (when (and (or (null pattern-optimized)
                                   (warp-state-manager--key-matches-optimized-pattern
-                                   key pattern-optimized))
+                                    key pattern-optimized))
                               (funcall predicate path value entry))
                      (push (cons path value) matches)))))
              (warp-state-manager-state-data state-mgr))
@@ -2834,10 +1883,10 @@ Signals:
 - `warp-state-manager-error`: If `state-mgr` is invalid or `pattern`
   is malformed."
   (warp:state-manager-find
-   state-mgr
-   (lambda (path value _entry)
-     (funcall filter-fn path value))
-   pattern))
+    state-mgr
+    (lambda (path value _entry)
+      (funcall filter-fn path value))
+    pattern))
 
 ;;----------------------------------------------------------------------
 ;;; Observer Management
@@ -2845,7 +1894,7 @@ Signals:
 
 ;;;###autoload
 (defun warp:state-manager-register-observer
-    (state-mgr path-pattern callback &optional options)
+  (state-mgr path-pattern callback &optional options)
   "Registers a callback function to observe state changes.
 This function allows for event-driven programming by attaching a
 listener to state changes that match a specific `path-pattern`. It
@@ -2894,31 +1943,31 @@ Side Effects:
          ;; Wrap the user's callback in an event handler that first
          ;; applies the path pattern matching and then the optional filter-fn.
          (wrapped-event-handler
-          (lambda (event)
-            (let* ((event-data (warp-event-data event))
-                   (path (plist-get event-data :path))
-                   (old-val (plist-get event-data :old-value))
-                   (new-val (plist-get event-data :new-value))
-                   (metadata (plist-get event-data :metadata))
-                   (filter-fn (plist-get options :filter-fn))
-                   (old-entry (plist-get metadata :old-entry))
-                   (new-entry (plist-get metadata :new-entry)))
-              ;; Only call the user's callback if the optional filter-fn passes.
-              (when (or (null filter-fn)
-                        (funcall filter-fn path old-entry new-entry))
-                (funcall callback path old-val new-val metadata))))))
+           (lambda (event)
+             (let* ((event-data (warp-event-data event))
+                    (path (plist-get event-data :path))
+                    (old-val (plist-get event-data :old-value))
+                    (new-val (plist-get event-data :new-value))
+                    (metadata (plist-get event-data :metadata))
+                    (filter-fn (plist-get options :filter-fn))
+                    (old-entry (plist-get metadata :old-entry))
+                    (new-entry (plist-get metadata :new-entry)))
+               ;; Only call the user's callback if the optional filter-fn passes.
+               (when (or (null filter-fn)
+                         (funcall filter-fn path old-entry new-entry))
+                 (funcall callback path old-val new-val metadata))))))
     (let ((handler-id
-           (warp:subscribe
-            event-system
-            ;; The event predicate filters `state-changed` events based on
-            ;; path pattern.
-            `(:type :state-changed
-              :predicate ,(lambda (event-data)
-                            (warp-state-manager--path-matches-pattern
-                             (plist-get event-data :path)
-                             path-pattern)))
-            wrapped-event-handler
-            options)))
+            (warp:subscribe
+             event-system
+             ;; The event predicate filters `state-changed` events based on
+             ;; path pattern.
+             `(:type :state-changed
+               :predicate ,(lambda (event-data)
+                             (warp-state-manager--path-matches-pattern
+                              (plist-get event-data :path)
+                              path-pattern)))
+             wrapped-event-handler
+             options)))
       ;; Store observer info using the event system's handler-id as the key.
       ;; This is crucial for correct deregistration and introspection.
       (puthash handler-id
@@ -2976,7 +2025,7 @@ complex operations that involve multiple state changes. The provided
 `warp:state-tx-update` and `warp:state-tx-delete` within it are
 collected. If `transaction-fn` completes successfully, all queued
 changes are committed at once (applying them to the state, logging,
-and emitting events). If `transaction-fn` signals an error, all
+and emitting events). If `transaction-fn` signals an an error, all
 changes are discarded via rollback, ensuring data consistency. The
 transaction execution is protected by the state manager's global lock,
 guaranteeing isolation from other concurrent operations.
@@ -3053,8 +2102,8 @@ Side Effects:
   `transaction` object. This operation includes a `:backup-entry` of
   the state before this specific update, enabling precise rollback."
   (warp-state-manager--add-tx-operation
-   transaction
-   (list :type :update :path path :value value)))
+    transaction
+    (list :type :update :path path :value value)))
 
 ;;;###autoload
 (defun warp:state-tx-delete (transaction path)
@@ -3078,8 +2127,8 @@ Side Effects:
   `transaction` object. This operation includes a `:backup-entry` of
   the state before this specific delete, enabling precise rollback."
   (warp-state-manager--add-tx-operation
-   transaction
-   (list :type :delete :path path)))
+    transaction
+    (list :type :delete :path path)))
 
 ;;----------------------------------------------------------------------
 ;;; Snapshot & Persistence API
@@ -3251,7 +2300,7 @@ Side Effects:
 
     (loom:with-mutex! (warp-state-manager-state-lock state-mgr)
       (let ((entries-to-flush (nreverse (warp-state-manager-wal-entries
-                                         state-mgr))))
+                                          state-mgr))))
         ;; Clear the in-memory buffer before initiating the async write.
         ;; This ensures new entries can be added immediately.
         (setf (warp-state-manager-wal-entries state-mgr) nil)
@@ -3279,7 +2328,7 @@ Side Effects:
             t)
           (:catch (err)
             (warp:log! :error (warp-state-manager-id state-mgr)
-                       (format "Manual WAL flush failed: %S." err))
+                       "Manual WAL flush failed: %S." err)
             (loom:rejected! err)))))))
 
 ;;----------------------------------------------------------------------
@@ -3330,11 +2379,11 @@ Signals:
           (condition-case err
               (warp-state-manager--validate-state-entry remote-entry)
             (error
-              (warp:log! :warn (warp-state-manager-id state-mgr)
-                         (format "Skipping invalid remote state entry for \
+             (warp:log! :warn (warp-state-manager-id state-mgr)
+                        (format "Skipping invalid remote state entry for \
                                   path %S: %S."
-                                 path err))
-              (cl-continue)))
+                                path err))
+             (cl-continue)))
 
           (cond
             ((null local-entry)
@@ -3400,6 +2449,8 @@ Signals:
   (unless (warp-state-manager-p state-mgr)
     (signal 'warp-state-manager-error
             (list "Invalid state manager object." state-mgr)))
+  (when paths
+    (warp-state-manager--validate-path paths))
 
   (let ((exported-entries nil))
     (maphash (lambda (key entry)
@@ -3408,7 +2459,7 @@ Signals:
                             (or (null paths)
                                 (cl-some (lambda (p)
                                            (warp-state-manager--path-matches-pattern
-                                            path p))
+                                             path p))
                                          paths)))
                    (push (cons path entry) exported-entries))))
              (warp-state-manager-state-data state-mgr))
@@ -3452,7 +2503,7 @@ Signals:
                metrics)
       (puthash :active-transactions
                (hash-table-count
-                (warp-state-manager-active-transactions state-mgr))
+                 (warp-state-manager-active-transactions state-mgr))
                metrics)
       (puthash :available-snapshots
                (hash-table-count (warp-state-manager-snapshots state-mgr))
@@ -3594,8 +2645,8 @@ Signals:
                  (cl-incf cleaned-snapshots-count)
                  ;; Attempt to delete the corresponding file from disk.
                  (let ((file (expand-file-name (format "%s-snapshot-%s.el"
-                                                        (warp-state-manager-id
-                                                         state-mgr) id)
+                                                       (warp-state-manager-id
+                                                        state-mgr) id)
                                                persist-dir)))
                    (when (file-exists-p file)
                      (condition-case err
@@ -3603,7 +2654,7 @@ Signals:
                        (error
                         (warp:log! :warn (warp-state-manager-id state-mgr)
                                    (format "Failed to delete old snapshot \
-                                            file '%s': %S."
+                                             file '%s': %S."
                                            file err))))))))
              snapshots)
             (setf (plist-get stats :snapshots-cleaned)
@@ -3657,7 +2708,7 @@ Side Effects:
                (warp:log! :info (warp-state-manager-id state-mgr)
                           "Migrating entry for path %S: old %S -> new %S."
                           path old-value new-value)
-               (loom:await 
+               (loom:await
                 (warp-state-manager--internal-update
                  state-mgr path new-value nil nil node-id nil))
                (cl-incf migrated-count)))))
