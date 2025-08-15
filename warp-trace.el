@@ -162,10 +162,10 @@ Fields:
 (defun warp--trace-export-span (tracer span)
   "Dispatches a completed span to all registered exporters.
 
-Why: This function provides the final step of the tracing lifecycle,
+This function provides the final step of the tracing lifecycle,
 sending a completed span to any registered exporter for processing.
 
-How: It iterates through the list of exporters and calls their
+It iterates through the list of exporters and calls their
 `export` method. In this version, we send the span to the central
 telemetry pipeline for a unified observability stream.
 
@@ -210,7 +210,7 @@ Returns:
                                                              tags)
   "Starts a new trace span, representing a new operation.
 
-Why: This function first consults the tracer's sampler to determine if a
+This function first consults the tracer's sampler to determine if a
 new trace should be recorded. It uses standard 128-bit UUIDs for Trace
 IDs and 64-bit random numbers for Span IDs to align with modern tracing
 conventions.
@@ -294,7 +294,7 @@ Returns:
   "Executes `BODY` within a new trace span, ensuring it is properly
 closed.
 
-Why: This macro is the primary, recommended way to instrument code. It
+This macro is the primary, recommended way to instrument code. It
 handles the full span lifecycle: starting the span, binding it to a
 variable, setting it as the current dynamic context, executing the body,
 and guaranteeing the span is ended and exported, even if an error occurs.
@@ -328,10 +328,37 @@ Returns:
          (warp:tracer-end-span ,tracer ,span-var)))))
 
 ;;;###autoload
+(cl-defmacro warp:trace-with-context ((parent-context &rest args) &rest body)
+  "Executes BODY within a new trace span using an explicit parent context.
+This macro is designed for server-side RPC handlers or other operations
+that are the receiving end of a distributed trace. It takes a parent
+context (e.g., extracted from an RPC message header) and uses it to
+start a new child span before executing the body.
+
+Arguments:
+- `PARENT-CONTEXT` (plist): The trace context, typically containing
+  `trace-id` and `parent-span-id`.
+- `&rest ARGS` (plist): Additional arguments for the new span.
+- `&rest BODY`: The code to execute within the new span's context.
+
+Returns:
+- The result of the last form in `BODY`."
+  (declare (indent 2) (debug `(form ,@form)))
+  `(let* ((tracer (warp:component-system-get (current-component-system) :distributed-tracer))
+          (parent-ctx ,parent-context))
+     (when (and tracer parent-ctx)
+       (warp:trace-with-span (span tracer "RPC.Server"
+                                   :trace-id (plist-get parent-ctx :trace-id)
+                                   :parent-span-id (plist-get parent-ctx :parent-span-id))
+         ,@body))
+     (unless (and tracer parent-ctx)
+       (progn ,@body))))
+
+;;;###autoload
 (defun warp:trace-add-tag (key value)
   "Adds a tag (key-value pair) to the currently active trace span.
 
-Why: This function should be called from within a `warp:trace-with-span`
+This function should be called from within a `warp:trace-with-span`
 block. It allows a developer to enrich a span with additional context as
 the operation progresses.
 
@@ -353,7 +380,7 @@ the operation progresses.
 (defun warp:trace-add-log (message &key tags)
   "Adds a structured log event to the currently active trace span.
 
-Why: This is distinct from standard logging. It attaches log events
+This is distinct from standard logging. It attaches log events
 directly to the span's timeline, which is crucial for debugging complex
 sequences of events within a single operation.
 
@@ -381,7 +408,7 @@ sequences of events within a single operation.
 (defun warp:trace-get-context (span)
   "Extracts the trace context from a span for network propagation.
 
-Why: This function serializes a span's essential context (`trace-id`,
+This function serializes a span's essential context (`trace-id`,
 `span-id`) into a format suitable for injecting into network headers,
 message queues, or other RPC mechanisms. The receiving process can then
 use this context to create a child span, linking the two operations.
@@ -399,7 +426,7 @@ use this context to create a child span, linking the two operations.
 (defun warp:trace-extract-context (headers)
   "Extracts trace context from network headers.
 
-Why: This is the inverse of `warp:trace-get-context`. It parses headers
+This is the inverse of `warp:trace-get-context`. It parses headers
 and returns a plist containing a trace ID and a parent span ID. This is
 the entry point for a distributed trace on a receiving process.
 
@@ -449,7 +476,7 @@ the entry point for a distributed trace on a receiving process.
      :middleware
      (lambda (cmd ctx next)
        "This middleware wraps incoming RPC requests in a server-side span.
-How: It extracts trace context from the message headers, uses it to
+It extracts trace context from the message headers, uses it to
 start a new child span, and then calls the next middleware in the
 pipeline. It ensures the span is ended in an `unwind-protect` block
 to guarantee cleanup."

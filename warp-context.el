@@ -35,7 +35,7 @@
 (require 'cl-lib)
 (require 'warp-component)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definition
 
 (cl-defstruct (warp-context (:constructor %%make-warp-context))
@@ -45,20 +45,23 @@ Fields:
 - `component-system` (warp-component-system): A reference to the underlying
   DI container, used to resolve long-lived services.
 - `data` (hash-table): A key-value store for arbitrary, often
-  request-scoped, data (e.g., trace IDs, user credentials)."
+  request-scoped, data (e.g., trace IDs, user credentials).
+- `parent` (warp-context, optional): A reference to the parent context,
+  enabling hierarchical context lookups."
   (component-system (cl-assert nil) :type (or null t))
-  (data (make-hash-table :test 'eq) :type hash-table))
+  (data (make-hash-table :test 'eq) :type hash-table)
+  (parent nil :type (or null t)))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;###autoload
 (defun warp:context-create (component-system &optional initial-data)
-  "Create a new `warp-context`.
-
-Why: This is the main factory for creating context objects. Typically, a
+  "Create a new, top-level `warp-context`.
+This is the main factory for creating a base context object. Typically, a
 base context is created once for the entire `component-system`, and then
-child contexts are derived from it for individual requests.
+child contexts are derived from it for individual requests using
+`warp:context-child`.
 
 Arguments:
 - `component-system` (warp-component-system): The component system this
@@ -74,10 +77,32 @@ Returns:
     ctx))
 
 ;;;###autoload
+(defun warp:context-child (parent-context &optional initial-data)
+  "Create a new child context that inherits from a parent.
+This is a critical function for managing request-scoped or
+operation-scoped state. The child context can have its own data, but
+if a key is not found in the child, the lookup will proceed to the
+parent. This allows for safe, concurrent operations without polluting
+the base context.
+
+Arguments:
+- `parent-context` (warp-context): The parent context to inherit from.
+- `initial-data` (plist, optional): An initial plist of data to populate
+  the child's specific data store.
+
+Returns:
+- (warp-context): A new child context instance."
+  (let ((child-ctx (%%make-warp-context
+                    :component-system (warp-context-component-system parent-context)
+                    :parent parent-context)))
+    (when initial-data
+      (setf (warp-context-data child-ctx) (plist-to-hash-table initial-data)))
+    child-ctx))
+
+;;;###autoload
 (defun warp:context-get-component (context component-key)
   "Retrieve a component instance from the context.
-
-Why: This is the primary way functions should access long-lived
+This is the primary way functions should access long-lived
 services. It abstracts away the `component-system`, making the code
 cleaner and more focused on its intent.
 
@@ -86,13 +111,21 @@ Arguments:
 - `component-key` (keyword): The unique keyword for the component.
 
 Returns:
-- (any): The resolved component instance."
+- (any): The resolved component instance.
+
+Side Effects:
+- May trigger lazy-loading of the component and its dependencies if it
+  has not been created yet."
   (warp:component-system-get (warp-context-component-system context)
                              component-key))
 
 ;;;###autoload
 (defun warp:context-get (context data-key &optional default)
   "Retrieve a request-scoped value from the context's data store.
+This function performs a hierarchical lookup. If the `data-key` is not
+found in the current context's data store, it will recursively search
+up through its parent contexts until the key is found or the root is
+reached.
 
 Arguments:
 - `context` (warp-context): The context instance.
@@ -101,19 +134,29 @@ Arguments:
 
 Returns:
 - (any): The stored value or the default."
-  (gethash data-key (warp-context-data context) default))
+  (let ((val (gethash data-key (warp-context-data context))))
+    (if val
+        val
+      (if-let (parent (warp-context-parent context))
+          (warp:context-get parent data-key default)
+        default))))
 
 ;;;###autoload
 (defun warp:context-set (context data-key value)
-  "Set a request-scoped value in the context's data store.
+  "Set a request-scoped value in the context's local data store.
+This function *only* modifies the local `data` hash table of the
+provided `context`. It does not affect any parent contexts.
 
 Arguments:
-- `context` (warp-context): The context instance.
+- `context` (warp-context): The context instance to modify.
 - `data-key` (keyword): The key for the data.
 - `value` (any): The value to store.
 
 Returns:
-- The `value` that was set."
+- The `value` that was set.
+
+Side Effects:
+- Modifies the `data` hash table of the `context`."
   (puthash data-key value (warp-context-data context)))
 
 (provide 'warp-context)

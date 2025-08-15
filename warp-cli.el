@@ -551,7 +551,7 @@ Side Effects:
   "Handle the `invoke` command.
 
 Arguments:
-- `OPTS` (alist): Parsed options for the command.
+- `OPTS` (alist): Parsed options for the subcommand.
 - `POSITIONAL` (list): Contains the service and function names.
 - `LEADER-ADDR` (string): The network address of the cluster leader.
 
@@ -768,23 +768,14 @@ Side Effects:
 
 (defun warp-cli--handle-deploy (opts positional leader-addr)
   "Handle the 'deploy' subcommand for declarative deployments.
-
-Arguments:
-- `OPTS` (alist): Parsed options.
-- `POSITIONAL` (list): The deploy action and its arguments.
-- `LEADER-ADDR` (string): The network address of the cluster leader.
-
-Returns:
-- `nil`.
-
-Side Effects:
-- Sends RPC requests to the `manager-service`."
+This handler now supports a simplified, single-step deployment flow."
   (when (null positional)
-    (warp-cli--print-error "Usage: warp deploy <plan|apply|status|list|rollback> [args]")
+    (warp-cli--print-error "Usage: warp deploy <plan|apply|status|list|rollback|manifest> [args]")
     (kill-emacs 1))
   (let* ((action (pop positional))
          (client-stub (warp-cli--get-service-client leader-addr :manager-service)))
     (pcase action
+      ;; The old, two-step manual flow is still available but discouraged.
       ("plan"
        (let* ((manifest-file (alist-get 'file opts))
               (manifest (yaml-read-file manifest-file))
@@ -798,6 +789,19 @@ Side Effects:
               (result (warp-cli--with-spinner ("Applying deployment plan...")
                         (loom:await (manager-client-apply-deployment client-stub plan)))))
          (warp-cli--print-success "Deployment started. ID: %s" (plist-get result :deployment-id))))
+      
+      ;; NEW: The simplified, single-step deployment flow.
+      ("manifest"
+       (let* ((manifest-file (alist-get 'file opts))
+              (manifest (yaml-read-file manifest-file))
+              (result (warp-cli--with-spinner ("Applying deployment manifest...")
+                        (loom:await (manager-client-deploy-and-monitor client-stub manifest)))))
+         (if (eq (plist-get result :status) :success)
+             (warp-cli--print-success "Deployment '%s' completed successfully."
+                                      (plist-get result :deployment-id))
+           (warp-cli--print-error "Deployment '%s' failed."
+                                  (plist-get result :deployment-id)))))
+      
       ("status"
        (let* ((deploy-id (car positional))
               (result (warp-cli--with-spinner ("Fetching deployment status...")

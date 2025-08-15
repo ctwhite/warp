@@ -24,7 +24,6 @@
 ;; For all standard application-level services, developers should use the
 ;; `warp:defservice-implementation` macro with the `:expose-via-rpc` key,
 ;; as it provides a more robust, integrated, and consistent approach.
-;;
 
 ;;; Code:
 
@@ -40,6 +39,7 @@
 (require 'warp-command-router)
 (require 'warp-bridge)
 (require 'warp-cluster)
+(require 'warp-service) ;; Added for service definitions
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -58,28 +58,24 @@
 ;;;###autoload
 (defmacro warp:defprotocol (name &rest options)
   "Define a low-level RPC protocol, generating client and server code.
-
 This macro is a powerful tool for manually defining RPC contracts.
 However, for standard services, it is **highly recommended** to use
 the `warp:defservice-implementation` macro instead, as it automates
 this process and ensures consistency with a formal service interface.
 
-Use this macro for framework-internal or ad-hoc communication that
-does not represent a formal, discoverable service.
-
-:Arguments:
-- `NAME` (symbol): The symbolic name of the protocol.
-- `OPTIONS` (plist):
+Arguments:
+- `name` (symbol): The symbolic name of the protocol.
+- `options` (plist):
   - `:client-class` (symbol): The name for the generated client struct.
   - `:handler-group-deps` (list): Dependencies injected into handlers.
   - `:auto-schema` (boolean): If t, auto-generate schemas.
-  - The rest of `OPTIONS` are RPC method definitions, including an
+  - The rest of `options` are RPC method definitions, including an
     inline `:handler` lambda.
 
-:Returns:
+Returns:
 - (list): A `(progn ...)` form containing all generated definitions.
 
-:Side Effects:
+Side Effects:
 - Defines structs, functions, commands, and variables in the current
   environment when the macro is expanded."
   (let* ((protocol-name name)
@@ -91,8 +87,6 @@ does not represent a formal, discoverable service.
                    unless (keywordp (car-safe opt))
                    collect opt)))
 
-    ;; This macro is now self-contained, with the logic of the former
-    ;; private helpers integrated directly into the `cl-loop` below.
     `(progn
        ;; Generate all definitions in a single pass.
        ,@(cl-loop
@@ -104,7 +98,6 @@ does not represent a formal, discoverable service.
                  (handler-code (plist-get method-options :handler))
                  (schema-name (intern (format "warp-%s-%s-request"
                                               protocol-name method-name)))
-                 ;; Update the rpc-def with the schema name if auto-generating.
                  (rpc-def-with-schema
                   (if auto-schema
                       (append rpc-def `(:request-schema ,schema-name))
@@ -120,40 +113,31 @@ does not represent a formal, discoverable service.
 
              ;; 2. Generate Client Method (optional)
              (when client-class
-               (let* ((client-fn-name (intern (format "%s-%s" client-class
-                                                      method-name)))
-                      (command-name (intern (format ":%s/%s" protocol-name
-                                                    method-name)))
+               (let* ((client-fn-name (intern (format "%s-%s" client-class method-name)))
+                      (command-name (intern (format ":%s/%s" protocol-name method-name)))
                       (payload-args
                        (cl-loop for arg in args-list
                                 unless (memq arg '(&key &optional &rest))
-                                collect `(,(intern (symbol-name arg) :keyword)
-                                          ,arg))))
+                                collect `(,(intern (symbol-name arg) :keyword) ,arg))))
                  `((cl-defun ,client-fn-name (client connection sender-id
                                                      recipient-id ,@args-list)
                      ,(format "Sends a %S RPC." command-name)
                      (let ((command (make-warp-rpc-command
                                      :name ',command-name
-                                     :args (,(intern (format "make-%s"
-                                                             schema-name))
+                                     :args (,(intern (format "make-%s" schema-name))
                                             ,@payload-args))))
-                       (warp:rpc-send (,(intern (format "%s-rpc-system"
-                                                        client-class))
-                                       client)
+                       (warp:rpc-send (,(intern (format "%s-rpc-system" client-class)) client)
                                       connection
                                       :sender-id sender-id
                                       :recipient-id recipient-id
                                       :command command
-                                      ,@(if (plist-get method-options :stream)
-                                            '(:stream t))
-                                      ,@(if (plist-get method-options
-                                                       :fire-and-forget)
+                                      ,@(if (plist-get method-options :stream) '(:stream t))
+                                      ,@(if (plist-get method-options :fire-and-forget)
                                             '(:expect-response nil))))))))
 
              ;; 3. Generate Server-Side Command (optional)
              (when handler-code
-               (let* ((command-name (intern (format ":%s/%s" protocol-name
-                                                    method-name)))
+               (let* ((command-name (intern (format ":%s/%s" protocol-name method-name)))
                       (handler-doc (cadr handler-code))
                       (handler-lambda-args (caddr handler-code))
                       (handler-body (cdddr handler-code)))
@@ -164,8 +148,7 @@ does not represent a formal, discoverable service.
        ;; Generate the client struct after all methods are processed.
        ,@(when client-class
            `((cl-defstruct (,client-class
-                            (:constructor
-                             ,(intern (format "make-%s" client-class)))
+                            (:constructor ,(intern (format "make-%s" client-class)))
                             (:conc-name ,(format "%s-" client-class)))
                ,(format "Client for the %s protocol." protocol-name)
                (rpc-system (cl-assert nil) :type (or null t)))))
@@ -173,16 +156,13 @@ does not represent a formal, discoverable service.
        ;; Generate the handler registration function after all commands.
        (defun ,(intern (format "register-%s-handlers" protocol-name))
            (router ,@handler-group-deps)
-         ,(format "Register all server-side handlers for the %s protocol."
-                  protocol-name)
+         ,(format "Register all server-side handlers for the %s protocol." protocol-name)
          ,@(cl-loop for rpc-def in rpc-definitions
                     when (plist-get (cddr rpc-def) :handler)
                     collect
                     (let* ((method-name (car rpc-def))
-                           (command-name (intern (format ":%s/%s" protocol-name
-                                                         method-name)))
-                           (command-var (intern (format "warp-command-%s"
-                                                        command-name))))
+                           (command-name (intern (format ":%s/%s" protocol-name method-name)))
+                           (command-var (intern (format "warp-command-%s" command-name))))
                       `(warp:command-router-add-route
                         router ',command-name
                         :handler-fn
@@ -192,7 +172,7 @@ does not represent a formal, discoverable service.
                                        command context))))))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Worker-Leader Protocol Schemas & Definition
+;;; Worker-Leader Protocol Schemas & Service Definition
 
 (warp:defschema warp-worker-ready-payload
   ((:constructor make-warp-worker-ready-payload))
@@ -200,7 +180,7 @@ does not represent a formal, discoverable service.
 This schema defines the essential information a new worker must provide
 to the leader to be officially registered and integrated into the cluster.
 
-:Fields:
+Fields:
 - `worker-id` (string): The unique identifier of the new worker.
 - `rank` (integer): The numerical rank of this worker within its pool.
 - `pool-name` (string): The name of the pool this worker belongs to.
@@ -211,14 +191,14 @@ to the leader to be officially registered and integrated into the cluster.
 - `leader-challenge-token` (string): The cryptographic challenge from the leader.
 - `worker-signature` (string): The worker's signature over the challenge token.
 - `worker-public-key` (string): The worker's public key material."
-  (worker-id              nil :type string)
-  (rank                   nil :type (or null integer))
-  (pool-name              nil :type (or null string))
-  (inbox-address          nil :type (or null string))
-  (launch-id              nil :type (or null string))
+  (worker-id nil :type string)
+  (rank nil :type (or null integer))
+  (pool-name nil :type (or null string))
+  (inbox-address nil :type (or null string))
+  (launch-id nil :type (or null string))
   (leader-challenge-token nil :type (or null string))
-  (worker-signature       nil :type (or null string))
-  (worker-public-key      nil :type (or null string)))
+  (worker-signature nil :type (or null string))
+  (worker-public-key nil :type (or null string)))
 
 (warp:defschema warp-worker-heartbeat-payload
   ((:constructor make-warp-worker-heartbeat-payload))
@@ -226,13 +206,12 @@ to the leader to be officially registered and integrated into the cluster.
 This schema defines the data a worker sends to the leader at regular
 intervals to signal that it is still alive and operational.
 
-:Fields:
+Fields:
 - `worker-id` (string): The ID of the worker sending the heartbeat.
-- `status` (symbol): The worker's self-reported health status
-  (e.g., `:healthy`, `:degraded`).
+- `status` (symbol): The worker's self-reported health status.
 - `telemetry` (string): A serialized snapshot of the worker's metrics."
   (worker-id nil :type string)
-  (status    nil :type symbol)
+  (status nil :type symbol)
   (telemetry nil :type (or null string)))
 
 (warp:defschema warp-worker-deregister-payload
@@ -254,59 +233,74 @@ update for a long-running plugin management task initiated by the leader."
           :validate (memq $ '(:pending :in-progress :completed :failed)))
   (details nil :type (or null string)))
 
-(warp:defprotocol worker-leader-protocol
+(warp:defservice-interface :worker-leader-service
   "Defines the essential control plane communication from a worker to its leader.
-
-This protocol is the primary channel for managing the worker lifecycle,
+This service is the primary channel for managing the worker lifecycle,
 including registration and ongoing health monitoring."
+  :methods
+  '((worker-ready (payload)
+     "Handles the initial handshake RPC from a newly launched worker.")
+    (send-heartbeat (payload)
+     "Processes a periodic heartbeat from an active worker."
+     :rpc-options (:fire-and-forget t))
+    (worker-deregister (payload)
+     "Handles a worker's deregistration signal."
+     :rpc-options (:fire-and-forget t))
+    (report-deployment-status (payload)
+     "Handles a worker's status report for a plugin deployment."
+     :rpc-options (:fire-and-forget t))))
 
-  :client-class worker-leader-client
-  :handler-group-deps (bridge)
-  :auto-schema t
+(warp:defservice-implementation :worker-leader-service :default-worker-leader-handler
+  "The default implementation for handling worker-to-leader communication."
+  :requires '(bridge)
 
-  (worker-ready (payload)
-   :doc "Handles the initial handshake RPC from a newly launched worker."
-   :handler (lambda (bridge command _context)
-              "Processes the initial handshake signal.
-:Arguments:
-- `bridge`: The injected `:bridge` component.
-- `command`: The incoming RPC command.
-- `_context`: The RPC context.
-:Returns:
+  (worker-ready (self payload)
+    "Processes the initial handshake signal.
+
+Arguments:
+- `self` (plist): The injected service component instance.
+- `payload` (warp-worker-ready-payload): The handshake data.
+
+Returns:
 - (loom-promise): A promise that resolves on successful registration."
-              (let ((args (warp-rpc-command-args command)))
-                (warp:bridge-handle-worker-ready-signal
-                 bridge (plist-get args :payload)))))
+    (let ((bridge (plist-get self :bridge)))
+      (warp:bridge-handle-worker-ready-signal bridge payload)))
 
-  (send-heartbeat (payload)
-   :doc "Processes a periodic heartbeat from an active worker."
-   :fire-and-forget t
-   :handler (lambda (bridge command _context)
-              "Processes a periodic heartbeat from an active worker.
-:Arguments:
-- `bridge`: The injected `:bridge` component.
-- `command`: The incoming RPC command.
-- `_context`: The RPC context.
-:Returns:
+  (send-heartbeat (self payload)
+    "Processes a periodic heartbeat from an active worker.
+
+Arguments:
+- `self` (plist): The injected service component instance.
+- `payload` (warp-worker-heartbeat-payload): The heartbeat data.
+
+Returns:
 - (loom-promise): A promise that resolves after processing."
-              (let ((args (warp-rpc-command-args command)))
-                (warp:bridge-handle-heartbeat bridge (plist-get args :payload)))))
+    (let ((bridge (plist-get self :bridge)))
+      (warp:bridge-handle-heartbeat bridge payload)))
 
-  (worker-deregister (payload)
-    :doc "Handles a worker's deregistration signal."
-    :fire-and-forget t
-    :handler (lambda (bridge command _context)
-               "Processes a deregistration signal from a worker."
-               (let ((args (warp-rpc-command-args command)))
-                 (warp:bridge-handle-worker-deregister bridge (plist-get args :payload)))))
+  (worker-deregister (self payload)
+    "Processes a deregistration signal from a worker.
 
-  (report-deployment-status (payload)
-    :doc "Handles a worker's status report for a plugin deployment."
-    :fire-and-forget t
-    :handler (lambda (bridge command _context)
-               "Processes a status update for a plugin deployment from a worker."
-               (let ((args (warp-rpc-command-args command)))
-                 (warp:bridge-handle-deployment-status-report bridge (plist-get args :payload))))))
+Arguments:
+- `self` (plist): The injected service component instance.
+- `payload` (warp-worker-deregister-payload): The deregistration data.
+
+Returns:
+- (loom-promise): A promise that resolves after processing."
+    (let ((bridge (plist-get self :bridge)))
+      (warp:bridge-handle-worker-deregister bridge payload)))
+
+  (report-deployment-status (self payload)
+    "Processes a status update for a plugin deployment from a worker.
+
+Arguments:
+- `self` (plist): The injected service component instance.
+- `payload` (warp-worker-deployment-status-payload): The status report.
+
+Returns:
+- (loom-promise): A promise that resolves after processing."
+    (let ((bridge (plist-get self :bridge)))
+      (warp:bridge-handle-deployment-status-report bridge payload))))
 
 (provide 'warp-protocol)
 ;;; warp-protocol.el ends here

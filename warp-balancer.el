@@ -2,43 +2,84 @@
 
 ;;; Commentary:
 ;;
-;; This module provides a sophisticated, extensible, and thread-safe
-;; system for applying load balancing strategies. It is built on a
-;; polymorphic, registry-based architecture that fully decouples the
-;; core balancing logic from the specific algorithms it employs.
+;; This module provides a high-performance, extensible load balancing system for
+;; distributing requests across a set of nodes (e.g., servers, workers). It is
+;; designed to be both powerful and flexible, supporting everything from simple
+;; round-robin to sophisticated, real-time health-aware routing.
 ;;
-;; ## The "How" and "Why" of Warp-Balancer
+;; ## The "Why": The Need for Intelligent Traffic Distribution
 ;;
-;; **1. Centralized State Management**: All mutable global state is
-;; consolidated within a single `warp-balancer` struct. This approach
-;; simplifies the system by providing a single source of truth for
-;; counters, caches, and locks. It eliminates the risk of scattered
-;; state and makes the system's behavior easier to reason about,
-;; particularly in a concurrent environment.
+;; In any distributed system with more than one server, a critical question
+;; arises: when a new request arrives, which server should handle it? Making this
+;; decision intelligently is the core purpose of a load balancer. The goals are
+;; to:
 ;;
-;; **2. Polymorphism over Dispatching**: The core of the design is the
-;; **Strategy Pattern**. Instead of using a central `pcase` to select an
-;; algorithm, the `warp-balancer-strategy` object itself holds a
-;; reference to the selection function. The main `warp:balance` function
-;; is completely decoupled from the specific algorithm, simply invoking
-;; the function stored within the strategy object. This makes the system
-;; infinitely extensible, as new algorithms can be added without ever
-;; touching the core balancing logic.
+;; - **Ensure Reliability and Availability**: By distributing load, we prevent
+;;   any single node from becoming overwhelmed. If a node fails, the balancer
+;;   can automatically redirect traffic to healthy ones, maintaining service
+;;   uptime.
+;; - **Maximize Performance and Efficiency**: By routing requests to the least
+;;   busy or fastest-responding nodes, we can significantly reduce latency and
+;;   ensure that all available computing resources are used effectively.
+;; - **Enable Scalability**: A load balancer is the entry point that allows a
+;;   system to scale horizontally by seamlessly adding more nodes to the pool.
 ;;
-;; **3. Declarative Registration**: New algorithms are defined using the
-;; `warp:defbalancer-algorithm` macro. This macro handles both the
-;; function definition and its registration in a central registry. It
-;; is a powerful, declarative mechanism that allows new strategies to
-;; be added from any module in the system, turning the load balancer
-;; into a pluggable, dynamic component.
+;; ## The "How": A Decoupled, Strategy-Based Architecture
 ;;
-;; **4. The "Power of Two Choices" (P2C)**: For performance-sensitive
-;; balancing strategies like `:least-connections` and `:least-latency`,
-;; this module leverages the P2C algorithm. This technique selects two
-;; random nodes and chooses the best one, dramatically reducing the
-;; computational overhead of finding the absolute best node while
-;; providing near-optimal load distribution. It's a pragmatic approach
-;; to solving a computationally expensive problem.
+;; This module's design is centered on a clean separation of concerns, making it
+;; highly modular and extensible.
+;;
+;; 1.  **The Strategy Pattern**: The core logic is decoupled from the specific
+;;     balancing algorithms. The main function, `warp:balance`, is an
+;;     orchestrator; it does not contain any specific algorithm like
+;;     "round-robin". Instead, it is given a `warp-balancer-strategy` object
+;;     which holds a direct reference to the function implementing the desired
+;;     algorithm (the "strategy"). This means new algorithms can be plugged in
+;;     from anywhere without ever modifying the core balancer code.
+;;
+;; 2.  **The Internal State Wrapper (Adapter Pattern)**: The balancer does not
+;;     operate on your application's raw node objects directly. Instead, it
+;;     uses an internal, standardized wrapper struct:
+;;     `warp-balancer--internal-node-state`. This is a crucial abstraction that:
+;;     - **Decouples**: The balancing algorithms work with this consistent
+;;       internal view, not your specific application's data structures.
+;;     - **Caches State**: It holds a snapshot of real-time metrics (load,
+;;       latency, health score) needed for intelligent decisions.
+;;     The strategy object is configured with simple "extractor" functions
+;;     (e.g., `:connection-load-fn`) that tell the balancer how to get a
+;;     metric from your raw node and put it into the internal wrapper.
+;;
+;; 3.  **Centralized, Thread-Safe State**: All mutable state shared across
+;;     different balancing operations (like round-robin counters or consistent
+;;     hashing rings) is managed within a single, central `warp-balancer`
+;;     component. All access to this state is protected by locks, ensuring
+;;     safe concurrent operation.
+;;
+;; ## Key Features and Algorithms
+;;
+;; Beyond basic strategies, this module includes advanced features for modern,
+;; resilient systems:
+;;
+;; - **Health-Aware Balancing**: The most powerful feature is its deep
+;;   integration with the `warp-health` system. The `:health-aware-select`
+;;   algorithm uses a detailed, real-time health score to route requests.
+;;   This creates an adaptive feedback loop where the system automatically
+;;   directs traffic away from nodes that are slow, failing, or overloaded,
+;;   dramatically improving the overall resilience and performance of the
+;;   application.
+;;
+;; - **High-Performance "Least-X" Strategies**: For load-aware strategies like
+;;   `:least-connections` and `:least-latency`, a full scan of all nodes to
+;;   find the "best" one can be slow. This module uses the **"Power of Two
+;;   Choices"** (P2C) optimization: it picks just two random nodes and chooses
+;;   the better one. This provides near-optimal load distribution at a
+;;   fraction of the computational cost (O(1) vs. O(N)).
+;;
+;; - **Session Stickiness with Consistent Hashing**: The `:consistent-hash`
+;;   algorithm ensures that requests related to the same session (e.g., a
+;;   user's shopping cart) are always sent to the same node. This provides
+;;   "stickiness" while minimizing disruption when the set of available nodes
+;;   changes.
 
 ;;; Code:
 
@@ -46,6 +87,7 @@
 (require 's)
 (require 'loom)
 
+(require 'warp-circuit-breaker)
 (require 'warp-log)
 (require 'warp-error)
 (require 'warp-config)
@@ -57,128 +99,110 @@
 (require 'warp-service)
 (require 'warp-component)
 
-;; Forward declaration for the circuit breaker service client
+;; Forward declaration for service clients.
 (cl-deftype circuit-breaker-client () t)
+(cl-deftype balancer-service () t)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
 
 (define-error 'warp-balancer-error
-  "A generic error occurred in the load balancer."
+  "Base error for the Warp load balancer module."
   'warp-error)
 
 (define-error 'warp-balancer-no-healthy-nodes
-  "No healthy nodes were available for selection by the balancer."
+  "Signaled when no available nodes could be selected.
+All nodes failed health checks or were otherwise filtered out."
   'warp-balancer-error)
 
 (define-error 'warp-balancer-invalid-strategy
-  "The provided load balancing strategy configuration is invalid."
+  "The provided load balancing strategy is invalid or misconfigured.
+Signaled if a strategy `type` is unknown or a required key is missing."
   'warp-balancer-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Configuration Definition
+;;; Configuration
 
 (warp:defconfig balancer
-  "Defines the configuration settings for a balancer strategy.
+  "Defines the global configuration for the balancer service.
 
 Fields:
-- `default-virtual-nodes` (integer): Default number of virtual
-  nodes for consistent hashing.
-- `cleanup-interval` (integer): Interval in seconds between
-  automatic cleanup cycles for stale balancer state."
+- `default-virtual-nodes` (integer): Default virtual nodes for consistent
+  hashing. Higher values improve distribution but increase memory usage.
+- `cleanup-interval` (integer): Interval in seconds for the background task
+  that purges stale state (e.g., old round-robin counters).
+- `strategy` (symbol): The default load balancing algorithm to use."
   (default-virtual-nodes 150
    :type integer
-   :doc "Default number of virtual nodes for consistent hashing."
+   :doc "Default virtual nodes for consistent hashing."
    :validate (and (integerp $) (> $ 0)))
   (cleanup-interval 300
    :type integer
-   :doc "Interval in seconds between automatic cleanup cycles for
-         stale balancer state."
-   :validate (and (integerp $) (>= $ 0))))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Core Balancer Struct and Component
-
-(cl-defstruct (warp-balancer
-               (:constructor warp-balancer-create)
-               (:copier nil))
-  "The central, thread-safe state container for the load balancer.
-
-This struct consolidates all mutable global state, providing a single
-point of control and locking. This design improves code cohesion and
-eliminates the risk of scattered, unmanaged global state.
-
-Fields:
-- `rr-state` (hash-table): Stores the round-robin counter for
-  each distinct list of nodes.
-- `rr-lock` (loom:lock): Mutex protecting `rr-state`.
-- `ring-cache` (hash-table): Global cache for consistent hash rings.
-- `rings-lock` (loom:lock): Mutex protecting `ring-cache`.
-- `node-states` (hash-table): Internal, global cache for the dynamic
-  state of raw node objects. This is a weak-key hash table.
-- `node-states-lock` (loom:lock): Mutex protecting `node-states`.
-- `last-cleanup-time` (float): Timestamp of the last cleanup cycle.
-- `algorithm-registry` (warp-registry): Registry for balancer
-  algorithms.
-- `config` (warp-balancer-config): Balancer-wide configuration."
-  (rr-state (make-hash-table :test #'equal) :type hash-table)
-  (rr-lock (loom:lock :name "warp-balancer-rr-lock"))
-  (ring-cache (make-hash-table :test #'equal) :type hash-table)
-  (rings-lock (loom:lock :name "warp-balancer-rings-lock"))
-  (node-states (make-hash-table :test #'eq :weakness 'key)
-               :type hash-table)
-  (node-states-lock (loom:lock :name "warp-balancer-nodes-lock"))
-  (last-cleanup-time (float-time) :type float)
-  (algorithm-registry
-   (warp:registry-create :name "balancer-algorithm-registry"))
-  (config (make-warp-balancer-config) :type warp-balancer-config))
-
-(warp:defcomponent balancer-core
-  "The core component that manages the state for load balancing.
-This component is designed to be injected as a dependency into other
-components that require load balancing functionality, ensuring
-that its lifecycle is managed by the `warp-component-system`."
-  :factory (lambda ()
-             (let ((instance (warp-balancer-create)))
-               (warp:log! :info "balancer" "Balancer core initialized.")
-               instance)))
-
-(defun warp:balancer-get-instance (system)
-  "Retrieves the singleton `warp-balancer` struct instance from the
-component system.
-
-Arguments:
-- `system` (warp-component-system): The component system instance.
-
-Returns:
-- (warp-balancer): The central balancer state object."
-  (warp:component-system-get system :balancer-core))
+   :doc "Interval in seconds for purging stale cached state."
+   :validate (and (integerp $) (>= $ 0)))
+  (strategy :health-aware-select
+            :type symbol
+            :doc "The default load balancing algorithm to use."))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definitions
 
+(cl-defstruct (warp-balancer
+               (:constructor %%make-balancer-unmanaged)
+               (:copier nil))
+  "The central, thread-safe state container for the load balancer system.
+
+This struct consolidates all mutable state, providing a single point of
+control and locking. This design improves code cohesion, simplifies state
+management, and eliminates the risk of scattered, unmanaged global state.
+
+Fields:
+- `rr-state` (hash-table): Caches `{node-set-hash . (counter . timestamp)}`
+  for the `:round-robin` algorithm.
+- `rr-lock` (loom:lock): Mutex protecting `rr-state`.
+- `ring-cache` (hash-table): Caches pre-computed consistent hash rings.
+- `rings-lock` (loom:lock): Mutex protecting `ring-cache`.
+- `node-states` (hash-table): Caches internal state wrappers for raw nodes.
+- `node-states-lock` (loom:lock): Mutex protecting `node-states`.
+- `last-cleanup-time` (float): Timestamp of the last cleanup cycle.
+- `cleanup-poll` (loom-poll): Background task for state cleanup.
+- `algorithm-registry` (warp-registry): Registry for all balancer algorithms.
+- `config` (warp-balancer-config): Global balancer configuration."
+  (rr-state (make-hash-table :test #'equal) :type hash-table)
+  (rr-lock (loom:lock :name "warp-balancer-rr-lock"))
+  (ring-cache (make-hash-table :test #'equal) :type hash-table)
+  (rings-lock (loom:lock :name "warp-balancer-rings-lock"))
+  (node-states (make-hash-table :test #'eq :weakness 'key) :type hash-table)
+  (node-states-lock (loom:lock :name "warp-balancer-nodes-lock"))
+  (last-cleanup-time (float-time) :type float)
+  (cleanup-poll nil :type (or null loom-poll))
+  (algorithm-registry
+   (warp:registry-create :name "balancer-algorithm-registry"))
+  (config (make-warp-balancer-config) :type warp-balancer-config))
+
 (cl-defstruct (warp-balancer--internal-node-state
                (:constructor %%make-internal-node-state)
                (:copier nil))
-  "An internal state-tracking wrapper for a single raw node object.
-This mutable object holds all real-time metrics and state needed
-by balancing algorithms, such as health, load, and latency.
+  "An internal, mutable wrapper for a raw application node object.
+
+This struct is the balancer's internal view of a node. It caches all
+real-time metrics (health, load, latency) needed by balancing algorithms,
+decoupling them from the application's specific node object structure.
 
 Fields:
-- `raw-node` (any): The original application-specific node object.
-- `healthy` (boolean): `t` if the node is considered healthy.
-- `connection-load` (integer): The number of active connections.
-- `latency` (float): The average response time or latency.
-- `queue-depth` (integer): The number of pending requests.
-- `initial-weight` (float): The node's configured weight.
-- `last-selected` (float): Timestamp of the last time this node was
-  selected.
-- `selection-count` (integer): Total number of times this node has
-  been selected.
-- `last-access-time` (float): Timestamp of the last state update.
-- `swrr-current-weight` (float): Current weight for SWRR algorithm.
-- `swrr-effective-weight` (float): Effective weight for SWRR
-  algorithm."
+- `raw-node` (any): The original, opaque application node object.
+- `healthy` (boolean): `t` if the node is considered available for selection.
+- `connection-load` (integer): Number of active connections.
+- `latency` (float): Average response time.
+- `queue-depth` (integer): Number of pending requests in a queue.
+- `initial-weight` (float): The node's configured static weight.
+- `last-selected` (float): Timestamp of the last selection.
+- `selection-count` (integer): Lifetime counter of selections.
+- `last-access-time` (float): Timestamp of the last metric update.
+- `swrr-current-weight` (float): Dynamic weight for SWRR algorithm.
+- `swrr-effective-weight` (float): Effective weight for SWRR algorithm.
+- `total-failures` (integer): Lifetime counter of failures.
+- `health-score` (warp-connection-health-score): Detailed health score."
   (raw-node nil :read-only t)
   (healthy t :type boolean)
   (connection-load 0 :type integer)
@@ -189,35 +213,33 @@ Fields:
   (selection-count 0 :type integer)
   (last-access-time 0.0 :type float)
   (swrr-current-weight 0.0 :type float)
-  (swrr-effective-weight 1.0 :type float))
+  (swrr-effective-weight 1.0 :type float)
+  (total-failures 0 :type integer)
+  (health-score (make-warp-connection-health-score)))
 
 (cl-defstruct (warp-balancer-strategy
                (:constructor %%make-balancer-strategy)
                (:copier nil))
-  "A comprehensive, immutable configuration object for a load
-balancing strategy. This object encapsulates both the configuration
-and the actual selection logic.
+  "An immutable object for a complete load balancing strategy.
+
+This object encapsulates both the configuration for a strategy (e.g.,
+metric extractor functions) and a direct reference to the function that
+implements the selection algorithm.
 
 Fields:
-- `type` (symbol): The primary load balancing algorithm
-  (e.g., `:round-robin`).
-- `config` (plist): A plist of configuration parameters and data
-  extractor functions required by the chosen strategy.
-- `selection-fn` (function): The actual function that implements the
-  selection algorithm. This is the core of the Strategy Pattern.
-- `health-check-fn` (function, optional): A function `(lambda (raw-node))`
-  that returns non-nil if the node is healthy.
-- `fallback-strategy` (symbol, optional): A simpler strategy
-  (e.g., `:random`) to use if the primary strategy fails to select
-  a node.
-- `settings` (warp-balancer-config): A `warp-balancer-config` object
-  holding settings like cleanup intervals for this specific strategy.
-- `circuit-breaker-policy` (symbol, optional): The circuit breaker
-  policy to use for health checks."
+- `type` (symbol): Keyword identifying the algorithm (e.g., `:random`).
+- `config` (plist): Configuration and data extractor functions.
+- `selection-fn` (function): Direct reference to the selection algorithm.
+- `health-check-fn` (function, optional): Legacy boolean health check.
+- `health-score-fn` (function, optional): Modern, detailed health score fn.
+- `fallback-strategy` (symbol, optional): Strategy to use if primary fails.
+- `settings` (warp-balancer-config): Strategy-specific config overrides.
+- `circuit-breaker-policy` (symbol, optional): CB policy for nodes."
   (type nil :type symbol :read-only t)
   (config nil :type plist)
   (selection-fn nil :type function :read-only t)
   (health-check-fn nil :type (or null function))
+  (health-score-fn nil :type (or null function))
   (fallback-strategy nil :type (or null symbol))
   (settings (make-warp-balancer-config) :type warp-balancer-config)
   (circuit-breaker-policy nil :type (or null symbol)))
@@ -225,182 +247,263 @@ Fields:
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Private Functions
 
-(defun warp--balancer-hash-raw-nodes (raw-nodes node-key-fn)
-  "Generate a stable, consistent hash for a list of raw node objects.
+;;;---------------------------------------------------------------------
+;;; Utilities
+;;;---------------------------------------------------------------------
 
-This is critical for caching mechanisms. It ensures the same set of
-nodes, regardless of order, always produces the same hash value by
-sorting the nodes based on their unique key before hashing.
+(defun warp--balancer-hash-raw-nodes (raw-nodes node-key-fn)
+  "Generate a stable hash for a set of `RAW-NODES`.
+
+This is critical for caching. To use a list of nodes as a cache key, the
+key must be identical regardless of node order. This is achieved by
+sorting the nodes by a stable key (`NODE-KEY-FN`) before hashing.
 
 Arguments:
-- `RAW-NODES` (list): A list of raw node objects.
-- `NODE-KEY-FN` (function): A function `(lambda (raw-node))` that
-  returns a unique, stable string key for a raw node.
+- `RAW-NODES` (list): A list of raw application node objects.
+- `NODE-KEY-FN` (function): Returns a unique, stable string identifier.
 
 Returns:
 - (integer): A hash value representing the unique set of `RAW-NODES`."
   (sxhash (mapcar (lambda (n) (format "%S" (funcall node-key-fn n)))
-                  ;; Sorting by a stable key is essential for consistency.
+                  ;; Sorting ensures the hash is consistent even if the
+                  ;; input list order changes.
                   (sort (copy-sequence raw-nodes) #'string<
                         :key node-key-fn))))
 
-(defun warp-balancer--get-internal-node-state (balancer raw-node strategy time)
-  "Retrieve or create an internal state wrapper for a raw node object.
-
-This function is the primary bridge between the application's node
-objects and the balancer's internal, stateful view. It finds or
-creates a `warp-balancer--internal-node-state` struct for the
-given `RAW-NODE` and updates its cached metrics by calling the
-accessor functions provided in the `STRATEGY` config.
-
-Arguments:
-- `BALANCER` (warp-balancer): The central balancer state object.
-- `RAW-NODE` (any): The original application-specific node object.
-- `STRATEGY` (warp-balancer-strategy): The strategy configuration,
-  containing the necessary accessor functions.
-- `TIME` (float): The current timestamp.
-
-Returns:
-- (warp-balancer--internal-node-state): The internal state wrapper
-  for `RAW-NODE`, updated with the latest metrics."
-  (let* ((state (loom:with-mutex! (warp-balancer-node-states-lock balancer)
-                  (or (gethash raw-node (warp-balancer-node-states balancer))
-                      (let ((new-state (%%make-internal-node-state
-                                        :raw-node raw-node)))
-                        (puthash raw-node new-state
-                                 (warp-balancer-node-states balancer))
-                        new-state))))
-         (config (warp-balancer-strategy-config strategy)))
-    ;; Update dynamic metrics by calling the extractor functions from the config.
-    (when-let (fn (warp-balancer-strategy-health-check-fn strategy))
-      (setf (warp-balancer--internal-node-state-healthy state)
-            (funcall fn raw-node)))
-    (when-let (fn (plist-get config :connection-load-fn))
-      (setf (warp-balancer--internal-node-state-connection-load state)
-            (or (funcall fn raw-node) 0)))
-    (when-let (fn (plist-get config :latency-fn))
-      (setf (warp-balancer--internal-node-state-latency state)
-            (or (funcall fn raw-node) 0.0)))
-    (when-let (fn (plist-get config :queue-depth-fn))
-      (setf (warp-balancer--internal-node-state-queue-depth state)
-            (or (funcall fn raw-node) 0)))
-    (when-let (fn (plist-get config :initial-weight-fn))
-      (setf (warp-balancer--internal-node-state-initial-weight state)
-            (or (funcall fn raw-node) 1.0)))
-    ;; Handle specific updates for the Smooth Weighted Round Robin algorithm.
-    (when (eq (warp-balancer-strategy-type strategy)
-              :smooth-weighted-round-robin)
-      (when-let (fn (plist-get config :dynamic-effective-weight-fn))
-        (setf (warp-balancer--internal-node-state-swrr-effective-weight
-               state)
-              (or (funcall fn raw-node)
-                  (warp-balancer--internal-node-state-initial-weight
-                   state)))))
-    (setf (warp-balancer--internal-node-state-last-access-time state)
-          time)
-    state))
-
-(defun warp--balancer-cleanup-stale-state (balancer strategy)
-  "Perform periodic cleanup of unused balancer state.
-
-This prevents memory leaks from long-lived state related to nodes
-that are no longer in use. The cleanup interval is sourced from the
-provided `STRATEGY`.
-
-Arguments:
-- `BALANCER` (warp-balancer): The central balancer state object.
-- `STRATEGY` (warp-balancer-strategy): The strategy whose settings
-  should be used for cleanup.
-
-Returns:
-- `nil`."
-  (let* ((now (float-time))
-         (settings (warp-balancer-strategy-settings strategy))
-         (interval (warp-balancer-config-cleanup-interval settings)))
-    (when (> (- now (warp-balancer-last-cleanup-time balancer))
-             interval)
-      (let ((threshold (- now interval)))
-        ;; Remove stale round-robin counters.
-        (loom:with-mutex! (warp-balancer-rr-lock balancer)
-          (maphash (lambda (k v) (when (< (cdr v) threshold)
-                                   (remhash k (warp-balancer-rr-state
-                                               balancer))))
-                   (warp-balancer-rr-state balancer)))
-        ;; Remove stale consistent hash rings.
-        (loom:with-mutex! (warp-balancer-rings-lock balancer)
-          (maphash (lambda (k v) (when (< (cdr v) threshold)
-                                   (remhash k
-                                            (warp-balancer-ring-cache
-                                             balancer))))
-                   (warp-balancer-ring-cache balancer))))
-      (setf (warp-balancer-last-cleanup-time balancer) now))))
-
-(defun warp--balancer-get-healthy-nodes (balancer raw-nodes strategy)
-  "A helper function that performs all the work to transform a list
-of raw nodes into a list of healthy, internal nodes with up-to-date
-state. This refactors complex logic out of the main `warp:balance`
-function, adhering to the Single Responsibility Principle.
-
-Arguments:
-- `BALANCER` (warp-balancer): The central balancer state object.
-- `RAW-NODES` (list): The original list of application node objects.
-- `STRATEGY` (warp-balancer-strategy): The strategy configuration.
-
-Returns:
-- (list): A list of healthy `internal-node-state` objects."
-  (let* ((time (float-time))
-         (internal-nodes
-          (cl-loop for n in raw-nodes
-                   for state = (warp-balancer--get-internal-node-state
-                                balancer n strategy time)
-                   collect state)))
-    (cl-remove-if-not #'warp-balancer--internal-node-state-healthy
-                      internal-nodes)))
+;;;---------------------------------------------------------------------
+;;; Node Selection
+;;;---------------------------------------------------------------------
 
 (defun warp--balancer-select-by-load (nodes load-fn)
   "Select a node by comparing the load of two random choices (P2C).
 
-This is a highly efficient algorithm for 'least-X' strategies. Instead
-of scanning all nodes, it picks two at random and chooses the
-better of the two, drastically reducing complexity while providing
-near-optimal load distribution.
+This is a highly efficient O(1) algorithm for 'least-X' strategies.
+Instead of an O(N) scan of all nodes, it picks two at random and
+chooses the better one, providing near-optimal distribution.
 
 Arguments:
-- `NODES` (list): The list of healthy `internal-node-state` objects.
-- `LOAD-FN` (function): A function that takes an internal-node-state
-  and returns its load metric.
+- `NODES` (list): The list of healthy internal node state objects.
+- `LOAD-FN` (function): Returns a load metric (e.g., connections).
 
 Returns:
 - (warp-balancer--internal-node-state): The selected internal node."
   (if (<= (length nodes) 1)
       (car nodes)
-    (let* ((idx1 (random (length nodes)))
-           (idx2 (random (length nodes))))
+    (let* ((len (length nodes))
+           (idx1 (random len))
+           (idx2 (random len)))
       ;; Ensure two distinct indices for a meaningful comparison.
       (when (= idx2 idx1)
-        (setq idx2 (mod (1+ idx1) (length nodes))))
+        (setq idx2 (mod (1+ idx1) len)))
       (let ((node1 (nth idx1 nodes))
             (node2 (nth idx2 nodes)))
+        ;; Return the node with the lower load value.
         (if (<= (funcall load-fn node1) (funcall load-fn node2))
             node1
           node2)))))
 
+(defun warp--balancer-get-healthy-nodes (balancer raw-nodes strategy)
+  "Transform a list of raw nodes into a list of healthy internal nodes.
+
+This orchestrates the preparation of nodes for selection. It maps over
+the raw node list, gets the internal state for each, updates its
+metrics, and filters the list down to only the healthy nodes.
+
+Arguments:
+- `BALANCER` (warp-balancer): The central balancer state object.
+- `RAW-NODES` (list): The list of application node objects.
+- `STRATEGY` (warp-balancer-strategy): The strategy configuration.
+
+Returns:
+- (loom-promise): A promise resolving with a list of healthy internal
+  nodes."
+  (braid! (loom:all
+           (cl-loop for n in raw-nodes
+                    collect (warp-balancer--get-internal-node-state
+                             balancer n strategy)))
+    (:then (internal-nodes)
+      (cl-remove-if-not #'warp-balancer--internal-node-state-healthy
+                        internal-nodes))))
+
+;;;---------------------------------------------------------------------
+;;; Node State Management
+;;;---------------------------------------------------------------------
+
+(defun warp-balancer--get-internal-node-state (balancer raw-node strategy)
+  "Retrieve or create an internal state wrapper for a `RAW-NODE`.
+
+This is the bridge between the application's opaque node objects and the
+balancer's internal, stateful view. It finds or creates the internal
+state object and updates its cached metrics based on the `STRATEGY`.
+
+Arguments:
+- `BALANCER` (warp-balancer): The central balancer state object.
+- `RAW-NODE` (any): The original application-specific node object.
+- `STRATEGY` (warp-balancer-strategy): The strategy configuration.
+
+Returns:
+- (loom-promise): Promise resolving with the updated internal node state."
+  (let* ((state
+          ;; Find or create the internal state object in a thread-safe way.
+          (loom:with-mutex! (warp-balancer-node-states-lock balancer)
+            (or (gethash raw-node (warp-balancer-node-states balancer))
+                (let ((new-state
+                       (%%make-internal-node-state :raw-node raw-node)))
+                  (puthash raw-node new-state
+                           (warp-balancer-node-states balancer))
+                  new-state))))
+         (config (warp-balancer-strategy-config strategy))
+         (health-score-fn (warp-balancer-strategy-health-score-fn strategy))
+         (health-check-fn (warp-balancer-strategy-health-check-fn strategy)))
+
+    (braid! (loom:resolved! t)
+      (:then (lambda (_)
+        ;; Update dynamic metrics by calling the extractor functions
+        ;; defined in the strategy's configuration.
+        (when-let (fn (plist-get config :connection-load-fn))
+          (setf (warp-balancer--internal-node-state-connection-load state)
+                (or (funcall fn raw-node) 0)))
+        (when-let (fn (plist-get config :latency-fn))
+          (setf (warp-balancer--internal-node-state-latency state)
+                (or (funcall fn raw-node) 0.0)))
+        (when-let (fn (plist-get config :queue-depth-fn))
+          (setf (warp-balancer--internal-node-state-queue-depth state)
+                (or (funcall fn raw-node) 0)))
+        (when-let (fn (plist-get config :initial-weight-fn))
+          (setf (warp-balancer--internal-node-state-initial-weight state)
+                (or (funcall fn raw-node) 1.0)))
+
+        ;; Update health, preferring the modern health score function.
+        (if health-score-fn
+            (progn
+              (setf (warp-balancer--internal-node-state-health-score state)
+                    (loom:await (funcall health-score-fn raw-node)))
+              (setf (warp-balancer--internal-node-state-healthy state)
+                    (>= (warp-connection-health-score-overall-score
+                         (warp-balancer--internal-node-state-health-score
+                          state))
+                        0.5)))
+          ;; Fallback to the legacy boolean health check function.
+          (when health-check-fn
+            (setf (warp-balancer--internal-node-state-healthy state)
+                  (funcall health-check-fn raw-node))))
+
+        ;; Update weights for the Smooth Weighted Round Robin algorithm.
+        (when (eq (warp-balancer-strategy-type strategy)
+                  :smooth-weighted-round-robin)
+          (when-let (fn (plist-get config :dynamic-effective-weight-fn))
+            (setf (warp-balancer--internal-node-state-swrr-effective-weight
+                   state)
+                  (or (funcall fn raw-node)
+                      (warp-balancer--internal-node-state-initial-weight
+                       state)))))
+        ;; Timestamp the update for cache cleanup purposes.
+        (setf (warp-balancer--internal-node-state-last-access-time state)
+              (float-time))
+        state))))
+
+(defun warp--balancer-cleanup-stale-state (balancer)
+  "Perform periodic cleanup of cached state to prevent memory leaks.
+
+State like round-robin counters and consistent hash rings are keyed by
+the set of nodes they apply to. If a node set is no longer in use, this
+cached state becomes stale. This background task purges old entries.
+
+Arguments:
+- `BALANCER` (warp-balancer): The central balancer state object.
+
+Returns: `nil`."
+  (let* ((now (float-time))
+         (interval (warp-balancer-config-cleanup-interval
+                    (warp-balancer-config balancer)))
+         (threshold (- now interval)))
+    (warp:log! :debug "balancer" "Running stale state cleanup.")
+    ;; Purge stale round-robin counters.
+    (loom:with-mutex! (warp-balancer-rr-lock balancer)
+      (maphash (lambda (k v)
+                 (when (< (cdr v) threshold)
+                   (remhash k (warp-balancer-rr-state balancer))))
+               (warp-balancer-rr-state balancer)))
+    ;; Purge stale consistent hash rings.
+    (loom:with-mutex! (warp-balancer-rings-lock balancer)
+      (maphash (lambda (k v)
+                 (when (< (cdr v) threshold)
+                   (remhash k (warp-balancer-ring-cache balancer))))
+               (warp-balancer-ring-cache balancer)))
+    (setf (warp-balancer-last-cleanup-time balancer) now)
+    nil))
+
+;;;---------------------------------------------------------------------
+;;; Component Helpers
+;;;---------------------------------------------------------------------
+
+(defun warp-balancer--create ()
+  "Create and initialize a new `warp-balancer` component instance.
+
+This factory function sets up the core state object and starts the
+background cleanup task, making the instance ready for use.
+
+Returns:
+- (warp-balancer): A new, fully initialized balancer instance."
+  (let ((instance (%%make-balancer-unmanaged)))
+    (let* ((interval (warp-balancer-config-cleanup-interval
+                      (warp-balancer-config instance)))
+           (poll (loom:poll-create
+                  :name "warp-balancer-cleanup-poll"
+                  :interval interval
+                  :task (lambda ()
+                          (warp--balancer-cleanup-stale-state instance)))))
+      (setf (warp-balancer-cleanup-poll instance) poll)
+      (loom:poll-start poll))
+    instance))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
+;;;---------------------------------------------------------------------
+;;; Component Definition & Management
+;;;---------------------------------------------------------------------
+
+(warp:defcomponent balancer-core
+  "The core component managing state and lifecycle for load balancing.
+
+This component is injected as a dependency into services that need load
+balancing. It ensures its state is initialized on startup and its
+background tasks are cleanly shut down."
+  :factory #'warp-balancer--create
+  :destructor (lambda (instance)
+                (when-let (poll (warp-balancer-cleanup-poll instance))
+                  (loom:poll-shutdown poll))))
+
 ;;;###autoload
-(defmacro warp:defbalancer-algorithm (name args docstring &body body)
-  "Defines and registers a load balancing algorithm in the central
-registry. This is the primary mechanism for extending the load
-balancer. It creates a selection function and registers it, making
-it available to `warp:balancer-strategy-create`.
+(defun warp:balancer-get-instance (system)
+  "Retrieve the singleton `warp-balancer` instance from the `SYSTEM`.
 
 Arguments:
-- `NAME` (keyword): The unique keyword to identify this algorithm.
-- `ARGS` (list): The argument list for the selection function. Must
-  conform to `(strategy nodes raw-nodes &key session-id)`.
+- `SYSTEM` (warp-component-system): The active component system.
+
+Returns:
+- (warp-balancer): The central balancer state object."
+  (warp:component-system-get system :balancer-core))
+
+;;;---------------------------------------------------------------------
+;;; Balancing Algorithm Definition
+;;;---------------------------------------------------------------------
+
+;;;###autoload
+(defmacro warp:defbalancer-algorithm (name args docstring &body body)
+  "Define a load balancing algorithm and register it in the central registry.
+
+This is the primary mechanism for extending the load balancer. It creates a
+selection function and registers it under `NAME`, making it available to
+`warp:balancer-strategy-create`.
+
+Arguments:
+- `NAME` (keyword): The unique keyword for this algorithm.
+- `ARGS` (list): The argument list for the selection function, which must
+  be `(strategy nodes raw-nodes &key session-id)`.
 - `DOCSTRING` (string): Documentation for the algorithm.
-- `BODY` (forms): The implementation of the selection logic.
+- `BODY` (forms): The Lisp code implementing the selection logic.
 
 Returns:
 - `NAME` (keyword): The keyword that was registered."
@@ -408,78 +511,101 @@ Returns:
                                  (symbol-name name)))))
     `(progn
        (defun ,fn-name ,args ,docstring ,@body)
-       (let ((balancer (warp:balancer-get-instance (current-component-system))))
-         (warp:registry-add
-          (warp-balancer-algorithm-registry balancer)
-          ,name #',fn-name :overwrite-p t))
+       (let ((balancer (warp:balancer-get-instance
+                        (current-component-system))))
+         (warp:registry-add (warp-balancer-algorithm-registry balancer)
+                            ,name #',fn-name :overwrite-p t))
        ',name)))
 
+;;;---------------------------------------------------------------------
+;;; Balancing Strategy Creation
+;;;---------------------------------------------------------------------
+
 ;;;###autoload
-(cl-defun warp:balancer-strategy-create (system &key type
-                                              config
-                                              health-check-fn
+(cl-defun warp:balancer-strategy-create (system &key type config
+                                              health-check-fn health-score-fn
                                               fallback-strategy
+                                              circuit-breaker-policy
                                               cleanup-interval
-                                              default-virtual-nodes
-                                              circuit-breaker-policy)
+                                              default-virtual-nodes)
   "Create a new, configured `warp-balancer-strategy` instance.
 
-This function looks up the requested algorithm `TYPE` in the registry
-and embeds the corresponding function into the returned strategy
-object.
+This factory is the main entry point for building a strategy. It looks up
+the algorithm `TYPE` in the registry and embeds the corresponding
+selection function into the returned strategy object.
 
 Arguments:
 - `system` (warp-component-system): The component system instance.
-- `:type` (symbol): The load balancing algorithm (e.g., `:random`).
-- `:config` (plist): A plist of data extractor functions required by
-  the chosen strategy.
-- `:health-check-fn` (function, optional): A function `(lambda (raw-node))`
-  that returns non-nil if the node is healthy.
-- `:fallback-strategy` (symbol, optional): A simpler strategy
-  (e.g., `:random`) to use if the primary strategy fails.
-- `:cleanup-interval` (integer, optional): This strategy's cleanup interval.
-- `:default-virtual-nodes` (integer, optional): This strategy's default
-  virtual nodes for consistent hashing.
-- `:circuit-breaker-policy` (symbol, optional): A registered circuit breaker
-  policy to use for health checks.
-- `:circuit-breaker-client` (circuit-breaker-client, optional): The client to
-  the `circuit-breaker-service`.
+- `:type` (symbol): The algorithm to use (e.g., `:random`).
+- `:config` (plist): A plist of data extractor functions.
+- `:health-check-fn` (function, optional): Legacy health check function.
+- `:health-score-fn` (function, optional): Preferred health score fn.
+- `:fallback-strategy` (symbol, optional): A simpler fallback strategy.
+- `:circuit-breaker-policy` (symbol, optional): CB policy for nodes.
+- `:cleanup-interval` (integer, optional): Override global cleanup interval.
+- `:default-virtual-nodes` (integer, optional): Override virtual nodes.
 
 Returns:
-- (warp-balancer-strategy): A new, configured strategy instance."
+- (warp-balancer-strategy): A new, configured, and immutable strategy."
   (let* ((balancer (warp:balancer-get-instance system))
          (registry (warp-balancer-algorithm-registry balancer))
          (selection-fn (warp:registry-get registry type))
-         (final-config (copy-list config))
-         (settings (apply #'make-warp-balancer-config
-                          (append (list :cleanup-interval cleanup-interval
-                                        :default-virtual-nodes default-virtual-nodes)
-                                  '()))))
+         (settings
+          (apply #'make-warp-balancer-config
+                 (append (list :cleanup-interval cleanup-interval
+                               :default-virtual-nodes default-virtual-nodes)
+                         '()))))
     (unless selection-fn
       (error 'warp-balancer-invalid-strategy
-             (format "Unknown or unregistered strategy type: %S" type)))
+             (format "Unknown strategy type: %S" type)))
     (%%make-balancer-strategy :type type
-                              :config final-config
+                              :config (copy-list config)
                               :selection-fn selection-fn
                               :health-check-fn health-check-fn
+                              :health-score-fn health-score-fn
                               :fallback-strategy fallback-strategy
                               :settings settings
                               :circuit-breaker-policy circuit-breaker-policy)))
 
 ;;;###autoload
-(cl-defun warp:balance (balancer raw-nodes strategy &key session-id)
-  "Select a single node from a list using the provided strategy.
+(defmacro warp:defbalancer-strategy (name docstring &rest plist)
+  "Define a named, reusable `warp-balancer-strategy` as a global constant.
 
-This is the main entry point for the load balancer. It is fully
-abstracted from the underlying algorithm; it simply invokes the
-`selection-fn` stored within the `STRATEGY` object.
+This is a convenience wrapper around `warp:balancer-strategy-create` that
+defines a constant, simplifying the reuse of common configurations.
+
+Arguments:
+- `NAME` (symbol): The variable name for the new constant strategy object.
+- `DOCSTRING` (string): Documentation for the strategy.
+- `PLIST` (plist): A property list of strategy options.
+
+Returns:
+- `NAME` (symbol): The symbol of the defined constant."
+  `(defconst ,name
+     (apply #'warp:balancer-strategy-create (current-component-system)
+            ,plist)
+     ,docstring))
+
+;;;---------------------------------------------------------------------
+;;; Core Balancing API
+;;;---------------------------------------------------------------------
+
+(cl-defun warp:balance (balancer raw-nodes strategy &key session-id)
+  "Select a single node from a list using the provided `STRATEGY`.
+
+This is the main, algorithm-agnostic entry point for the load balancer.
+It orchestrates the balancing process:
+1. Prepares nodes by fetching and updating their internal state.
+2. Filters the list to include only healthy nodes.
+3. Invokes the `selection-fn` from the `STRATEGY` object.
+4. If selection fails, attempts to use the fallback strategy.
+5. On success, updates metrics and returns the original raw node object.
 
 Arguments:
 - `BALANCER` (warp-balancer): The central balancer state object.
-- `RAW-NODES` (list): A non-empty list of application's node objects.
-- `STRATEGY` (warp-balancer-strategy): A strategy object created by
-  `warp:balancer-strategy-create`.
-- `:session-id` (string, optional): Required for `:consistent-hash`.
+- `RAW-NODES` (list): A non-empty list of application node objects.
+- `STRATEGY` (warp-balancer-strategy): A strategy object.
+- `:session-id` (string, optional): A session key for sticky strategies.
 
 Returns:
 - (any): The original `raw-node` object that was selected.
@@ -488,279 +614,179 @@ Signals:
 - `warp-balancer-no-healthy-nodes`: If no healthy nodes are available."
   (unless raw-nodes
     (error "Cannot select from an empty list of nodes"))
-  (warp--balancer-cleanup-stale-state balancer strategy)
-  (let* ((start-time (float-time))
-         ;; Get the list of healthy nodes, preparing their internal state.
-         (healthy-nodes (warp--balancer-get-healthy-nodes balancer raw-nodes strategy))
-         (selected-node nil))
-    (unwind-protect
-        (progn
-          (setq selected-node
-                (or (when healthy-nodes
-                      (funcall (warp-balancer-strategy-selection-fn
-                                strategy)
-                               strategy healthy-nodes raw-nodes
-                               :session-id session-id))
-                    ;; If the main strategy fails, try the fallback.
-                    (when-let (fallback (warp-balancer-strategy-fallback-strategy
-                                         strategy))
-                      (let* ((registry (warp-balancer-algorithm-registry balancer))
-                             (fallback-fn (warp:registry-get registry fallback)))
-                        (when fallback-fn
-                          (funcall fallback-fn strategy healthy-nodes
-                                   raw-nodes :session-id session-id))))
-                    ;; As a last resort, pick the first healthy node.
-                    (car-safe healthy-nodes)))
-          (when selected-node
-            ;; Update the selection metrics for the chosen node.
-            (loom:with-mutex! (warp-balancer-node-states-lock balancer)
-              (setf (warp-balancer--internal-node-state-last-selected
-                     selected-node) start-time)
-              (cl-incf (warp-balancer--internal-node-state-selection-count
-                        selected-node))))
-          (and selected-node
-               (warp-balancer--internal-node-state-raw-node
-                selected-node)))
-      ;; If no node was selected at all, signal an error.
-      (unless selected-node
-        (signal 'warp-balancer-no-healthy-nodes
-                "No healthy nodes were available for selection."))))))
+  (braid! (warp--balancer-get-healthy-nodes balancer raw-nodes strategy)
+    (:then (healthy-nodes)
+      (let ((start-time (float-time))
+            (selected-internal-node nil))
+        (unwind-protect
+            (progn
+              (setq selected-internal-node
+                    (or ;; 1. Attempt selection with the primary strategy.
+                        (when healthy-nodes
+                          (funcall (warp-balancer-strategy-selection-fn
+                                    strategy)
+                                   strategy healthy-nodes raw-nodes
+                                   :session-id session-id))
+                        ;; 2. If that fails, try the fallback strategy.
+                        (when-let (fallback-type
+                                   (warp-balancer-strategy-fallback-strategy
+                                    strategy))
+                          (let* ((registry (warp-balancer-algorithm-registry
+                                            balancer))
+                                 (fallback-fn (warp:registry-get
+                                               registry fallback-type)))
+                            (when fallback-fn
+                              (funcall fallback-fn strategy healthy-nodes
+                                       raw-nodes :session-id session-id))))))
+
+              (if selected-internal-node
+                  (progn
+                    ;; Update selection metrics for the chosen node.
+                    (loom:with-mutex!
+                        (warp-balancer-node-states-lock balancer)
+                      (setf (warp-balancer--internal-node-state-last-selected
+                             selected-internal-node)
+                            start-time)
+                      (cl-incf (warp-balancer--internal-node-state-selection-count
+                                selected-internal-node)))
+                    ;; Return the original application node object.
+                    (warp-balancer--internal-node-state-raw-node
+                     selected-internal-node))
+
+                ;; If no node could be selected, signal an error.
+                (signal 'warp-balancer-no-healthy-nodes
+                        "No healthy nodes were available for selection.")))))))
+
+;;;---------------------------------------------------------------------
+;;; Node Health Management
+;;;---------------------------------------------------------------------
 
 ;;;###autoload
-(defmacro warp:defbalancer-strategy (name docstring &rest plist)
-  "Define a named, reusable `warp-balancer-strategy` object.
+(defun warp:balancer-update-node-health (balancer worker-id health-report)
+  "Update the health status of a node in the balancer's cache.
 
-This macro simplifies the creation and reuse of common load-balancing
-configurations within applications.
+This is a push-based mechanism, used by event handlers to react
+instantly to health changes, rather than waiting for the next pull-based
+update during a `warp:balance` call.
 
 Arguments:
-- `NAME` (symbol): The variable name for the new strategy.
-- `DOCSTRING` (string): Documentation for the strategy.
-- `PLIST` (plist): A property list of strategy options, matching the
-  keys for `warp:balancer-strategy-create`.
+- `balancer` (warp-balancer): The central balancer state object.
+- `worker-id` (string): The unique ID of the worker node.
+- `health-report` (warp-health-report): The new health report.
 
 Returns:
-- `NAME` (symbol): The symbol of the defined constant."
-  `(defconst ,name
-     (apply #'warp:balancer-strategy-create ,plist)
-     ,docstring))
+- `t` if the node was found and updated, `nil` otherwise."
+  (loom:with-mutex! (warp-balancer-node-states-lock balancer)
+    (let ((node-state (cl-find worker-id
+                               (hash-table-values
+                                (warp-balancer-node-states balancer))
+                               :key (lambda (s)
+                                      (when-let (w (warp-balancer--internal-node-state-raw-node s))
+                                        (warp-managed-worker-id w)))
+                               :test #'string=)))
+      (when node-state
+        (setf (warp-balancer--internal-node-state-health-score node-state)
+              health-report)
+        (setf (warp-balancer--internal-node-state-healthy node-state)
+              (eq (warp-health-report-overall-status health-report) :UP))
+        (warp:log! :debug "balancer"
+                   "Updated health for worker '%s' to %S via event."
+                   worker-id
+                   (warp-health-report-overall-status health-report))
+        t))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Core Algorithm Implementations
 
-(warp:defbalancer-algorithm :random 
-  (strategy nodes raw-nodes &key session-id)
-  "Selects a random healthy node from the list.
+(warp:defbalancer-algorithm :random (strategy nodes raw-nodes &key session-id)
+  "Select a random healthy node.
 
-This is the simplest strategy and is useful as a fallback or when
-nodes are homogenous.
-
-Arguments:
-- `STRATEGY` (warp-balancer-strategy): The strategy object (unused).
-- `NODES` (list): The list of healthy `internal-node-state` objects.
-- `RAW-NODES` (list): The original list of raw nodes (unused).
-- `SESSION-ID` (string): The session ID (unused).
-
-Returns:
-- (warp-balancer--internal-node-state): The selected internal node."
+This is the simplest strategy. It's cheap and effective for stateless
+services where nodes are homogenous. Often used as a fallback."
   (declare (ignore strategy raw-nodes session-id))
   (nth (random (length nodes)) nodes))
 
-(warp:defbalancer-algorithm :round-robin 
-  (strategy nodes raw-nodes &key session-id)
-  "Selects the next node in a deterministic, circular order.
+(warp:defbalancer-algorithm :round-robin (strategy nodes raw-nodes
+                                          &key session-id)
+  "Select the next node in a deterministic, circular order.
 
-This strategy guarantees even distribution over time. The counter state
-is maintained globally on a per-node-list basis.
+This strategy guarantees even distribution over time. The counter state is
+maintained globally and keyed by a hash of the node list, ensuring that
+requests for the same set of nodes share the same rotation sequence.
 
-Arguments:
-- `STRATEGY` (warp-balancer-strategy): The strategy object, used to
-  access config for `node-key-fn` and `list-id-fn`.
-- `NODES` (list): The list of healthy `internal-node-state` objects.
-- `RAW-NODES` (list): The original list of raw nodes, used to
-  generate a stable ID for the node list.
-- `SESSION-ID` (string): The session ID (unused).
-
-Returns:
-- (warp-balancer--internal-node-state): The selected internal node."
+Configuration:
+- Requires a `:node-key-fn` in the strategy's `:config` plist to return a
+  unique string ID for a raw node."
   (declare (ignore session-id))
   (let* ((balancer (warp:balancer-get-instance (current-component-system)))
          (config (warp-balancer-strategy-config strategy))
          (node-key-fn (plist-get config :node-key-fn))
-         (list-id-fn (plist-get config :list-id-fn))
-         (list-id (funcall list-id-fn raw-nodes))
-         ;; Sort the nodes by their key to ensure the round-robin order is
-         ;; consistent and deterministic regardless of the input order.
-         (sorted (sort (copy-sequence nodes) #'string<
-                       :key (lambda (s)
-                              (funcall
-                               node-key-fn
-                               (warp-balancer--internal-node-state-raw-node s)))))
+         (list-hash (warp--balancer-hash-raw-nodes raw-nodes node-key-fn))
+         ;; Sort nodes for a consistent, deterministic round-robin order.
+         (sorted-nodes
+          (sort (copy-sequence nodes) #'string<
+                :key (lambda (s)
+                       (funcall node-key-fn
+                                (warp-balancer--internal-node-state-raw-node
+                                 s)))))
          (counter 0))
-    ;; Use a mutex to safely increment the shared counter for this node list.
+    ;; Safely get and increment the shared counter for this node list.
     (loom:with-mutex! (warp-balancer-rr-lock balancer)
-      (let* ((entry (gethash list-id (warp-balancer-rr-state balancer) '(0 . 0))))
+      (let* ((entry (gethash list-hash
+                             (warp-balancer-rr-state balancer) '(0 . 0))))
         (setq counter (car entry))
-        (puthash list-id (cons (1+ counter) (float-time))
+        (puthash list-hash (cons (1+ counter) (float-time))
                  (warp-balancer-rr-state balancer))))
-    (nth (mod counter (length sorted)) sorted)))
+    ;; Select the node at the current position in the sorted list.
+    (nth (mod counter (length sorted-nodes)) sorted-nodes)))
 
-(warp:defbalancer-algorithm :weighted-round-robin 
-  (strategy nodes raw-nodes &key session-id)
-  "Selects a node based on its `initial-weight`.
+(warp:defbalancer-algorithm :least-connections (strategy nodes raw-nodes
+                                                &key session-id)
+  "Select the node with the fewest active connections using P2C.
 
-Nodes with a higher weight will be selected proportionally more often.
-This is a simple probabilistic implementation.
+This dynamic strategy adapts to load by sending new requests to the
+least-busy node. It uses the 'Power of Two Choices' (P2C) optimization,
+providing near-optimal distribution with minimal overhead.
 
-Arguments:
-- `STRATEGY` (warp-balancer-strategy): The strategy object (unused).
-- `NODES` (list): The list of healthy `internal-node-state` objects.
-- `RAW-NODES` (list): The original list of raw nodes (unused).
-- `SESSION-ID` (string): The session ID (unused).
-
-Returns:
-- (warp-balancer--internal-node-state): The selected internal node."
+Configuration:
+- Requires a `:connection-load-fn` in the strategy's `:config` to
+  extract the connection count from a raw node."
   (declare (ignore strategy raw-nodes session-id))
-  (cl-block select-wrr
-    (let ((total-weight (apply #'+ (mapcar
-                                   #'warp-balancer--internal-node-state-initial-weight
-                                   nodes)))
-          (current-sum 0.0)
-          (target-weight (random (float total-weight))))
-      (cl-loop for node in nodes do
-               (cl-incf current-sum
-                        (warp-balancer--internal-node-state-initial-weight node))
-               (when (>= current-sum target-weight)
-                 (cl-return-from select-wrr node))))
-    (car nodes)))
+  (warp--balancer-select-by-load
+   nodes #'warp-balancer--internal-node-state-connection-load))
 
-(warp:defbalancer-algorithm :smooth-weighted-round-robin 
-  (strategy nodes raw-nodes &key session-id)
-  "Selects a node using a Smooth Weighted Round Robin (SWRR)
-algorithm.
+(warp:defbalancer-algorithm :least-response-time (strategy nodes raw-nodes
+                                                  &key session-id)
+  "Select the node with the lowest average response time (latency) using P2C.
 
-This algorithm distributes requests proportionally to node weights
-while minimizing the burstiness common in simple weighted round-robin.
-It maintains internal state (`swrr-current-weight`) for each node.
+This dynamic strategy sends requests to the fastest-responding node,
+improving overall application performance. It uses the 'Power of Two
+Choices' (P2C) optimization for efficiency.
 
-Arguments:
-- `STRATEGY` (warp-balancer-strategy): The strategy object (unused).
-- `NODES` (list): The list of healthy `internal-node-state` objects.
-- `RAW-NODES` (list): The original list of raw nodes (unused).
-- `SESSION-ID` (string): The session ID (unused).
-
-Returns:
-- (warp-balancer--internal-node-state): The selected internal node."
+Configuration:
+- Requires a `:latency-fn` in the strategy's `:config` to extract the
+  average latency from a raw node."
   (declare (ignore strategy raw-nodes session-id))
-  (cl-block select-swrr
-    (unless nodes (cl-return-from select-swrr nil))
-    (let ((balancer (warp:balancer-get-instance (current-component-system)))
-          (selected-node nil)
-          (total-effective-weight
-           (apply #'+ (mapcar
-                       #'warp-balancer--internal-node-state-swrr-effective-weight
-                       nodes))))
-      (unless (> total-effective-weight 0)
-        (warp:log! :warn "balancer" "All SWRR weights are zero, falling back.")
-        (cl-return-from select-swrr (car nodes)))
-      ;; Update the current weights and select the node with the highest weight.
-      (loom:with-mutex! (warp-balancer-node-states-lock balancer)
-        (cl-loop for node in nodes do
-                 (cl-incf (warp-balancer--internal-node-state-swrr-current-weight node)
-                          (warp-balancer--internal-node-state-swrr-effective-weight node))
-                 (when (or (not selected-node)
-                           (> (warp-balancer--internal-node-state-swrr-current-weight node)
-                              (warp-balancer--internal-node-state-swrr-current-weight selected-node)))
-                   (setq selected-node node)))
-        ;; Decrease the selected node's current weight by the total effective weight.
-        (when selected-node
-          (cl-decf (warp-balancer--internal-node-state-swrr-current-weight selected-node)
-                   total-effective-weight)))
-      selected-node)))
+  (warp--balancer-select-by-load
+   nodes #'warp-balancer--internal-node-state-latency))
 
-(warp:defbalancer-algorithm :least-connections 
-  (strategy nodes raw-nodes &key session-id)
-  "Selects the node with the fewest active connections using the
-'Power of Two Choices' (P2C) method.
+(warp:defbalancer-algorithm :consistent-hash (strategy nodes raw-nodes
+                                              &key session-id)
+  "Select a node using consistent hashing for session stickiness.
 
-It picks two random nodes and returns the one with the lower
-connection load.
+This ensures that a given `SESSION-ID` consistently maps to the same node
+as long as the node set is stable. When nodes are added or removed, only
+a small fraction of keys are re-mapped.
+
+Configuration:
+- Requires a `:node-key-fn` in the strategy's `:config`.
+- Optional keys: `:virtual-nodes`, `:hash-fn`.
 
 Arguments:
-- `STRATEGY` (warp-balancer-strategy): The strategy object (unused).
-- `NODES` (list): The list of healthy `internal-node-state` objects.
-- `RAW-NODES` (list): The original list of raw nodes (unused).
-- `SESSION-ID` (string): The session ID (unused).
-
-Returns:
-- (warp-balancer--internal-node-state): The selected internal node."
-  (declare (ignore strategy raw-nodes session-id))
-  (warp--balancer-select-by-load nodes
-                                 #'warp-balancer--internal-node-state-connection-load))
-
-(let ((system (current-component-system)))
-  (when system
-    (let ((balancer (warp:balancer-get-instance system)))
-      (warp:registry-add
-       (warp-balancer-algorithm-registry balancer)
-       :power-of-two-choices
-       (warp:registry-get (warp-balancer-algorithm-registry balancer)
-                          :least-connections)
-       :overwrite-p t))))
-
-(warp:defbalancer-algorithm :least-response-time 
-  (strategy nodes raw-nodes &key session-id)
-  "Selects the node with the lowest average response time (latency)
-using the 'Power of Two Choices' (P2C) method.
-
-Arguments:
-- `STRATEGY` (warp-balancer-strategy): The strategy object (unused).
-- `NODES` (list): The list of healthy `internal-node-state` objects.
-- `RAW-NODES` (list): The original list of raw nodes (unused).
-- `SESSION-ID` (string): The session ID (unused).
-
-Returns:
-- (warp-balancer--internal-node-state): The selected internal node."
-  (declare (ignore strategy raw-nodes session-id))
-  (warp--balancer-select-by-load nodes
-                                 #'warp-balancer--internal-node-state-latency))
-
-(warp:defbalancer-algorithm :least-queue-depth 
-  (strategy nodes raw-nodes &key session-id)
-  "Selects the node with the shortest work queue using the 'Power of
-Two Choices' (P2C) method.
-
-Arguments:
-- `STRATEGY` (warp-balancer-strategy): The strategy object (unused).
-- `NODES` (list): The list of healthy `internal-node-state` objects.
-- `RAW-NODES` (list): The original list of raw nodes (unused).
-- `SESSION-ID` (string): The session ID (unused).
-
-Returns:
-- (warp-balancer--internal-node-state): The selected internal node."
-  (declare (ignore strategy raw-nodes session-id))
-  (warp--balancer-select-by-load nodes
-                                 #'warp-balancer--internal-node-state-queue-depth))
-
-(warp:defbalancer-algorithm :consistent-hash 
-  (strategy nodes raw-nodes &key session-id)
-  "Selects a node using a consistent hashing algorithm.
-
-This ensures that a given `SESSION-ID` consistently maps to the same
-node as long as the set of nodes is stable, and minimizes
-re-mappings when nodes are added or removed.
-
-Arguments:
-- `STRATEGY` (warp-balancer-strategy): The strategy object, used to
-  access config for hashing parameters.
-- `NODES` (list): The list of healthy `internal-node-state` objects.
-- `RAW-NODES` (list): The original list of raw nodes.
-- `SESSION-ID` (string): A required session identifier to hash.
-
-Returns:
-- (warp-balancer--internal-node-state): The selected internal node."
+- `:session-id` (string): **Required**. The key to be hashed."
   (unless session-id
-    (error 'warp-balancer-error ":session-id is required for :consistent-hash"))
+    (error 'warp-balancer-invalid-strategy
+           ":session-id is required for :consistent-hash"))
   (let* ((balancer (warp:balancer-get-instance (current-component-system)))
          (config (warp-balancer-strategy-config strategy))
          (settings (warp-balancer-strategy-settings strategy))
@@ -771,82 +797,98 @@ Returns:
          (nodes-hash (warp--balancer-hash-raw-nodes raw-nodes key-fn))
          (ring-key (cons nodes-hash vnodes))
          (ring
-          (loom:with-mutex! (warp-balancer-rings-lock balancer)
-            ;; Check the cache first to avoid re-computing the ring.
-            (or (car (gethash ring-key (warp-balancer-ring-cache balancer)))
-                ;; If not in cache, build the new ring.
-                (let ((new-ring nil))
-                  (dolist (state nodes)
-                    (let ((node-key (funcall
-                                     key-fn
-                                     (warp-balancer--internal-node-state-raw-node state))))
-                      (dotimes (i vnodes)
-                        ;; Create virtual nodes and add them to the ring.
-                        (push (cons (funcall hash-fn
-                                             (format "%s:%d" node-key i))
-                                    state)
-                              new-ring))))
-                  ;; Sort the ring by hash value for efficient lookup.
-                  (let ((sorted (sort new-ring #'< :key #'car)))
-                    (puthash ring-key (cons sorted (float-time))
-                             (warp-balancer-ring-cache balancer))
-                    sorted))))))
-    (let* ((session-hash (funcall hash-fn session-id))
-           ;; Find the first virtual node with a hash greater than or equal to the session's hash.
-           (entry (cl-find-if (lambda (e) (>= (car e) session-hash))
-                              ring)))
-      ;; If no such node is found (i.e., we wrapped around the ring), select the first node.
-      (cdr (or entry (car ring))))))
+          (or ;; 1. Check the global cache for a pre-computed ring.
+              (car (gethash ring-key (warp-balancer-ring-cache balancer)))
+              ;; 2. If not cached, build, sort, and cache the new ring.
+              (loom:with-mutex! (warp-balancer-rings-lock balancer)
+                (or (car (gethash ring-key
+                                  (warp-balancer-ring-cache balancer)))
+                    (let ((new-ring nil))
+                      (dolist (state nodes)
+                        (let ((node-key (funcall key-fn
+                                                 (warp-balancer--internal-node-state-raw-node
+                                                  state))))
+                          (dotimes (i vnodes)
+                            (push (cons (funcall hash-fn
+                                                 (format "%s:%d" node-key i))
+                                        state)
+                                  new-ring))))
+                      (let ((sorted-ring (sort new-ring #'< :key #'car)))
+                        (puthash ring-key (cons sorted-ring (float-time))
+                                 (warp-balancer-ring-cache balancer))
+                        sorted-ring)))))))
+    (when ring
+      (let* ((session-hash (funcall hash-fn session-id))
+             ;; Find the first virtual node with a hash >= session's hash.
+             (entry (cl-find-if (lambda (e) (>= (car e) session-hash))
+                                ring)))
+        ;; If we wrapped around, select the first node on the ring.
+        (cdr (or entry (car ring)))))))
 
-;;;---------------------------------------------------------------------
-;;; Intelligent Balancing Plugin Definition
-;;;---------------------------------------------------------------------
+(warp:defbalancer-algorithm :health-aware-select (strategy nodes raw-nodes
+                                                  &key session-id)
+  "Select the node with the highest overall health score.
+
+This is the most advanced adaptive strategy. It directly uses the
+`overall-score` from each node's health score object to find the best
+candidate.
+
+Configuration:
+- Requires a `:health-score-fn` in the strategy that returns a
+  `warp-connection-health-score` object."
+  (declare (ignore strategy raw-nodes session-id))
+  (when nodes
+    (let ((best-node (car nodes))
+          (best-score -1.0))
+      ;; Iterate through all nodes to find the one with the max score.
+      (dolist (node nodes)
+        (let ((current-score
+               (warp-connection-health-score-overall-score
+                (warp-balancer--internal-node-state-health-score node))))
+          (when (> current-score best-score)
+            (setq best-score current-score)
+            (setq best-node node))))
+      best-node)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Plugin Definition
 
 (warp:defplugin :balance
-  "Provides advanced, pre-configured load balancing strategies that
-integrate with other Warp observability and resilience modules."
-  :version "1.0.0"
+  "Provides advanced, pre-configured load balancing strategies that integrate
+with other Warp observability and resilience modules."
+  :version "1.1.0"
   :dependencies '(health)
   :profiles
   `((:cluster-worker
      :components
-     `((balancer-core
-        :doc "The component that manages the state for load balancing."
-        :factory (lambda () (warp-balancer-create))))
+     ((balancer-core
+       :doc "The component managing state for load balancing."
+       :factory #'warp-balancer--create))
      :init
      (lambda (context)
-       "The plugin's init hook defines the strategy, ensuring it is only
-        created when the plugin is loaded and its dependencies are met."
+       ;; The plugin's init hook defines a pre-canned, intelligent
+       ;; strategy for balancing across worker nodes.
        (warp:defbalancer-strategy intelligent-worker-balancer
-         "A balancer that uses health and performance data to route requests."
-         :type :smooth-weighted-round-robin
+         "A balancer that uses health scores to route requests to the
+        healthiest worker, providing adaptive, performance-aware load distribution."
+         :type :health-aware-select
          :fallback-strategy :random
-         :config
-         `(
-           ;; Health Check: Use the Health Orchestrator as the source of truth.
-           :health-check-fn
-           ,(lambda (worker-node)
-              (let* ((system (plist-get context :host-system))
-                     (ho (warp:component-system-get system :health-orchestrator))
-                     (health-state (and ho (warp:health-orchestrator-get-target-health
-                                            ho (warp-managed-worker-worker-id worker-node)))))
-                (and health-state (eq (warp-health-state-status health-state) :healthy))))
-
-           ;; Dynamic Weight: Calculate weight based on performance metrics.
-           :dynamic-effective-weight-fn
-           ,(lambda (worker-node)
-              (let* ((base-weight (warp-managed-worker-initial-weight worker-node))
-                     (latency (warp-managed-worker-observed-avg-rpc-latency worker-node))
-                     (active-rpcs (warp-managed-worker-active-rpcs worker-node))
-                     (weight base-weight))
-                (when (> latency 1.0) (setq weight (* weight (/ 1.0 latency))))
-                (when (> active-rpcs 5) (setq weight (* weight (/ 1.0 (1+ (* 0.1 active-rpcs))))))
-                (max 0.1 weight)))
-
-           ;; Other required functions
-           :node-key-fn #'(lambda (worker-node) (warp-managed-worker-worker-id worker-node))
-           :list-id-fn #'(lambda (_nodes) "cluster-worker-pool")
-          ))))))
+         :config `(:node-key-fn
+                   #'(lambda (w) (warp-managed-worker-worker-id w)))
+         ;; This health score function bridges the balancer to the health
+         ;; system by actively fetching the latest score for a worker.
+         :health-score-fn
+         ,(lambda (worker-node)
+            (let* ((system (plist-get context :host-system))
+                   (ho (warp:component-system-get
+                        system :health-orchestrator))
+                   (score (and ho
+                               (warp:health-orchestrator-get-target-health-score
+                                ho (warp-managed-worker-worker-id
+                                    worker-node)))))
+              (or score
+                  (make-warp-connection-health-score
+                   :overall-score 0.0)))))))))
 
 (provide 'warp-balancer)
 ;;; warp-balancer.el ends here

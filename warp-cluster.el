@@ -2,65 +2,52 @@
 
 ;;; Commentary:
 ;;
-;; This module is the architectural blueprint for a **Warp Cluster Orchestrator**,
-;; a high-availability control plane designed to manage and coordinate a fleet
-;; of distributed worker processes. It defines the core "cluster-worker" runtime,
-;; which, unlike a standard worker, is responsible not for performing application
-;; tasks, but for maintaining the health, state, and security of the entire
-;; distributed system.
+;; This module provides the blueprint for a **Warp Cluster Orchestrator**, a
+;; high-availability control plane for managing a fleet of worker processes.
+;; It defines the `cluster-worker` runtime, which is responsible for
+;; maintaining the health, state, and security of the entire system.
 ;;
-;; At its heart, this module orchestrates the instantiation of a complex,
-;; production-grade runtime by combining a declarative configuration, a minimal
-;; set of core components, and a rich ecosystem of optional plugins. This
-;; micro-kernel design ensures the core system remains lean and highly stable,
-;; while allowing advanced capabilities like autoscaling, dynamic load balancing,
-;; and a centralized management API to be added and removed dynamically.
+;; ## The "Why": The Need for a Control Plane
 ;;
-;; ## The "How" and "Why" of the Cluster Orchestrator
+;; A distributed system needs a "brain" or a "control plane." This is a
+;; special, highly-available node (or set of nodes) responsible for managing
+;; the entire system. Its jobs include:
+;; - Managing worker process lifecycles (starting, stopping, monitoring).
+;; - Autoscaling the number of workers in response to load.
+;; - Handling zero-downtime deployments of new code.
+;; - Aggregating logs and telemetry from all workers.
+;; - Providing a single, centralized administrative API.
 ;;
-;; **1. The Runtime as a State Machine**: The cluster's lifecycle is not a simple
-;; linear function; it's a dynamic process governed by the `cluster-lifecycle`
-;; state machine. This approach provides a predictable and robust way to manage
-;; the node's startup and shutdown. For example, it ensures that all core
-;; components are fully initialized before the coordinator worker is launched,
-;; and it guarantees a graceful shutdown even in the face of errors. This
-;; contrasts with a fragile `do-this-then-that` script, making the system more
-;; resilient to unexpected events.
+;; This module defines the blueprint for such an orchestrator.
 ;;
-;; **2. The Leader-Only Model**: Key components, such as the `allocator`,
-;; `autoscaler-manager`, and the `manager-service`, are explicitly marked with
-;; `:leader-only` metadata. This is a fundamental pattern for building a
-;; high-availability cluster. These components are automatically started when a
-;; node is elected leader and gracefully stopped when leadership is lost. This
-;; design prevents the critical "split-brain" problem, where multiple nodes
-;; simultaneously try to perform leader-exclusive tasks, leading to data
-;; corruption or inconsistent state.
+;; ## The "How": A Compositional, Event-Driven, HA Control Plane
 ;;
-;; **3. Service-Oriented Architecture**: The cluster is a composition of services.
-;; Components like `worker-manager` and `telemetry-pipeline` are not mere utility
-;; libraries; they are stateful, long-running services with formal APIs. Other
-;; components interact with them through declarative **service clients**, which
-;; can be configured with powerful middleware for transparent resilience features
-;; like retries, circuit breakers, and distributed tracing. This powerful
-;; decoupling ensures that each component can evolve independently without
-;; impacting the rest of the system.
+;; 1.  **The Leader-Only Model**: In a high-availability (HA) setup with
+;;     multiple orchestrator nodes, only one can be the **leader** at a time.
+;;     Critical, stateful components like the `allocator` and `autoscaler` are
+;;     marked with `:leader-only` metadata. The system listens for
+;;     `:leader-elected` events from the coordinator and automatically starts
+;;     these services *only* on the active leader. This is a fundamental
+;;     pattern that prevents "split-brain" problems where multiple nodes
+;;     might try to make conflicting decisions.
 ;;
-;; **4. The Power of Event Sourcing**: The `worker-manager` is implemented as an
-;; **event-sourced aggregate**. This is a sophisticated architectural pattern
-;; where all changes to the worker's state (e.g., a worker joining or sending a
-;; health report) are recorded as a stream of events. The current state is
-;; derived by replaying these events. This provides a single source of truth, a
-;; complete audit trail, and a natural mechanism for building a resilient,
-;; distributed system that can recover from catastrophic failures by simply
-;; rebuilding its state from the event log.
+;; 2.  **Service-Oriented Architecture**: The cluster is a composition of
+;;     fine-grained, independent services (worker management, service
+;;     discovery, deployment, etc.). These services communicate via formal
+;;     APIs and clients, which promotes decoupling and allows each
+;;     component to evolve independently.
 ;;
-;; **5. The Extensible Plugin System**: The `warp:defruntime` macro's `plugins`
-;; list is the primary mechanism for extending the cluster's capabilities.
-;; Rather than including all features by default, the cluster starts with a
-;; minimal core and dynamically loads specialized components. This approach
-;; simplifies the core codebase, reduces the system's memory footprint for
-;; simpler deployments, and allows developers to build and share complex,
-;; self-contained features as plugins.
+;; 3.  **Event Sourcing for State**: The `worker-manager`, which tracks the
+;;     state of all workers, is implemented as an **event-sourced aggregate**.
+;;     Every change to the worker fleet (a worker joining, leaving, or
+;;     sending a health report) is recorded as an immutable event. This
+;;     provides a complete audit trail and allows the cluster's state to be
+;;     perfectly rebuilt after a crash by replaying the event log.
+;;
+;; 4.  **Extensible Plugin System**: The cluster is a "micro-kernel." It
+;;     starts with a minimal set of core components and then dynamically
+;;     loads powerful features like autoscaling, job queues, and security
+;;     as plugins.
 
 ;;; Code:
 
@@ -69,6 +56,7 @@
 (require 'subr-x)
 (require 'loom)
 (require 'braid)
+(require 'json)
 
 (require 'warp-aggregate)
 (require 'warp-allocator)
@@ -201,23 +189,33 @@ Fields:
   (health-check-timeout 5.0 :type number)
   (trace-log-file-path nil :type (or null string)))
 
-(warp:defconfig (warp-cluster-config
-                  (:extends '(warp-cluster-config-base)))
-  "The composite configuration for a `warp-cluster`.
-This master configuration schema is built by extending all other config schemas.
-It represents the top-level configuration object for a cluster instance."
+(warp:defconfig warp-cluster-main-config
+  "The primary, high-level configuration fields for a cluster instance.
+This schema holds the core, top-level settings that are not specific to
+a particular subsystem (e.g., networking, telemetry, etc.).
+
+Fields:
+- `name`: A user-friendly name for the cluster.
+- `environment`: A property list of environment variables for the cluster.
+- `security-policy`: The security policy to enforce on the cluster."
   (name "default-cluster" :type string)
   (environment nil :type list)
-  (coordinator-config-options nil :type (or null plist))
   (security-policy :strict :type keyword)
-  (plugin-settings nil :type (or null plist))
   (config-file nil :type string))
 
 (warp:defconfig (warp-cluster-config
-                  (:extends '(warp-cluster-config-base))
-                  (:extensible-template t))
+                (:extends '(warp-cluster-main-config
+                            warp-cluster-network-config
+                            warp-cluster-resource-config
+                            warp-cluster-telemetry-config)))
+  "The composite configuration for a `warp-cluster`.
+This master configuration schema is built by extending all other config schemas.
+It represents the top-level configuration object for a cluster instance.")
+
+(warp:defconfig (warp-cluster-extensible-config :extensible-template t)
   "The extensible configuration template for a `warp-cluster`.
 Plugins can now dynamically add their own fields to this config.")
+
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Schema & Aggregate Definitions
@@ -324,11 +322,11 @@ Fields:
   internal subsystems and manages their lifecycles.
 - `state-machine`: The `warp-state-machine` instance for the cluster's
   lifecycle."
-  (id               nil :type string)
-  (name             nil :type string)
-  (config           nil :type warp-cluster-config)
+  (id             nil :type string)
+  (name           nil :type string)
+  (config         nil :type warp-cluster-config)
   (component-system nil :type (or null warp-component-system))
-  (state-machine    nil :type (or null warp-state-machine)))
+  (state-machine  nil :type (or null warp-state-machine)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Plugin Lifecycle Hooks for the Cluster
@@ -347,7 +345,7 @@ when leadership changes or the cluster shuts down."
 
 ;;;---------------------------------------------------------------------------
 ;;; Cluster Creation & Configuration
-;;;---------------------------------------------------------------------------
+;;---------------------------------------------------------------------------
 
 (defun warp-cluster--generate-id ()
   "Generate a unique ID for a cluster instance.
@@ -359,7 +357,7 @@ for distributed state management and logging correlation.
 Returns:
 - (string): A unique string identifier (e.g.,
   \"cluster-a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d\")."
-  ;; How: It uses the `warp:uuid4` generator for a standard random UUID.
+  ;; It uses the `warp:uuid4` generator for a standard random UUID.
   (format "cluster-%s" (warp:uuid-string (warp:uuid4))))
 
 (defun warp-cluster--create-instance (config)
@@ -376,17 +374,17 @@ Returns:
 - (loom-promise): A promise that resolves to the fully started
   `warp-runtime-instance` for the cluster node."
   (let* ((config-file (or (warp-cluster-config-config-file config) "cluster-config.json"))
-         (root-config-plist (json-read-file config-file)))
+          (root-config-plist (json-read-file config-file)))
     (unless root-config-plist
       (error "Failed to load cluster configuration from file: %s" config-file))
-    ;; Why: By using `warp:runtime-create`, we delegate the complex task of
+    ;; By using `warp:runtime-create`, we delegate the complex task of
     ;; wiring up components and plugins to the runtime system, making cluster
     ;; creation a single, declarative step.       
     (warp:runtime-create 'cluster-worker :root-config-plist root-config-plist)))
 
 ;;;---------------------------------------------------------------------------
 ;;; Cluster Leader Management
-;;;---------------------------------------------------------------------------
+;;---------------------------------------------------------------------------
 
 (defun warp-cluster--start-leader-only-components (system)
   "Starts components designated to run only on the leader node.
@@ -405,7 +403,7 @@ Side Effects:
 - Initiates the start lifecycle for all leader-only components."
   (let* ((leader-only-components
            (warp:component-system-list-components-with-metadata
-            system :leader-only t)))
+             system :leader-only t)))
     (warp:log! :info "cluster.lifecycle" "Starting leader-only components: %S"
                leader-only-components)
     (loom:await (warp:component-system-start-components
@@ -429,14 +427,14 @@ Side Effects:
 - Initiates the stop lifecycle for all leader-only components."
   (let* ((leader-only-components
            (warp:component-system-list-components-with-metadata
-            system :leader-only t)))
+             system :leader-only t)))
     (warp:log! :info "cluster.lifecycle" "Stopping leader-only components: %S"
                leader-only-components)
     (loom:await (warp:component-system-stop-components
                   system
                   leader-only-components))))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Cluster Lifecycle State Machine
 
 (warp:defstate-machine cluster-lifecycle
@@ -465,7 +463,8 @@ that are not marked as `:leader-only`."
             ;; Await the asynchronous startup of the component system.
             (loom:await (warp:component-system-start
                           (warp-cluster-component-system cluster)))))))
-    (:starting
+   
+   (:starting
     (on :components-ready :to :running
         :action
         (lambda (context)
@@ -475,7 +474,7 @@ then handle its own internal leader election process."
           (let* ((cluster (plist-get context :cluster))
                  (system (warp-cluster-component-system cluster))
                  (coord-worker (warp:component-system-get
-                                 system :coordinator-worker)))
+                                  system :coordinator-worker)))
             (warp:log! :info "cluster.lifecycle"
                        "Core components started. Starting coordinator worker...")
             ;; Await the start of the coordinator process.
@@ -487,9 +486,11 @@ then handle its own internal leader election process."
           (warp:log! :fatal "cluster.lifecycle"
                      "Startup failed during component initialization: %S"
                      error))))
-    (:running
+   
+   (:running
     (on :shutdown :to :shutting-down))
-    (:shutting-down
+   
+   (:shutting-down
     (on :shutdown-complete :to :terminated
         :action
         (lambda (context)
@@ -509,7 +510,8 @@ of all components to ensure the process exits cleanly."
             ;; The :force flag ensures immediate termination.
             (warp:component-system-stop
              (warp-cluster-component-system cluster) :force)))))
-    (:terminated)))
+   
+   (:terminated)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Plugin Deployment Workflow
@@ -535,14 +537,14 @@ Compensation:
                                             plugin-names target-workers))
     (:monitor-progress
      :invoke (plugin-deployment-service :await-deployment-results
-                                        tracking-ids))))
+                                       tracking-ids))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Service Interfaces & Implementations
 
 ;;;---------------------------------------------------------------------------
 ;;; Worker Management
-;;;---------------------------------------------------------------------------
+;;---------------------------------------------------------------------------
 
 (warp:defservice-implementation :worker-management-service :worker-manager
   "Links the `:worker-management-service` contract to the `:worker-manager`.
@@ -594,12 +596,12 @@ Side Effects:
 - None."
     (let ((workers-hash (warp-worker-manager-state-workers worker-manager)))
       (if-let (worker (gethash worker-id workers-hash))
-        (loom:resolved! worker)
+          (loom:resolved! worker)
         (loom:rejected! (warp:error! 'worker-not-found))))))
 
 ;;;---------------------------------------------------------------------------
 ;;; Cluster Introspection
-;;;---------------------------------------------------------------------------
+;;---------------------------------------------------------------------------
 
 (warp:defservice-implementation :cluster-introspection-service
   :cluster-introspection-facade
@@ -653,7 +655,7 @@ Side Effects:
     (let* ((plugin-system (plist-get cis-facade :plugin-system))
            (registry (warp-plugin-system-registry plugin-system)))
       (if-let (def (gethash plugin-name (warp:registry-data registry)))
-        (loom:resolved! (cl-struct-to-plist def))
+          (loom:resolved! (cl-struct-to-plist def))
         (loom:rejected! (warp:error! 'plugin-not-found)))))
 
   (list-events ()
@@ -681,7 +683,7 @@ Arguments:
 - `event-type` (keyword): The event type to inspect.
 
 Returns:
-- (loom-promise): A promise resolving with the event's schema plist.
+- (loom-promise): A promise resolving with the event's detailed schema.
 
 Signals:
 - `event-schema-not-found`: If `event-type` schema is not defined.
@@ -690,12 +692,12 @@ Side Effects:
 - None."
     (let ((es (plist-get cis-facade :event-system)))
       (if-let (schema (warp:event-system-get-schema es event-type))
-        (loom:resolved! schema)
+          (loom:resolved! schema)
         (loom:rejected! (warp:error! 'event-schema-not-found))))))
 
 ;;;---------------------------------------------------------------------------
 ;;; Plugin Deployment
-;;;---------------------------------------------------------------------------
+;;---------------------------------------------------------------------------
 
 (warp:defservice-implementation :plugin-deployment-service
   :plugin-deployment-manager
@@ -716,27 +718,27 @@ breaking."
    ;; sent over the wire.
    :client-middleware
    `((warp:defmiddleware-stage :log-call
-       (lambda (context next-fn)
-         ,(format "Logs the details of the outgoing service call.")
-         (warp:log! :info "plugin-deployment-client"
-                    "Calling service '%s' method '%s'."
-                    (plist-get (plist-get context :options) :service-name)
-                    (plist-get (plist-get context :options) :method-name))
-         (funcall next-fn)))
+      (lambda (context next-fn)
+        ,(format "Logs the details of the outgoing service call.")
+        (warp:log! :info "plugin-deployment-client"
+                   "Calling service '%s' method '%s'."
+                   (plist-get (plist-get context :options) :service-name)
+                   (plist-get (plist-get context :options) :method-name))
+        (funcall next-fn)))
      (warp:defmiddleware-stage :retry
-       (lambda (context next-fn)
-         ,(format "Applies a retry policy with exponential backoff.")
-         (loom:await (loom:retry (lambda () (funcall next-fn))
+      (lambda (context next-fn)
+        ,(format "Applies a retry policy with exponential backoff.")
+        (loom:await (loom:retry (lambda () (funcall next-fn))
                                  :retries 5
                                  :delay (lambda (n _) (expt 2 n))))))
      (warp:defmiddleware-stage :circuit-breaker
-       (lambda (context next-fn)
-         ,(format "Wraps the RPC in a circuit breaker for fault tolerance.")
-         (let* ((service-name
+      (lambda (context next-fn)
+        ,(format "Wraps the RPC in a circuit breaker for fault tolerance.")
+        (let* ((service-name
                  (plist-get (plist-get context :options) :service-name))
-                (cb (warp:circuit-breaker-get-or-create
-                     service-name :threshold 3 :timeout 60)))
-           (loom:await (warp:circuit-breaker-execute cb next-fn))))))))
+               (cb (warp:circuit-breaker-get-or-create
+                      service-name :threshold 3 :timeout 60)))
+          (loom:await (warp:circuit-breaker-execute cb next-fn))))))))
 
   (load-on-workers (pdm names targets)
     "Dispatches plugin load commands to target workers via RPC.
@@ -761,13 +763,13 @@ Side Effects:
            (wm (plist-get pdm :worker-manager))
            (client (make-plugin-management-client :rpc-system rpc))
            (worker-ids (or targets
-                           (mapcar #'warp-managed-worker-id
-                                   (loom:await
-                                    (get-all-workers wm))))))
+                            (mapcar #'warp-managed-worker-id
+                                    (loom:await
+                                      (get-all-workers wm))))))
       ;; The core action is a single call to the generated client stub.
       ;; The declared middleware will automatically wrap and execute this.
       (plugin-management-client-load-on-workers
-       client nil nil nil names worker-ids)))
+        client nil nil nil names worker-ids)))
 
   (unload-from-workers (pdm names targets)
     "Dispatches plugin unload commands to target workers via RPC.
@@ -790,11 +792,11 @@ Side Effects:
            (wm (plist-get pdm :worker-manager))
            (client (make-plugin-management-client :rpc-system rpc))
            (worker-ids (or targets
-                           (mapcar #'warp-managed-worker-id
-                                   (loom:await
-                                    (get-all-workers wm))))))
+                            (mapcar #'warp-managed-worker-id
+                                    (loom:await
+                                      (get-all-workers wm))))))
       (plugin-management-client-unload-from-workers
-       client nil nil nil names worker-ids)))
+        client nil nil nil names worker-ids)))
 
   (await-deployment-results (pdm ids)
     "Monitors the state of deployment ops until completion or failure.
@@ -822,22 +824,22 @@ Side Effects:
         ;; Check for overall timeout to prevent waiting indefinitely.
         (when (> (- (float-time) start-time) timeout)
           (loom:break! (warp:error!
-                        'warp-workflow-error
-                        :message "Deployment timed out.")))
+                         'warp-workflow-error
+                         :message "Deployment timed out.")))
 
         (braid! (warp:state-manager-bulk-get
                   sm
                   (mapcar (lambda (id) `(:deployments ,id)) ids))
           (:then (results)
             (let ((statuses (mapcar (lambda (res)
-                                      (plist-get (cdr res) :status))
-                                    results)))
+                                     (plist-get (cdr res) :status))
+                                   results)))
               (cond
                 ;; If any sub-task has failed, fail the entire workflow step.
                 ((cl-some (lambda (s) (eq s :failed)) statuses)
                  (loom:break! (warp:error!
-                               'warp-workflow-error
-                               :message "A plugin deployment failed.")))
+                                'warp-workflow-error
+                                :message "A plugin deployment failed.")))
                 ;; If all sub-tasks are completed, the step is successful.
                 ((cl-every (lambda (s) (eq s :completed)) statuses)
                  (loom:break! t))
@@ -848,7 +850,7 @@ Side Effects:
 
 ;;;---------------------------------------------------------------------------
 ;;; Cluster Administration
-;;;---------------------------------------------------------------------------
+;;---------------------------------------------------------------------------
 
 (warp:defservice-implementation :cluster-admin-service :cluster-admin-facade
   "Implements the cluster's main administrative API.
@@ -937,10 +939,10 @@ Side Effects:
 - Starts a long-running workflow instance."
     (let ((workflow-svc (plist-get cluster-admin-facade :workflow-service)))
       (warp:workflow-service-start-workflow
-       workflow-svc
-       'plugin-deployment-saga
-       `((plugin-names . ,plugin-names)
-         (target-workers . ,target-workers)))))
+        workflow-svc
+        'plugin-deployment-saga
+        `((plugin-names . ,plugin-names)
+          (target-workers . ,target-workers)))))
 
   (manage-plugin-unload (plugin-names target-workers)
     "Starts a resilient workflow to unload plugins from workers.
@@ -955,7 +957,7 @@ Returns:
   workflow instance tracking this deployment.
 
 Signals:
-- None.
+- Propagates errors from the underlying RPC call.
 
 Side Effects:
 - Starts a long-running workflow instance."
@@ -963,10 +965,10 @@ Side Effects:
       ;; A corresponding `plugin-unloading-saga` would be defined
       ;; elsewhere to handle this process.
       (warp:workflow-service-start-workflow
-       workflow-svc
-       'plugin-unloading-saga
-       `((plugin-names . ,plugin-names)
-         (target-workers . ,target-workers)))))
+        workflow-svc
+        'plugin-unloading-saga
+        `((plugin-names . ,plugin-names)
+          (target-workers . ,target-workers)))))
 
   (plugin-list ()
     "Delegates the call to the `:cluster-introspection-service`.
@@ -1009,7 +1011,7 @@ Side Effects:
     "Delegates the call to the `:cluster-introspection-service`.
 
 Arguments:
-- `cluster-admin-facade`: The injected facade component instance.
+- `cis-facade`: The injected facade component instance.
 
 Returns:
 - (loom-promise): A promise resolving with a list of event schemas.
@@ -1027,7 +1029,7 @@ Side Effects:
     "Delegates the call to the `:cluster-introspection-service`.
 
 Arguments:
-- `cluster-admin-facade`: The injected facade component instance.
+- `cis-facade`: The injected facade component instance.
 - `event-type` (keyword): The event type to inspect.
 
 Returns:
@@ -1044,7 +1046,7 @@ Side Effects:
 
 ;;;---------------------------------------------------------------------------
 ;;; Worker Telemetry
-;;;---------------------------------------------------------------------------
+;;---------------------------------------------------------------------------
 
 (warp:defservice-implementation :worker-telemetry-service
   :cluster-telemetry-facade
@@ -1096,7 +1098,7 @@ Side Effects:
 - None."
     (let ((pipeline (plist-get facade :telemetry-pipeline)))
       (warp:telemetry-pipeline-get-latest-metrics pipeline
-                                                  :worker-id worker-id))))
+                                                 :worker-id worker-id))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Component Manifest
@@ -1124,212 +1126,224 @@ are added via plugins."
 
   ;; --- Core Infrastructure & State ---
   (config-service
-   :doc "Centralized, dynamic configuration management service."
-   :requires '(event-system root-config-plist)
-   :factory (lambda (event-system root-config-plist)
-              (warp:config-service-create :event-system event-system
-                                          :root-config root-config-plist))
-   :priority 1000)
+    :doc "Centralized, dynamic configuration management service."
+    :requires '(event-system)
+    :factory (lambda (event-system)
+               (warp:config-service-create :event-system event-system))
+    :priority 1000)
 
   (cluster-orchestrator
-   :doc "The top-level component managing the cluster's identity and lifecycle."
-   :requires '(config-service)
-   :factory (lambda (cfg)
-              (let* ((cluster-id (warp-cluster--generate-id))
-                     (cluster (%%make-cluster
-                               :id cluster-id
-                               :name (warp:config-service-get cfg '(:cluster-name))
-                               :config cfg)))
-                ;; Register for global cleanup on Emacs exit.
-                (push cluster warp-cluster--active-clusters)
-                (warp:log! :info cluster-id "Cluster created: %s" cluster-id)
-                cluster)))
+    :doc "The top-level component managing the cluster's identity and lifecycle."
+    :requires '(config-service)
+    :factory (lambda (cfg)
+               (let* ((cluster-id (warp-cluster--generate-id))
+                      (cluster-name (warp:config-service-get cfg '(:name)))
+                      (cluster (%%make-cluster
+                                :id cluster-id
+                                :name cluster-name
+                                :config cfg)))
+                 ;; Register for global cleanup on Emacs exit.
+                 (push cluster warp-cluster--active-clusters)
+                 (warp:log! :info cluster-id "Cluster created: %s" cluster-id)
+                 cluster)))
 
   (state-manager
-   :doc "Manages distributed state via a durable backend (e.g., Redis)."
-   :requires '(cluster-orchestrator event-system redis-service)
-   :factory (lambda (cluster es redis-svc)
-              (let* ((key-prefix (format "warp:%s:state" (warp-cluster-id cluster)))
-                     (backend-conf `(:type :redis :service ,redis-svc :key-prefix ,key-prefix)))
-                (warp:state-manager-create
-                 :name (format "%s-state" (warp-cluster-id cluster))
-                 :node-id (warp-cluster-id cluster)
-                 :event-system es
-                 :config-options `((:persistence-backend ,backend-conf))))))
+    :doc "Manages distributed state via a durable backend (e.g., Redis)."
+    :requires '(cluster-orchestrator event-system redis-service)
+    :factory (lambda (cluster es redis-svc)
+               (let* ((key-prefix (format "warp:%s:state" (warp-cluster-id cluster)))
+                      (backend-conf `(:type :redis :service ,redis-svc :key-prefix ,key-prefix)))
+                 (warp:state-manager-create
+                   :name (format "%s-state" (warp-cluster-id cluster))
+                   :node-id (warp-cluster-id cluster)
+                   :event-system es
+                   :config-options `((:persistence-backend ,backend-conf))))))
 
   (worker-manager
-   :doc "Event-sourced aggregate that maintains the live state of all workers."
-   :requires '(event-system state-manager)
-   :factory (lambda (es sm) (make-worker-manager-aggregate
-                             (make-warp-worker-manager-state) es sm))
-   :metadata '(:leader-only t))
+    :doc "Event-sourced aggregate that maintains the live state of all workers."
+    :requires '(event-system state-manager)
+    :factory (lambda (es sm) (make-worker-manager-aggregate
+                               (make-warp-worker-manager-state) es sm))
+    :start (lambda (self ctx es)
+             "Subscribes to events from workers to keep its state up-to-date.
+            This replaces the old RPC-based heartbeat system with a modern, reactive
+            event-driven pattern."
+             (warp:subscribe es :worker-ready
+                             (lambda (event)
+                               (let* ((data (warp-event-data event))
+                                      (worker-id (plist-get data :worker-id))
+                                      (worker-obj (make-warp-managed-worker
+                                                   :id worker-id :pool-name (plist-get data :pool-name)
+                                                   :address (plist-get data :inbox-address)
+                                                   :rank (plist-get data :rank))))
+                                 (warp:aggregate-dispatch-command
+                                  self :register-worker worker-id worker-obj))))
+             (warp:subscribe es :worker-deregistered
+                             (lambda (event)
+                               (let* ((data (warp-event-data event))
+                                      (worker-id (plist-get data :worker-id)))
+                                 (warp:aggregate-dispatch-command
+                                  self :deregister-worker worker-id)))))
+    :metadata '(:leader-only t))
 
   ;; --- Communication, Events, and RPC ---
   (event-system
-   :doc "The central event bus for internal system events and plugin hooks."
-   :requires '(cluster-orchestrator rpc-system)
-   :factory (lambda (cluster rpc)
-              (warp:event-system-create
-               :id (format "%s-events" (warp-cluster-id cluster))
-               :rpc-system rpc))
-   :start (lambda (self ctx cluster es)
-            "On start, subscribe to leadership events to manage leader-only components.
-This is the core of the new, decoupled leadership handling. The event
-system listens for leadership changes from the coordinator and
-orchestrates the startup/shutdown of leader-only components using
-the unified context.
+    :doc "The central event bus for internal system events and plugin hooks."
+    :requires '(cluster-orchestrator rpc-system)
+    :factory (lambda (cluster rpc)
+               (warp:event-system-create
+                 :id (format "%s-events" (warp-cluster-id cluster))
+                 :rpc-system rpc))
+    :start (lambda (self ctx cluster es)
+             "On start, subscribe to leadership events to manage leader-only components.
+            This is the core of the new, decoupled leadership handling. The event
+            system listens for leadership changes from the coordinator and
+            orchestrates the startup/shutdown of leader-only components using
+            the unified context.
 
-Arguments:
-- `self` (warp-event-system): The component instance.
-- `ctx` (warp-context): The system's execution context.
-- `cluster` (warp-cluster): The injected cluster orchestrator.
-- `es` (warp-event-system): The injected event system (same as self)."
-            ;; When this node becomes the leader...
-            (warp:subscribe es :leader-elected
-              (lambda (event)
-                (when (string= (plist-get (warp-event-data event) :leader-id) (warp-cluster-id cluster))
-                  (warp-cluster--start-leader-only-components ctx))))
-            ;; When this node loses leadership...
-            (warp:subscribe es :leader-lost
-              (lambda (_event)
-                (warp-cluster--stop-leader-only-components ctx)))))
+            Arguments:
+            - `self` (warp-event-system): The component instance.
+            - `ctx` (warp-context): The system's execution context.
+            - `cluster` (warp-cluster): The injected cluster orchestrator.
+            - `es` (warp-event-system): The injected event system (same as self)."
+             ;; When this node becomes the leader...
+             (warp:subscribe es :leader-elected
+                             (lambda (event)
+                               (when (string= (plist-get (warp-event-data event) :leader-id) 
+                                              (warp-cluster-id cluster))
+                                 (warp-cluster--start-leader-only-components ctx))))
+             ;; When this node loses leadership...
+             (warp:subscribe es :leader-lost
+                             (lambda (_event)
+                               (warp-cluster--stop-leader-only-components ctx)))))
 
   (command-router
-   :doc "Maps incoming RPC command names to handler functions."
-   :requires '(cluster-orchestrator)
-   :factory (lambda (cluster)
-              (warp:command-router-create
-               :name (format "%s-router" (warp-cluster-id cluster)))))
+    :doc "Maps incoming RPC command names to handler functions."
+    :requires '(cluster-orchestrator)
+    :factory (lambda (cluster)
+               (warp:command-router-create
+                 :name (format "%s-router" (warp-cluster-id cluster)))))
 
   (rpc-system
-   :doc "Manages the lifecycle of outgoing and incoming RPC requests."
-   :requires '(cluster-orchestrator command-router)
-   :factory (lambda (cluster router)
-              (let ((system (warp-cluster-component-system cluster)))
-                (warp:rpc-system-create
-                 :name (format "%s-rpc" (warp-cluster-id cluster))
-                 :component-system system
-                 :command-router router))))
+    :doc "Manages the lifecycle of outgoing and incoming RPC requests."
+    :requires '(cluster-orchestrator command-router)
+    :factory (lambda (cluster router)
+               (let ((system (warp-cluster-component-system cluster)))
+                 (warp:rpc-system-create
+                   :name (format "%s-rpc" (warp-cluster-id cluster))
+                   :component-system system
+                   :command-router router))))
 
   (dialer-service
-   :doc "The unified dialer service for the cluster"
-   :requires '(config-service service-registry load-balancer)
-   :factory (lambda (cfg-svc registry balancer)
-              (let* ((dialer (%%make-dialer-service
-                              :service-registry registry
-                              :load-balancer balancer))
-                     (pool-config (warp:config-service-get cfg-svc :connection-pool))
-                     (pool (warp:resource-pool-create
-                            :name (intern (format "%s-conn-pool" (warp-dialer-service-id dialer)))
-                            :factory-fn (lambda (address) (warp-dialer--connection-factory dialer address))
-                            :destructor-fn #'warp-dialer--connection-destructor
-                            :health-check-fn #'warp-dialer--connection-health-check
-                            :idle-timeout (plist-get pool-config :idle-timeout 300)
-                            :max-size (plist-get pool-config :max-size 50)
-                            :min-size (plist-get pool-config :min-size 1)
-                            :max-wait-time (plist-get pool-config :max-wait-time 5.0))))
-                (setf (warp-dialer-service-connection-pool dialer) pool)
-                dialer))
-   :start (lambda (self ctx) (warp:dialer-start self))
-   :stop (lambda (self ctx) (warp:dialer-shutdown self)))
+    :doc "The unified dialer service for the cluster"
+    :requires '(config-service service-registry load-balancer)
+    :factory (lambda (cfg-svc registry balancer)
+               (warp:dialer-create
+                 :config-service cfg-svc
+                 :service-registry registry
+                 :load-balancer balancer))
+    :start (lambda (self ctx) (warp:dialer-start self))
+    :stop (lambda (self ctx) (warp:dialer-shutdown self)))
 
   (service-gateway
-   :doc "The central entry point for routing external service requests.
-It now uses a standardized, declarative client for all downstream communication."
-   ;; The dependency is now on our new declarative client component.
-   :requires '(cluster-orchestrator cluster-service-client rpc-system)
-   :factory (lambda (cluster client rpc)
-              ;; The factory is now much simpler. It just receives the
-              ;; fully-formed client as a dependency.
-              (warp:gateway-create
-               :name (format "%s-gateway" (warp-cluster-id cluster))
-               :service-client client
-               :rpc-system rpc))
-   :metadata '(:leader-only t))
+    :doc "The central entry point for routing external service requests.
+          It now uses a standardized, declarative client for all downstream communication."
+    :requires '(cluster-orchestrator cluster-service-client rpc-system)
+    :factory (lambda (cluster client rpc)
+               (warp:gateway-create
+                 :name (format "%s-gateway" (warp-cluster-id cluster))
+                 :service-client client
+                 :rpc-system rpc))
+    :metadata '(:leader-only t))
 
   ;; --- Control Plane & Extensibility ---
   (plugin-system
-   :doc "Orchestrator for loading, unloading, and managing plugins."
-   :requires '(event-system cluster-orchestrator)
-   :factory (lambda (es cluster)
-              (let ((ps (warp-event-system-plugin-system es)))
-                (setf (warp-plugin-system-component-system ps)
-                      (warp-cluster-component-system cluster))
-                ps)))
+    :doc "Orchestrator for loading, unloading, and managing plugins."
+    :requires (event-system cluster-orchestrator)
+    :factory (lambda (es cluster)
+               (let ((ps (warp-event-system-plugin-system es)))
+                 (setf (warp-plugin-system-component-system ps)
+                       (warp-cluster-component-system cluster))
+                 ps)))
 
   (redis-service
-   :doc "Manages the Redis connection needed by core services and plugins."
-   :requires '(config-service)
-   :factory (lambda (cfg)
-              (apply #'warp:redis-service-create
-                     (warp:config-service-get
-                      cfg '(:job-queue :redis-config-options))))
-   :start #'warp:redis-service-start
-   :stop #'warp:redis-service-stop)
+    :doc "Manages the Redis connection needed by core services and plugins."
+    :requires '(config-service)
+    :factory (lambda (cfg)
+               (apply #'warp:redis-service-create
+                      (warp:config-service-get cfg '(:job-queue :redis-config-options))))
+    :start #'warp:redis-service-start
+    :stop #'warp:redis-service-stop)
 
   (coordinator-worker
-   :doc "The managed worker process that runs the core coordination service."
-   :requires '(cluster-orchestrator config-service)
-   :factory (lambda (cluster cfg)
-              (let* ((coord-conf (warp:config-service-get cfg '(:coordinator-options)))
-                     (name (format "%s-coordinator" (warp-cluster-id cluster)))
-                     (id (format "coordinator-worker-%s" (warp-cluster-id cluster)))
-                     (env (warp-cluster-build-worker-environment
-                           cluster id 0 name 'coordinator-worker)))
-                (warp:managed-worker-create
-                 :worker-type 'coordinator-worker
-                 :config-options coord-conf
-                 :launch-options `(:env ,env)))))
+    :doc "The managed worker process that runs the core coordination service."
+    :requires '(cluster-orchestrator config-service)
+    :factory (lambda (cluster cfg)
+               (let* ((coord-conf (warp:config-service-get cfg '(:coordinator-options)))
+                      (name (format "%s-coordinator" (warp-cluster-id cluster)))
+                      (id (format "coordinator-worker-%s" (warp-cluster-id cluster)))
+                      (env (warp-cluster-build-worker-environment
+                             cluster id 0 name 'coordinator-worker)))
+                 (warp:managed-worker-create
+                   :worker-type 'coordinator-worker
+                   :config-options coord-conf
+                   :launch-options `(:env ,env)))))
 
   ;; --- Leader-Only Primitives ---
   (bridge
-   :doc "Communication hub between the leader and its managed workers."
-   :requires '(cluster-orchestrator event-system command-router)
-   :factory #'warp:bridge-create
-   :start (lambda (self ctx router wm)
-            "Registers RPC handlers and starts the transport listener.
+    :doc "Communication hub between the leader and its managed workers."
+    :requires '(cluster-orchestrator event-system command-router)
+    :factory #'warp:bridge-create
+    :start (lambda (self ctx router wm)
+             "Registers RPC handlers and starts the transport listener.
+            This now includes a generic telemetry handler to replace the old heartbeat RPC."
+             (warp:defrpc-handlers router
+               (:telemetry-batch
+                 (lambda (command _context)
+                   (let ((batch (warp-rpc-command-args command))
+                         (pipeline (warp:component-system-get ctx :telemetry-pipeline)))
+                     (warp:telemetry-pipeline-record-batch pipeline batch)))))
+             ;; Register other low-level worker communication handlers.
+             (register-worker-leader-protocol-handlers router self)
+             (loom:await (warp:bridge-start self)))
+    :stop #'warp:bridge-stop
+    :metadata '(:leader-only t))
 
-Arguments:
-- `self` (warp-bridge): The component instance.
-- `ctx` (warp-context): The system's execution context.
-- `router` (warp-command-router): The injected command router.
-- `wm` (worker-manager): The injected worker manager aggregate."
-            (warp:defrpc-handlers router
-              (:worker-heartbeat
-               (lambda (command _context)
-                 (let* ((report (warp-rpc-command-args command))
-                        (worker-id
-                         (warp-rpc-message-sender-id
-                          (plist-get _context :original-message))))
-                   (warp:aggregate-dispatch-command
-                    wm :process-health-report worker-id report)))))
-            ;; Register other low-level worker communication handlers.
-            (register-worker-leader-protocol-handlers router self)
-            (loom:await (warp:bridge-start self)))
-   :stop #'warp:bridge-stop
+  (log-server
+   :doc "A network service that aggregates logs from other workers."
+   :requires '(config-service telemetry-client)
+   :factory (lambda (cfg-svc tel-client)
+              (let ((log-cfg (warp:config-service-get cfg-svc :log)))
+                (warp:log-server-create
+                 :name "cluster-log-server" :telemetry-client tel-client
+                 :address (warp:config-service-get log-cfg :listen-address))))
+   :start (lambda (self _) (loom:await (warp:log-server-start self)))
+   :stop (lambda (self _)
+           (when-let (transport (warp-log-server-transport-server self))
+             (loom:await (warp:transport-close transport))))
    :metadata '(:leader-only t))
 
   ;; --- Facade Components ---
   (cluster-admin-facade
-   :doc "A structural component that acts as a facade for admin APIs."
-   :requires '(worker-management-client
-               deployment-client
-               service-gateway
-               workflow-service)
-   :factory (lambda (wm-client deploy-client sg-comp workflow-svc)
-              `(:worker-management-service ,wm-client
-                :deployment-service ,deploy-client
-                :service-gateway ,sg-comp
-                :workflow-service ,workflow-svc))
-   :metadata '(:leader-only t))
+    :doc "A structural component that acts as a facade for admin APIs."
+    :requires '(worker-management-client
+                deployment-client
+                service-gateway
+                workflow-service)
+    :factory (lambda (wm-client deploy-client sg-comp workflow-svc)
+               `(:worker-management-service ,wm-client
+                 :deployment-service ,deploy-client
+                 :service-gateway ,sg-comp
+                 :workflow-service ,workflow-svc))
+    :metadata '(:leader-only t))
 
   (plugin-deployment-manager
-   :doc "Implements the internal plugin deployment service steps."
-   :requires '(rpc-system state-manager worker-manager)
-   :factory (lambda (rpc sm wm)
-              `(:rpc ,rpc :state-manager ,sm :worker-manager ,wm))
-   :metadata '(:leader-only t)))
-   
+    :doc "Implements the internal plugin deployment service steps."
+    :requires '(rpc-system state-manager worker-manager)
+    :factory (lambda (rpc sm wm)
+               `(:rpc ,rpc :state-manager ,sm :worker-manager ,wm))
+    :metadata '(:leader-only t)))
+    
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Package Private Functions
 
@@ -1360,8 +1374,8 @@ Returns:
     ;; The core configuration is passed in a single environment variable.
     (warp:defbootstrap-env
       (:identity worker-id rank pool-name worker-type)
-      (:cluster-info (warp-cluster-id cluster) 
-                     (warp:config-service-get cfg-svc '(:coordinator-options :peers)))
+      (:cluster-info (warp-cluster-id cluster)
+                     (warp:config-service-get cfg-svc '(:coordinator :peers)))
       (:leader-contact leader-contact)
       (:security-token)
       (:extra-vars `((,(warp:env 'root-config) . ,serialized-worker-config))))))
@@ -1371,7 +1385,7 @@ Returns:
 
 ;;;---------------------------------------------------------------------------
 ;;; Cluster Creation & Management
-;;;---------------------------------------------------------------------------
+;;---------------------------------------------------------------------------
 
 ;;;###autoload
 (defmacro warp:defcluster (name &rest body)
@@ -1388,8 +1402,10 @@ Returns:
 
 Side Effects:
 - Creates and starts a new cluster runtime instance."
-  `(let ((config (make-warp-cluster-config :name ',name ,@body)))
-     (warp-cluster--create-instance config)))
+  `(let ((config (make-warp-cluster-config
+                   :name ',name
+                   ,@body)))
+      (warp-cluster--create-instance config)))
 
 ;;;###autoload
 (defun warp:cluster-shutdown (cluster &optional force)
@@ -1422,7 +1438,7 @@ Side Effects:
       (:then (final-state)
         ;; Trigger the final plugin hook.
         (warp:trigger-cluster-lifecycle-hook
-         'after-cluster-shutdown cluster-id final-state)
+          'after-cluster-shutdown cluster-id final-state)
         (warp:log! :info cluster-id
                    "Cluster '%s' shutdown complete in state %S."
                    (warp-cluster-name cluster) final-state)))))
@@ -1449,7 +1465,8 @@ Signals:
   (let* ((system (warp-cluster-component-system cluster))
          (balancer (warp:component-system-get system :load-balancer)))
     (unless balancer
-      (error "The load-balancer component is not loaded. Is a service discovery plugin active?"))
+      (error "The load-balancer component is not loaded. 
+              Is a service discovery plugin active?"))
     (warp:balance balancer :session-id session-id :pool-name pool-name)))
 
 ;;;###autoload
@@ -1469,7 +1486,7 @@ Returns:
 Signals:
 - `warp-service-not-found`: If no healthy endpoints are available."
   (let ((client (warp:component-system-get
-                  (warp-cluster-component-system cluster) :service-client)))
+                   (warp-cluster-component-system cluster) :service-client)))
     (warp:service-client-get-endpoint client service-name)))
 
 ;;;###autoload
@@ -1486,12 +1503,12 @@ Returns:
   ;; The presence and state of the active :coordinator component determines
   ;; leadership status for this node.
   (let ((coord (warp:component-system-get
-                 (warp-cluster-component-system cluster) :coordinator)))
+                   (warp-cluster-component-system cluster) :coordinator)))
     (and coord (eq (warp:coordinator-get-role coord) :leader))))
 
 ;;;---------------------------------------------------------------------------
 ;;; Dynamic Scaling Plugin Definition
-;;;---------------------------------------------------------------------------
+;;---------------------------------------------------------------------------
 
 (warp:defplugin :dynamic-scaling
   "Provides dynamic worker pool allocation and autoscaling for the cluster.
@@ -1502,175 +1519,194 @@ and automatically scale based on observed metrics."
   :dependencies '(cluster-orchestrator event-system config-service state-manager)
   :profiles
   `((:cluster-worker
-    :components
-    `((load-balancer
-       :doc "Selects the best worker using a metrics-aware strategy."
-       :requires '(config-service state-manager)
-       :factory (lambda (cfg-svc state-mgr)
-                  (warp:balancer-strategy-create
-                   :type (warp:config-service-get
-                          cfg-svc :load-balance-strategy
-                          'intelligent-worker-balancer)
-                   ;; Health check now uses the detailed report, ensuring a
-                   ;; worker is not just alive but fully operational.
-                   :health-check-fn
-                   (lambda (worker)
-                     (when-let ((report (warp-managed-worker-latest-health-report
-                                         worker)))
-                       (eq (warp-health-report-overall-status report) :UP)))
-                   ;; Function to retrieve all workers, optionally filtered.
-                   :get-all-workers-fn
-                   (lambda (&key pool-name)
-                     (let ((workers
-                            (hash-table-values
-                             (warp-worker-manager-state-workers
-                              (warp:state-manager-get
-                               state-mgr '(:workers))))))
-                       (if pool-name
-                           (cl-remove-if-not
-                            (lambda (w)
-                              (string= (warp-managed-worker-pool-name w)
-                                       pool-name))
-                            workers)
-                         workers)))
-                   ;; Calculates load, penalizing degraded workers.
-                   :connection-load-fn
-                   (lambda (m-worker)
-                     (let* ((metrics (warp-managed-worker-last-reported-metrics
-                                      m-worker))
-                            (base-load (if metrics
-                                           (gethash :active-request-count
-                                                    metrics 0)
-                                         0))
-                            (penalty (warp:config-service-get
-                                      cfg-svc :degraded-load-penalty 1000)))
-                       (if (eq (warp-managed-worker-health-status
-                                m-worker) :DEGRADED)
-                           (+ base-load penalty)
-                         base-load)))
-                   ;; Enables adaptive, weighted load balancing. It calculates
-                   ;; a worker's 'effective weight' in real-time based on
-                   ;; health and resource utilization.
-                   :dynamic-effective-weight-fn
-                   (lambda (m-worker)
-                     (let* ((report (warp-managed-worker-latest-health-report
-                                     m-worker))
-                            (health (if report
-                                        (warp-health-report-overall-status
-                                         report)
-                                      (warp-managed-worker-health-status
-                                       m-worker)))
-                            (weight (warp-managed-worker-initial-weight m-worker))
-                            (metrics (warp-managed-worker-last-reported-metrics
-                                      m-worker))
-                            (cpu (if metrics (gethash :cpu-utilization
-                                                      metrics 0.0) 0.0))
-                            (reqs (if metrics (gethash :active-request-count
-                                                       metrics 0) 0)))
-                       (pcase health
-                         ((or :DOWN :UNHEALTHY) 0.0) ; No traffic.
-                         (:DEGRADED (* weight 0.25)) ; Reduced traffic.
-                         ;; Healthy: adjust weight based on CPU/req load.
-                         (_ (let ((cpu-penalty (cond ((> cpu 80.0) 0.1)
-                                                     ((> cpu 50.0) 0.5)
-                                                     (t 1.0)))
-                                  (req-penalty (cond ((> reqs 50) 0.1)
-                                                     ((> reqs 20) 0.5)
-                                                     (t 1.0))))
-                              ;; `max` ensures weight is never zero.
-                              (max 0.001 (* weight cpu-penalty req-penalty)))))))))
-      :metadata `(:leader-only t))
+      :components
+      `((load-balancer
+         :doc "Selects the best worker using a metrics-aware strategy."
+         :requires '(config-service state-manager health-check-service) 
+         :factory (lambda (cfg-svc state-mgr health-svc)
+                    (warp:balancer-strategy-create
+                      :type (warp:config-service-get
+                             cfg-svc '(:resource-config :load-balance-strategy)
+                             'intelligent-worker-balancer)
+                      ;; Health check now uses the detailed report, ensuring a
+                      ;; worker is not just alive but fully operational.
+                      :health-check-fn
+                      (lambda (worker)
+                        (when-let ((report (warp-managed-worker-latest-health-report
+                                              worker)))
+                          (eq (warp-health-report-overall-status report) :UP)))
+                      ;; Function to retrieve all workers, optionally filtered.
+                      :get-all-workers-fn
+                      (lambda (&key pool-name)
+                        (let ((workers
+                               (hash-table-values
+                                (warp-worker-manager-state-workers
+                                 (loom:await (warp:state-manager-get
+                                              state-mgr '(:workers)))))))
+                          (if pool-name
+                              (cl-remove-if-not
+                               (lambda (w)
+                                 (string= (warp-managed-worker-pool-name w)
+                                          pool-name))
+                               workers)
+                            workers)))
+                      ;; Calculates load, penalizing degraded workers.
+                      :connection-load-fn
+                      (lambda (m-worker)
+                        (let* ((metrics (warp-managed-worker-last-reported-metrics
+                                          m-worker))
+                               (base-load (if metrics
+                                              (gethash :active-request-count
+                                                       metrics 0)
+                                            0))
+                               (penalty (warp:config-service-get
+                                          cfg-svc '(:resource-config :degraded-load-penalty)
+                                          1000)))
+                          (if (eq (warp-managed-worker-health-status
+                                    m-worker) :DEGRADED)
+                              (+ base-load penalty)
+                            base-load)))
+                      :dynamic-effective-weight-fn
+                      (lambda (m-worker)
+                        (let* ((report (warp-managed-worker-latest-health-report
+                                          m-worker))
+                               (health (if report
+                                           (warp-health-report-overall-status
+                                            report)
+                                         (warp-managed-worker-health-status
+                                          m-worker)))
+                               (weight (warp-managed-worker-initial-weight m-worker))
+                               (metrics (warp-managed-worker-last-reported-metrics
+                                          m-worker))
+                               (cpu (if metrics (gethash :cpu-utilization
+                                                          metrics 0.0) 0.0))
+                               (reqs (if metrics (gethash :active-request-count
+                                                           metrics 0) 0)))
+                          
+                          ;; Proactively check for predictive failures.
+                          (let* ((worker-id (warp-managed-worker-id m-worker))
+                                 (predictive-report (loom:await
+                                                     (warp:health-get-predictive-report
+                                                      health-svc
+                                                      worker-id
+                                                      '(:memory-exhaustion-predictor
+                                                        :disk-space-predictor))))
+                                 (is-failing-predictively
+                                   (cl-some (lambda (status) (not (eq status :UP)))
+                                            (hash-table-values predictive-report))))
+                            (when is-failing-predictively
+                              (warp:log! :warn 
+                                         "load-balancer" "Proactively draining 
+                                          traffic from worker %s due to predictive failure." 
+                                          worker-id)
+                              (return-from nil 0.0)))
+
+                          ;; Original weight calculation logic follows.
+                          (pcase health
+                            ((or :DOWN :UNHEALTHY) 0.0) ; No traffic.
+                            (:DEGRADED (* weight 0.25)) ; Reduced traffic.
+                            ;; Healthy: adjust weight based on CPU/req load.
+                            (_ (let ((cpu-penalty (cond ((> cpu 80.0) 0.1)
+                                                         ((> cpu 50.0) 0.5)
+                                                         (t 1.0)))
+                                     (req-penalty (cond ((> reqs 50) 0.1)
+                                                        ((> reqs 20) 0.5)
+                                                        (t 1.0))))
+                                 ;; `max` ensures weight is never zero.
+                                 (max 0.001 (* weight cpu-penalty req-penalty)))))))))))
+        :metadata `(:leader-only t))
 
       (allocator
-       :doc "The allocator engine, responsible for executing scaling policies."
-       :requires '(cluster-orchestrator event-system)
-       :factory (lambda (cluster es)
-                  (warp:allocator-create
-                   :id (format "%s-allocator" (warp-cluster-id cluster))
-                   :event-system es))
-       :start #'warp:allocator-start
-       :stop #'warp:allocator-stop
-       :metadata `(:leader-only t))
+        :doc "The allocator engine, responsible for executing scaling policies."
+        :requires '(cluster-orchestrator event-system resource-pool-manager-client)
+        :factory (lambda (cluster es rpm-client)
+                   (warp:allocator-create
+                     :id (format "%s-allocator" (warp-cluster-id cluster))
+                     :event-system es
+                     :resource-pool-manager-client rpm-client))
+        :start #'warp:allocator-start
+        :stop #'warp:allocator-stop
+        :metadata `(:leader-only t))
 
       (resource-pool-manager
-       :doc "The component that provides the resource pool management service."
-       :requires '(config-service)
-       :factory (lambda (cfg)
-                  (warp:get-resource-pool-manager-service :default-impl))
-       :metadata `(:leader-only t))
+        :doc "The component that provides the resource pool management service."
+        :requires '(component-system)
+        :factory (lambda (system)
+                   (warp:get-resource-pool-manager-service :default-impl))
+        :metadata `(:leader-only t))
 
       (worker-pool-manager
-       :doc "Creates and manages all configured `warp-worker-pool` instances."
-       :requires '(cluster-orchestrator config-service allocator)
-       :start (lambda (_ system)
-                "On start, this component reads the cluster configuration and
-instantiates a `warp-worker-pool` for each entry. Each pool then
-auto-registers with the allocator."
-                (let ((cluster (warp:component-system-get
-                                system :cluster-orchestrator))
-                      (cfg (warp:component-system-get system :config-service))
-                      (allocator (warp:component-system-get system :allocator)))
-                  (dolist (pool-cfg (warp:config-service-get cfg :worker-pools))
-                    (let* ((pool-name (plist-get pool-cfg :name))
-                           (pool (warp:worker-pool-create cluster pool-cfg)))
-                      (loom:await (warp:worker-pool-start pool allocator))
-                      ;; Dynamically add the pool as a manageable component.
-                      (warp:component-system-add-component
-                       system
-                       (intern pool-name)
-                       (lambda () pool)
-                       :stop (lambda (p) (warp:worker-pool-stop p)))))))
-       :metadata `(:leader-only t))
+        :doc "Creates and manages all configured `warp-worker-pool` instances."
+        :requires '(cluster-orchestrator config-service allocator)
+        :start (lambda (_ system)
+                 "On start, this component reads the cluster configuration and
+                instantiates a `warp-worker-pool` for each entry. Each pool then
+                auto-registers with the allocator."
+                 (let ((cluster (warp:component-system-get
+                                   system :cluster-orchestrator))
+                       (cfg (warp:component-system-get system :config-service))
+                       (allocator (warp:component-system-get system :allocator)))
+                   (dolist (pool-cfg (warp:config-service-get cfg '(:resource-config :worker-pools)))
+                     (let* ((pool-name (plist-get pool-cfg :name))
+                            (pool (warp:worker-pool-create cluster pool-cfg)))
+                       (loom:await (warp:worker-pool-start pool allocator))
+                       ;; Dynamically add the pool as a manageable component.
+                       (warp:component-system-add-component
+                         system
+                         (intern pool-name)
+                         (lambda () pool)
+                         :stop (lambda (p) (warp:worker-pool-stop p)))))))
+        :metadata `(:leader-only t))
 
       (autoscaler-manager
-       :doc "Creates and manages autoscaler monitors for configured pools."
-       :requires '(config-service allocator telemetry-pipeline)
-       :start (lambda (_ system)
-                "On start, this component reads the cluster configuration and
-initializes an autoscaler for each configured pool."
-                (let ((allocator (warp:component-system-get system :allocator))
-                      (telemetry (warp:component-system-get
-                                  system :telemetry-pipeline))
-                      (cfg (warp:component-system-get system :config-service)))
-                  ;; Initialize the autoscaler subsystem once.
-                  (warp:autoscaler-initialize
-                   (warp:component-system-get system :event-system))
-                  ;; Iterate through the configured worker pools.
-                  (dolist (pool-cfg (warp:config-service-get cfg :worker-pools))
-                    (when-let ((strat-name (plist-get pool-cfg
-                                                      :autoscaler-strategy)))
-                      (let ((pool-name (plist-get pool-cfg :name))
-                            (strategy (symbol-value strat-name)))
-                        (warp:log! :info "autoscaler"
-                                   "Configuring autoscaler for pool '%s' with strategy '%s'."
-                                   pool-name strat-name)
-                        (warp:autoscaler-create
-                         allocator pool-name
-                         ;; This is the integration point. The metrics
-                         ;; provider now fetches rich, aggregated data from
-                         ;; the central telemetry pipeline.
-                         (lambda ()
-                           (braid! (warp:telemetry-pipeline-get-latest-metrics
-                                     telemetry)
-                             (:then (metrics-hash)
-                               `(:avg-cluster-cpu-utilization
-                                 ,(gethash "cpu.usage.percent"
-                                           metrics-hash 0.0)
-                                 :total-active-requests
-                                 ,(gethash "rpc.requests.active"
-                                           metrics-hash 0)
-                                 :avg-cluster-memory-utilization
-                                 ,(gethash "memory.usage.mb"
-                                           metrics-hash 0.0)))))
-                         strategy))))))
-       :metadata `(:leader-only t)))
+        :doc "Creates and manages autoscaler monitors for configured pools."
+        :requires '(config-service allocator telemetry-pipeline)
+        :start (lambda (_ system)
+                 "On start, this component reads the cluster configuration and
+                initializes an autoscaler for each configured pool."
+                 (let ((allocator (warp:component-system-get system :allocator))
+                       (telemetry (warp:component-system-get
+                                     system :telemetry-pipeline))
+                       (cfg (warp:component-system-get system :config-service)))
+                   ;; Initialize the autoscaler subsystem once.
+                   (warp:autoscaler-initialize
+                     (warp:component-system-get system :event-system))
+                   ;; Iterate through the configured worker pools.
+                   (dolist (pool-cfg (warp:config-service-get cfg '(:resource-config :worker-pools)))
+                     (when-let ((strat-name (plist-get pool-cfg
+                                                         :autoscaler-strategy)))
+                       (let ((pool-name (plist-get pool-cfg :name))
+                             (strategy (symbol-value strat-name)))
+                         (warp:log! :info "autoscaler"
+                                    "Configuring autoscaler for pool '%s' with strategy '%s'."
+                                    pool-name strat-name)
+                         (warp:autoscaler-create
+                           allocator pool-name
+                           ;; This is the integration point. The metrics
+                           ;; provider now fetches rich, aggregated data from
+                           ;; the central telemetry pipeline.
+                           (lambda ()
+                             (braid! (warp:telemetry-pipeline-get-latest-metrics
+                                       telemetry)
+                               (:then (metrics-hash)
+                                 `(:avg-cluster-cpu-utilization
+                                   ,(gethash "cpu.usage.percent"
+                                             metrics-hash 0.0)
+                                   :total-active-requests
+                                   ,(gethash "rpc.requests.active"
+                                             metrics-hash 0)
+                                   :avg-cluster-memory-utilization
+                                   ,(gethash "memory.usage.mb"
+                                             metrics-hash 0.0)))))
+                           strategy))))))
+        :metadata `(:leader-only t)))
       )))
 
 ;;;---------------------------------------------------------------------------
 ;;; Cluster Runtime Type Definition
-;;;---------------------------------------------------------------------------
+;;---------------------------------------------------------------------------
 
-(warp:defruntime cluster-worker
+(warp:defruntime :cluster
   "Defines the specialized runtime blueprint for a cluster orchestrator node.
 This runtime type is the top-level process for a Warp cluster. It does not
 run application-specific logic itself but instead manages the lifecycle of
@@ -1708,16 +1744,14 @@ plane for the entire system."
              :default-security-engine
              ;; Adds auditing, compliance, and real-time threat detection.
              :security
-             ;; Prevents workers from executing arbitrary code.
-             :sandbox-enforcer
-             ;; Provides the safe configuration and rolling update support.      
+             ;; Provides configuration and deployment for the cluster.
              :deployment
-             ;;; Provides configuration and deployment for the cluster.
+             ;; Provides configuration and deployment for the cluster.
              :manager))
 
 ;;;---------------------------------------------------------------------------
 ;;; System Shutdown Hook
-;;;---------------------------------------------------------------------------
+;;---------------------------------------------------------------------------
 
 (defun warp-cluster--cleanup-all ()
   "A `kill-emacs-hook` function to gracefully shut down all active clusters.

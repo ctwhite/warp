@@ -52,6 +52,7 @@
 (require 'warp-registry)
 (require 'warp-plugin)
 (require 'warp-service)
+(require 'warp-managed-worker)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -109,15 +110,17 @@ Fields:
   (resource-manager (cl-assert nil) :type t)
   (telemetry (cl-assert nil) :type t))
 
-
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Pluggable Strategy Pattern
 
-(cl-defgeneric warp:placement-strategy-evaluate (strategy task nodes)
+(cl-defgeneric warp:scheduler-evaluate-strategy (scheduler strategy task nodes)
   "Evaluate a single placement strategy to filter or score nodes.
+This is a generic function that dispatches to a specific method based on the
+strategy's name, promoting a polymorphic design.
 
 Arguments:
-- `STRATEGY` (t): The concrete strategy instance (e.g., a function).
+- `SCHEDULER` (warp-scheduler): The scheduler component instance.
+- `STRATEGY` (t): The concrete strategy to evaluate.
 - `TASK` (t): The task to be placed.
 - `NODES` (list): The list of candidate nodes.
 
@@ -125,27 +128,45 @@ Returns:
 - (list): A filtered list of nodes or a list of `(score . node)` pairs."
   (:documentation "The generic function for all placement strategies."))
 
-;;;###autoload
-(defmacro warp:defplacement-strategy (name docstring &rest body)
-  "Define and register a new, pluggable placement strategy.
-This macro allows developers to add new scheduling rules to the system
-declaratively. It registers a lambda function with a unique name
-in a central registry.
+(cl-defmethod warp:scheduler-evaluate-strategy (scheduler strategy task nodes)
+  "Default method for `warp:scheduler-evaluate-strategy`.
 
 Arguments:
-- `NAME` (keyword): The unique keyword for the strategy (e.g., `:resource-fit`).
-- `DOCSTRING` (string): Documentation for the strategy.
-- `BODY` (forms): The implementation of the strategy as a lambda.
-  The body should accept two arguments: `task` and `nodes`.
+- `scheduler` (warp-scheduler): The scheduler component instance.
+- `strategy` (t): The concrete strategy.
+- `task` (t): The task to be placed.
+- `nodes` (list): The list of candidate nodes.
+
+Returns:
+- (list): An unfiltered list of nodes."
+  (declare (ignore scheduler strategy task))
+  nodes)
+
+(defmacro warp:defplacement-strategy (name docstring &rest body)
+  "Define and register a new, pluggable placement strategy.
+This macro defines a placement strategy and registers it in a central
+registry. The implementation is defined as a method on the generic
+`warp:scheduler-evaluate-strategy`, making it a truly pluggable part of
+the system.
+
+Arguments:
+- `name` (keyword): The unique keyword for the strategy (e.g., `:resource-fit`).
+- `docstring` (string): Documentation for the strategy.
+- `body` (forms): The implementation of the strategy as a method body.
+  The body should be a lambda that accepts `scheduler`, `task`, and `nodes`.
 
 Returns:
 - (symbol): The `NAME` of the defined strategy."
-  (let ((fn-name (intern (format "warp-placement-strategy-%s" name))))
-    `(progn
-       (defun ,fn-name (task nodes) ,docstring ,@body)
-       (let ((registry (warp-scheduler--get-strategy-registry)))
-         (warp:registry-add registry ,name #',fn-name :overwrite-p t))
-       ',name)))
+  `(progn
+     (defmethod warp:scheduler-evaluate-strategy
+         ((scheduler warp-scheduler)
+          (strategy (eql ,name))
+          task nodes)
+       ,docstring
+       (lambda (task nodes) ,@body))
+     (let ((registry (warp-scheduler--get-strategy-registry)))
+       (warp:registry-add registry ,name t :overwrite-p t))
+     ',name))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Core Strategy Implementations
@@ -156,25 +177,25 @@ This implementation filters out nodes that do not meet the minimum CPU
 and memory requirements specified in the task's metadata.
 
 Arguments:
-- `TASK` (plist): The task to be placed, with a definition of its resource needs.
+- `scheduler` (warp-scheduler): The scheduler component.
+- `task` (plist): The task to be placed, with a definition of its resource needs.
   - `(:required-cpu . 0.5)` (float): Required CPU core count.
   - `(:required-memory . 512)` (integer): Required memory in MB.
-- `NODES` (list): The list of candidate worker nodes.
+- `nodes` (list): The list of candidate worker nodes.
 
 Returns:
 - (loom-promise): A promise that resolves with a filtered list of nodes."
   (lambda (task nodes)
     (warp:log! :debug "scheduler" "Applying :resource-fit strategy.")
     (let* ((required-cpu (plist-get task :required-cpu 0.0))
-           (required-mem (plist-get task :required-memory 0)))
+           (required-mem (plist-get task :required-memory 0))
+           (telemetry-pipeline (warp-scheduler-telemetry scheduler)))
       (braid! (loom:all (mapcar (lambda (node)
-                                  ;; Get the latest metrics for each node.
                                   (warp:telemetry-pipeline-get-latest-metrics
-                                   (warp-scheduler-telemetry scheduler)
+                                   telemetry-pipeline
                                    :worker-id (warp-managed-worker-worker-id node)))
                                 nodes))
         (:then (all-metrics)
-          ;; Filter nodes based on their reported metrics.
           (let ((fit-nodes (cl-remove-if-not
                             (lambda (node metrics)
                               (let ((available-cpu (- 1.0 (gethash "cpu.usage.percent" metrics 0.0)))
@@ -190,9 +211,10 @@ Returns:
 This implementation filters for nodes with a specific `affinity-tag`.
 
 Arguments:
-- `TASK` (plist): The task to be placed.
+- `scheduler` (warp-scheduler): The scheduler component.
+- `task` (plist): The task to be placed.
   - `(:affinity-tag . \"database\")` (string): The required tag.
-- `NODES` (list): The list of candidate nodes.
+- `nodes` (list): The list of candidate nodes.
 
 Returns:
 - (loom-promise): A promise that resolves with a filtered list of nodes
@@ -203,11 +225,9 @@ Returns:
       (if affinity-tag
           (let ((filtered-nodes (cl-remove-if-not
                                  (lambda (node)
-                                   ;; Assuming node has a `tags` plist.
                                    (member affinity-tag (plist-get node :tags)))
                                  nodes)))
             (loom:resolved! filtered-nodes))
-        ;; If no tag is specified, all nodes are valid candidates.
         (loom:resolved! nodes)))))
 
 (warp:defplacement-strategy :anti-affinity
@@ -216,9 +236,10 @@ This implementation filters nodes to ensure no two tasks with the same
 `anti-affinity-group` are placed on the same node.
 
 Arguments:
-- `TASK` (plist): The task to be placed.
+- `scheduler` (warp-scheduler): The scheduler component.
+- `task` (plist): The task to be placed.
   - `(:anti-affinity-group . \"web-server-v1\")` (string): The anti-affinity group.
-- `NODES` (list): The list of candidate nodes.
+- `nodes` (list): The list of candidate nodes.
 
 Returns:
 - (loom-promise): A promise that resolves with a filtered list of nodes
@@ -227,8 +248,6 @@ Returns:
     (warp:log! :debug "scheduler" "Applying :anti-affinity strategy.")
     (let ((anti-affinity-group (plist-get task :anti-affinity-group)))
       (if anti-affinity-group
-          ;; In a real system, we'd check a central state store for other tasks
-          ;; with this group on a given node and filter them out.
           (let ((filtered-nodes (cl-remove-if
                                  (lambda (node)
                                    (member anti-affinity-group (plist-get node :running-groups)))
@@ -242,8 +261,9 @@ This implementation simply sorts the nodes by a `cost-per-hour` metric
 and returns the one with the lowest cost.
 
 Arguments:
-- `TASK` (t): The task to be placed.
-- `NODES` (list): The list of candidate nodes.
+- `scheduler` (warp-scheduler): The scheduler component.
+- `task` (t): The task to be placed.
+- `nodes` (list): The list of candidate nodes.
 
 Returns:
 - (loom-promise): A promise that resolves with a filtered list containing
@@ -359,16 +379,13 @@ Returns:
       (warp:log! :debug "scheduler" "Applying :resource-fit strategy.")
       (let* ((required-cpu (plist-get task :required-cpu 0.0))
              (required-mem (plist-get task :required-memory 0))
-             ;; Get the scheduler's telemetry pipeline instance for metric lookups.
              (telemetry-pipeline (warp-scheduler-telemetry (current-component-instance))))
         (braid! (loom:all (mapcar (lambda (node)
-                                    ;; Get the latest metrics for each node.
                                     (warp:telemetry-pipeline-get-latest-metrics
                                      telemetry-pipeline
                                      :worker-id (warp-managed-worker-worker-id node)))
                                   nodes))
           (:then (all-metrics)
-            ;; Filter nodes based on their reported metrics.
             (let ((fit-nodes (cl-remove-if-not
                               (lambda (node metrics)
                                 (let ((available-cpu (- 1.0 (gethash "cpu.usage.percent" metrics 0.0)))

@@ -8,24 +8,41 @@
 ;; discovery, and retry logic, offering a simple and robust interface
 ;; for acquiring and releasing distributed locks.
 ;;
-;; This design decouples the client's business logic from the
-;; coordinator's implementation, allowing any component to safely
-;; use distributed locks without needing direct access to the
-;; coordinator's internal state or RPC handlers.
+;; ## The "Why": The Need for Mutual Exclusion in a Distributed System
 ;;
-;; ## Key Features:
+;; When multiple processes, potentially on different machines, need to
+;; access a shared resource, you need a way to ensure that only one process
+;; can access it at a time. A local mutex is insufficient as it only works
+;; within a single process. A **distributed lock** is the solution for
+;; coordinating actions across an entire cluster.
 ;;
-;; - **Declarative `warp:with-distributed-lock` Macro:** A powerful
-;;   macro that ensures locks are always acquired and released safely,
-;;   even in the event of an error.
+;; It is a critical primitive for ensuring data consistency, preventing
+;; race conditions in distributed workflows, and implementing leader-only
+;; tasks.
 ;;
-;; - **Resilient Operations:** The underlying functions automatically
-;;   handle retries and leader redirection, providing a fault-tolerant
-;;   client experience.
+;; ## The "How": A Client Facade over a Central Coordinator
 ;;
-;; - **Clean Separation of Concerns:** The client code is focused on
-;;   the locking primitive itself, not on how the lock is managed
-;;   by the cluster leader.
+;; This module does not implement the lock logic itself. Instead, it acts
+;; as a clean client facade for the `:coordinator-service`.
+;;
+;; 1.  **Centralized Authority**: The lock is managed by a central authority—the
+;;     cluster **leader** node (as determined by the `warp-coordinator`). All
+;;     requests to acquire or release a lock are sent via RPC to this leader,
+;;     which ensures that only one client can hold the lock at any given time.
+;;
+;; 2.  **Lease-Based Locking**: The locks granted by the coordinator are
+;;     typically lease-based (this is an implementation detail of the
+;;     coordinator). This means a lock is granted for a specific duration.
+;;     This is a safety mechanism that prevents a client that crashes while
+;;     holding a lock from blocking the entire system forever; the lease
+;;     would eventually expire.
+;;
+;; 3.  **Safe, Declarative API**: The primary way to use this module is
+;;     through the `warp:with-distributed-lock` macro. It is the distributed
+;;     equivalent of a local `with-mutex`. It guarantees that a lock is
+;;     **always** released after the critical section of code is executed,
+;;     even if an error occurs. This is the safest way to use the feature
+;;     and prevents accidental deadlocks.
 
 ;;; Code:
 
@@ -38,6 +55,7 @@
 (require 'warp-protocol)
 (require 'warp-rpc)
 (require 'warp-coordinator)
+(require 'warp-service)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -47,7 +65,7 @@
   'warp-error)
 
 (define-error 'warp-distributed-lock-timeout
-  "A distributed lock operation timed out."
+  "A distributed lock operation timed out while waiting for acquisition."
   'warp-distributed-lock-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -55,68 +73,60 @@
 
 ;;;###autoload
 (defmacro warp:with-distributed-lock ((lock-name &key (timeout 30.0)
-                                                 (coordinator-instance
-                                                  'warp-coordinator-instance))
+                                                 (coordinator-service
+                                                  'coordinator-service))
                                       &rest body)
-  "Acquires a distributed lock, executes BODY, and ensures the lock
-is released, even if an error occurs.
-
+  "Acquire a distributed lock, execute BODY, and ensure release.
 This macro provides a safe and idiomatic way to use distributed locks.
-It handles all the boilerplate of acquiring the lock, running the critical
-section (`BODY`), and then releasing the lock in a `unwind-protect` block
-to guarantee cleanup.
+It handles acquiring the lock, running the critical section (`BODY`),
+and releasing the lock in a `:finally` block to guarantee cleanup.
 
 Arguments:
 - `LOCK-NAME` (string): The unique name of the lock to acquire.
-- `:timeout` (number): The maximum time in seconds to wait for the lock.
-- `:coordinator-instance` (symbol): The variable name holding the
-  `warp-coordinator-instance` to use for the lock requests. This allows
-  the macro to be used with a specific coordinator instance from the
-  calling context, typically retrieved from the component system.
+- `:timeout` (number, optional): Max time in seconds to wait for the
+  lock. Defaults to 30.0.
+- `:coordinator-service` (symbol, optional): The variable holding the
+  `:coordinator-service` client. Defaults to `coordinator-service`.
 - `BODY` (forms): The code to execute while the lock is held.
 
 Returns:
-- The result of the last form in `BODY`.
+- (loom-promise): A promise resolving with the result of the last form in
+  `BODY`.
 
 Signals:
-- `warp-distributed-lock-error` or `warp-distributed-lock-timeout` if
-  the lock cannot be acquired or released.
-
-Example:
-(let ((my-coordinator (warp:component-system-get system :coordinator)))
-  (braid! (warp:with-distributed-lock (\"my-resource-lock\"
-                                       :coordinator-instance my-coordinator)
-    (loom:await (perform-critical-operation))
-    'success)
-  (:then (result)
-    (warp:log! :info \"Operation was a success: %S\" result))))"
-  (let ((lock-acquired-p (make-symbol "lock-acquired-p"))
-        (result-symbol (make-symbol "result")))
-    `(loom:with-async-unwind-protect
-        (braid! (warp:distributed-lock-acquire ,coordinator-instance
-                                              ,lock-name :timeout ,timeout)
-          (:then (,lock-acquired-p)
-            (when ,lock-acquired-p
-              (warp:log! :debug ,coordinator-instance "Lock '%s' acquired."
-                         ,lock-name)
-              (let ((,result-symbol (progn ,@body)))
-                (loom:resolved! ,result-symbol)))))
-      (lambda ()
-        (when ,lock-acquired-p
-          (warp:log! :debug ,coordinator-instance "Releasing lock '%s'."
-                     ,lock-name)
-          (loom:await (warp:distributed-lock-release ,coordinator-instance
-                                                    ,lock-name)))))))
+- Rejects promise with `warp-distributed-lock-error` or
+  `warp-distributed-lock-timeout` if the lock cannot be acquired."
+  (let ((lock-acquired-p (make-symbol "lock-acquired-p")))
+    `(let ((,lock-acquired-p nil))
+       (braid!
+         ;; 1. Attempt to acquire the distributed lock.
+         (warp:distributed-lock-acquire ,coordinator-service ,lock-name
+                                        :timeout ,timeout)
+         (:then (acquired)
+           (setq ,lock-acquired-p acquired)
+           (when ,lock-acquired-p
+             (warp:log! :debug "distributed-lock" "Lock '%s' acquired."
+                        ,lock-name)
+             ;; 2. If successful, execute the user-provided body.
+             (progn ,@body)))
+         (:finally (lambda ()
+                     ;; 3. This block is guaranteed to run, ensuring the lock
+                     ;; is always released if it was acquired.
+                     (when ,lock-acquired-p
+                       (warp:log! :debug "distributed-lock"
+                                  "Releasing lock '%s'." ,lock-name)
+                       (loom:await (warp:distributed-lock-release
+                                    ,coordinator-service ,lock-name)))))))))
 
 ;;;###autoload
-(cl-defun warp:distributed-lock-acquire (coordinator lock-name &key timeout)
-  "Acquires a distributed lock.
-This function wraps the RPC call to the coordinator, handling retries,
-timeouts, and leader redirection.
+(cl-defun warp:distributed-lock-acquire (coordinator-service lock-name
+                                                            &key timeout)
+  "Acquire a distributed lock by calling the coordinator service.
+This function wraps the RPC call to the coordinator, handling timeouts
+and error propagation.
 
 Arguments:
-- `COORDINATOR` (warp-coordinator-instance): The coordinator instance
-  used to send the lock request.
+- `COORDINATOR-SERVICE` (t): Client for the `:coordinator-service`.
 - `LOCK-NAME` (string): The unique name of the lock to acquire.
 - `:timeout` (number, optional): Max seconds to wait for the lock.
 
@@ -124,88 +134,63 @@ Returns:
 - (loom-promise): A promise that resolves to `t` if the lock is acquired.
 
 Signals:
-- `warp-distributed-lock-timeout` if the operation times out.
-- `warp-distributed-lock-error` for other failures."
-  (let* ((req-timeout (or timeout
-                          (warp-coordinator-config-rpc-timeout
-                           (warp-coordinator-config coordinator))))
-         (expiry-time (+ (float-time)
-                         (warp-coordinator-config-lock-lease-time
-                          (warp-coordinator-config coordinator))))
-         (holder-id (warp-coordinator-id coordinator)))
-
-    (braid! (warp-coordinator--rpc-call-with-leader-retry
-             coordinator
-             (lambda ()
-               (warp-protocol-make-command
-                :coordinator-acquire-lock
-                :lock-name lock-name
-                :holder-id holder-id
-                :expiry-time expiry-time))
-             :timeout req-timeout
-             :client-id holder-id
-             :op-name (format "Lock acquisition for '%s'" lock-name))
-      (:then (response)
-        (let ((payload (warp-rpc-command-args response)))
-          (if (plist-get payload :granted-p)
-              t
-            (loom:rejected!
-             (warp:error! :type 'warp-distributed-lock-error
-                          :message (format "Failed to acquire lock '%s': %s"
-                                           lock-name (plist-get payload :error)))))))
-      (:catch (err)
+- Rejects with `warp-distributed-lock-timeout` or
+  `warp-distributed-lock-error`."
+  (braid!
+      ;; Delegate the RPC call to the coordinator service. The coordinator's
+      ;; leader node is the central authority for all locks.
+      (coordinator-service-acquire-lock coordinator-service lock-name timeout)
+    (:then (response)
+      ;; Check the response payload to confirm the lock was granted.
+      (if (plist-get response :granted-p)
+          t
         (loom:rejected!
-         (warp:error! :type (if (eq (car (error-message-string err))
-                                    'warp-coordinator-timeout)
-                                'warp-distributed-lock-timeout
-                              'warp-distributed-lock-error)
-                      :message (error-message-string err)
-                      :cause err))))))
+         (warp:error! :type 'warp-distributed-lock-error
+                      :message (format "Failed to acquire lock '%s': %s"
+                                       lock-name
+                                       (plist-get response :error))))))
+    (:catch (err)
+      ;; Wrap any underlying RPC or transport error in a specific
+      ;; distributed lock error for clearer error handling by the client.
+      (loom:rejected!
+       (warp:error! :type (if (eq (loom-error-type err) 'loom-timeout-error)
+                              'warp-distributed-lock-timeout
+                            'warp-distributed-lock-error)
+                    :message (format "Error acquiring lock '%s'" lock-name)
+                    :cause err)))))
 
 ;;;###autoload
-(defun warp:distributed-lock-release (coordinator lock-name)
-  "Releases a previously acquired distributed lock.
-This function is a non-blocking operation that sends an RPC to the
-leader to release the lock. It should be called to clean up a lock
-after a critical section is complete.
+(defun warp:distributed-lock-release (coordinator-service lock-name)
+  "Release a previously acquired distributed lock.
+This function sends a non-blocking RPC to the leader to release the lock.
 
 Arguments:
-- `COORDINATOR` (warp-coordinator-instance): The coordinator instance.
+- `COORDINATOR-SERVICE` (t): Client for the `:coordinator-service`.
 - `LOCK-NAME` (string): The name of the lock to release.
 
 Returns:
-- (loom-promise): A promise that resolves to `t` if the lock is
-  successfully released.
+- (loom-promise): A promise that resolves to `t` if successfully released.
 
 Signals:
-- `warp-distributed-lock-error` if the release fails."
-  (let* ((req-timeout (warp-coordinator-config-rpc-timeout
-                       (warp-coordinator-config coordinator)))
-         (holder-id (warp-coordinator-id coordinator)))
-    
-    (braid! (warp-coordinator--rpc-call-with-leader-retry
-             coordinator
-             (lambda ()
-               (warp-protocol-make-command
-                :coordinator-release-lock
-                :lock-name lock-name
-                :holder-id holder-id))
-             :timeout req-timeout
-             :client-id holder-id
-             :op-name (format "Lock release for '%s'" lock-name))
-      (:then (response)
-        (let ((payload (warp-rpc-command-args response)))
-          (if (plist-get payload :success-p)
-              t
-            (loom:rejected!
-             (warp:error! :type 'warp-distributed-lock-error
-                          :message (format "Failed to release lock '%s': %s"
-                                           lock-name (plist-get payload :error)))))))
-      (:catch (err)
+- Rejects with `warp-distributed-lock-error` if the release fails."
+  (braid!
+      ;; Delegate the RPC call to the coordinator service.
+      (coordinator-service-release-lock coordinator-service lock-name)
+    (:then (response)
+      ;; Check the response payload to confirm success.
+      (if (plist-get response :success-p)
+          t
         (loom:rejected!
          (warp:error! :type 'warp-distributed-lock-error
-                      :message (error-message-string err)
-                      :cause err))))))
+                      :message (format "Failed to release lock '%s': %s"
+                                       lock-name
+                                       (plist-get response :error))))))
+    (:catch (err)
+      ;; Wrap any underlying error.
+      (loom:rejected!
+       (warp:error! :type 'warp-distributed-lock-error
+                    :message (format "Error releasing lock '%s'" lock-name)
+                    :cause err)))))
 
 (provide 'warp-distributed-lock)
 ;;; warp-distributed-lock.el ends here

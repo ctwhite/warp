@@ -33,9 +33,15 @@
 ;;     errors—are fully encapsulated within this plugin. The external world
 ;;     only interacts with it through its standardized service interface.
 ;;
-;; This design ensures that the system is robust, modular, and easy to
-;; maintain and extend.
+;; ## Enhancement: Rich Health Metrics
 ;;
+;; This version is updated to adhere to the new `transport-protocol-service`
+;; interface contract, which requires implementations to provide rich health
+;; metrics via `get-health-metrics`. This function replaces the old, binary
+;; `health-check-fn` and provides a granular health score based on the
+;; liveness of the underlying processes and the FIFO file itself. This
+;; allows higher-level components to make more intelligent, adaptive
+;; decisions.
 
 ;;; Code:
 
@@ -49,6 +55,7 @@
 (require 'warp-transport)
 (require 'warp-transport-api)
 (require 'warp-plugin)
+(require 'warp-health)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -394,32 +401,6 @@ Returns:
         :details `(:read-proc-live ,(process-live-p read-proc)
                    :write-proc-live ,(process-live-p write-proc)
                    :path-exists ,(file-exists-p path)))))))
-
-(defun warp-pipe--cleanup-orphans ()
-  "Clean up orphaned FIFO files from previous, unclean shutdowns.
-This function is a critical part of the plugin's lifecycle management. It
-is called on plugin load and shutdown to ensure that any leftover FIFO
-files from previous crashes or forced exits are removed, preventing a
-`warp:pipe-creation-error` on subsequent runs.
-
-Arguments:
-- None.
-
-Returns: `nil`."
-  (when warp-pipe-cleanup-orphans-on-startup
-    (warp:log! :info "warp-pipe" "Cleaning up orphaned FIFO files...")
-    (let ((pattern (expand-file-name "warp-pipe-*"
-                                     warp-pipe-default-directory)))
-      (dolist (file (file-expand-wildcards pattern))
-        (when (and (file-exists-p file)
-                   (eq 'fifo (car (file-attributes file))))
-          (condition-case err
-              (progn
-                (delete-file file)
-                (warp:log! :info "warp-pipe" "Deleted orphaned FIFO: %s" file))
-            (error
-             (warp:log! :warn "warp-pipe" "Failed to delete FIFO %s: %S"
-                        file err)))))))
 
 (defun warp-pipe-protocol--address-generator-fn (&key id host)
   "The `address-generator` method for the `:pipe` transport.

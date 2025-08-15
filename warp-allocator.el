@@ -2,22 +2,59 @@
 
 ;;; Commentary:
 ;;
-;; This module implements a generic, dynamic resource allocator. It serves
-;; as the core policy engine for managing groups of resources (like worker
-;; instances) within a Warp cluster.
+;; This module provides the central engine for managing the lifecycle of
+;; resources within a distributed system. It serves as the authoritative
+;; service for requesting changes in the capacity of resource pools, such as
+;; adding or removing worker processes.
 ;;
-;; ## Architectural Role: Separation of Policy and Mechanism
+;; ## The "Why": A Central Authority for Resource Management
 ;;
-;; This module's key design principle is the separation of concerns. It
-;; does not directly create or destroy resources. Instead, it acts as a
-;; central policy engine that makes decisions about scaling.
+;; In a complex system, multiple components may need to influence the number of
+;; active resources. An autoscaler might react to CPU load, an administrator
+-;; might manually provision capacity for a planned event, or a deployment
+;; script might need to perform a rolling update. Without a central authority,
+;; these actors could issue conflicting commands, leading to an unstable and
+;; unpredictable system state.
 ;;
-;; The **mechanism** of actually managing resources is delegated to external
-;; components (like a `warp-worker-pool`) which register a contract with
-;; the allocator via a `warp-resource-spec`. This allows the allocator to
-;; manage any type of resource (Lisp workers, Docker containers, etc.)
-;; through a unified interface.
+;; The **Allocator** acts as that central authority. It provides a single,
+;; unified API (`allocator-service`) for all scaling operations. By routing
+;; all requests through this service, it ensures that:
 ;;
+;; - **Consistency**: All scaling actions are serialized and validated against
+;;   the resource pool's defined limits (e.g., min/max capacity).
+;; - **Safety**: It prevents invalid operations, like scaling to a negative
+;;   number of workers or exceeding a hard-coded maximum.
+;; - **Abstraction**: Clients like the `warp-autoscaler` don't need to know
+;;   *how* a resource is created; they only need to ask the allocator for it.
+;;
+;; ## The "How": The Mechanism Engine
+;;
+;; This module embodies the principle of **separation of concerns**. It is
+;; designed as a pure **mechanism engine**. Its job is to execute scaling
+;; commands, not to decide when they should happen. That decision-making role
+;; belongs to its clients, most notably the `warp-autoscaler` (the "policy
+;; engine").
+;;
+;; The architectural relationship is as follows:
+;;
+;; 1.  **Client Request**: A client (e.g., the autoscaler) determines that a
+;;     pool named "web-workers" needs to scale from 5 to 8 instances.
+;; 2.  **Service Call**: The client calls the `allocator-service` with the
+;;     command: `(scale-pool "web-workers" :target-count 8)`.
+;; 3.  **Allocator Action**: The allocator receives this request. It doesn't
+;;     create the workers itself. Instead, it delegates the task to the
+;;     appropriate underlying **resource pool manager**.
+;; 4.  **Pool Execution**: The `resource-pool-manager` (defined in
+;;     `warp-resource-pool.el`) knows the concrete details of the "web-workers"
+;;     pool and executes the low-level logic to start 3 new worker processes.
+;;
+;; This layered design is crucial for flexibility. The allocator provides a
+;; stable, generic interface for scaling, while the actual implementation of
+;; how to manage a specific type of resource (e.g., a Lisp process, a Docker
+;; container, a VM) is encapsulated within a dedicated resource pool. The
+;; allocator can manage any type of resource pool through this common,
+;; high-level service interface, without being coupled to the implementation
+;; details of any of them.
 
 ;;; Code:
 
@@ -31,9 +68,11 @@
 (require 'warp-event)
 (require 'warp-config)
 (require 'warp-uuid)
-(require 'warp-service) 
+(require 'warp-service)
+(require 'warp-resource-pool)
+(require 'warp-patterns)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Errors Definitions
 
 (define-error 'warp-allocator-error
@@ -48,7 +87,7 @@
   "Requested capacity for a resource pool is invalid."
   'warp-allocator-error)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Configuration
 
 (warp:defconfig allocator-config
@@ -59,33 +98,7 @@ Fields:
   internal loop updates its metrics from registered pools."
   (polling-interval 5.0 :type float :validate (> $ 0.0)))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Schema Definitions
-
-(warp:defschema warp-resource-spec
-  "Defines the contract a resource pool must fulfill to be managed.
-
-This struct is provided by a pool when it registers with the allocator,
-giving the allocator the functions it needs to manage the pool's lifecycle.
-
-Fields:
-- `name` (string): Unique name of the resource pool.
-- `min-capacity` (integer): Minimum number of resources to maintain.
-- `max-capacity` (integer): Maximum allowed resources of this type.
-- `allocation-fn` (function): A function `(lambda (count))` that creates
-  `count` new resources and returns a promise for a list of their IDs.
-- `deallocation-fn` (function): A function `(lambda (count))` that
-  destroys `count` resources and returns a promise for the number destroyed.
-- `get-current-capacity-fn` (function): A function `(lambda ())` that
-  returns a promise for the current number of resources in the pool."
-  (name                    (cl-assert nil) :type string)
-  (min-capacity            0               :type integer)
-  (max-capacity            most-positive-fixnum :type integer)
-  (allocation-fn           (cl-assert nil) :type function)
-  (deallocation-fn         (cl-assert nil) :type function)
-  (get-current-capacity-fn (cl-assert nil) :type function))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definitions
 
 (cl-defstruct (warp-allocator
@@ -93,128 +106,143 @@ Fields:
                (:copier nil))
   "The dynamic resource allocator component.
 
+This struct represents the core policy engine for managing a fleet of
+resource pools. It delegates all resource management operations to the
+`resource-pool-manager-service`, thereby decoupling itself from the
+low-level mechanics of resource creation and destruction.
+
 Fields:
 - `id` (string): Unique ID for this allocator instance.
 - `config` (allocator-config): Configuration for the allocator.
-- `resource-pools` (hash-table): A registry of `warp-resource-spec` objects,
-  keyed by pool name.
 - `event-system` (t): Event system for emitting allocation-related events.
-- `polling-timer` (timer): Timer for the internal metrics loop.
+- `resource-pool-manager` (t): The client for the
+  `resource-pool-manager-service`.
 - `lock` (loom-lock): Mutex for protecting internal state."
-  (id             (format "allocator-%s" (warp:uuid-string (warp:uuid4))) :type string)
-  (config         (cl-assert nil) :type allocator-config)
-  (resource-pools (make-hash-table :test 'equal) :type hash-table)
-  (event-system   nil :type (or null t))
-  (polling-timer  nil :type (or null timer))
-  (lock           (loom:lock "allocator-lock") :type t))
+  (id (format "allocator-%s" (warp:uuid-string (warp:uuid4))) :type string)
+  (config (cl-assert nil) :type allocator-config)
+  (event-system nil :type (or null t))
+  (resource-pool-manager nil :type (or null t))
+  (lock (loom:lock "allocator-lock") :type t))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Private Functions
 
 (defun warp-allocator--emit-event (allocator event-type data)
   "Emit an event on the allocator's event system.
-
 This is a reusable helper function for broadcasting internal allocator
 events, such as when a pool is scaled up or down. It ensures
 consistency and centralizes the event-emission logic.
 
-:Arguments:
-- `ALLOCATOR` (warp-allocator): The allocator instance.
-- `EVENT-TYPE` (keyword): The type of event to emit (e.g., `:resource-allocated`).
-- `DATA` (plist): The data payload for the event.
+Arguments:
+- `allocator` (warp-allocator): The allocator instance.
+- `event-type` (keyword): The type of event to emit
+  (e.g., `:resource-allocated`).
+- `data` (plist): The data payload for the event.
 
-:Returns:
+Returns:
 - `nil`."
   (when-let (event-system (warp-allocator-event-system allocator))
     (warp:emit-event event-system event-type data)))
 
-(defun warp-allocator--handle-scale-up (allocator pool-name spec
-                                                  current-capacity
+(defun warp-allocator--handle-scale-up (allocator pool-name current-capacity
                                                   target-count)
   "Handles the logic for scaling a resource pool up.
 
-This function calculates the number of new resources to add, respecting the
-pool's `max-capacity`. It then invokes the pool's registered
-`allocation-fn` and emits a `:resource-allocated` event upon success.
+This function uses the high-level `resource-pool-manager` to command
+a pool to scale up. It respects the pool's maximum capacity before
+issuing the command.
 
 Arguments:
-- `ALLOCATOR` (warp-allocator): The allocator instance.
-- `POOL-NAME` (string): The name of the pool to scale.
-- `SPEC` (warp-resource-spec): The resource spec for the pool.
-- `CURRENT-CAPACITY` (integer): The current number of resources in the pool.
-- `TARGET-COUNT` (integer): The desired number of resources.
+- `allocator` (warp-allocator): The allocator instance.
+- `pool-name` (string): The name of the pool to scale.
+- `current-capacity` (integer): The current number of resources.
+- `target-count` (integer): The desired number of resources.
 
 Returns:
-- (loom-promise): A promise that resolves to the new capacity of the pool."
-  (let ((delta (- target-count current-capacity)))
-    ;; Cap the allocation at the pool's maximum defined capacity.
-    (when (> target-count (warp-resource-spec-max-capacity spec))
+- (loom-promise): A promise that resolves to the new capacity of the
+  pool."
+  (let* ((pool-manager (warp-allocator-resource-pool-manager allocator))
+         ;; Fetch the pool's defined configuration to get its hard limits.
+         (pool-status (loom:await (resource-pool-manager-service-get-status
+                                    pool-manager
+                                    pool-name)))
+         (max-capacity (plist-get pool-status :max-capacity)))
+    ;; Safety Check 1: Enforce the maximum capacity limit.
+    ;; This acts as a critical safety rail to prevent runaway resource creation.
+    (when (> target-count max-capacity)
       (warp:log! :warn (warp-allocator-id allocator)
                  "Scale to %d exceeds max %d for pool '%s'. Capping."
-                 target-count (warp-resource-spec-max-capacity spec)
-                 pool-name)
-      (setq delta (- (warp-resource-spec-max-capacity spec)
-                     current-capacity)))
+                 target-count max-capacity pool-name)
+      (setq target-count max-capacity))
 
-    (if (<= delta 0)
+    ;; Safety Check 2: If the target is not greater than the current size,
+    ;; no action is needed. This handles cases where the original target was
+    ;; capped below the current size.
+    (if (<= target-count current-capacity)
         (loom:resolved! current-capacity)
-      (progn
-        (warp:log! :info (warp-allocator-id allocator)
-                   "Allocating %d new resources for pool '%s'."
-                   delta pool-name)
-        (braid! (funcall (warp-resource-spec-allocation-fn spec) delta)
-          (:then (allocated-ids)
-            ;; Emit a standardized event for observability.
-            (warp-allocator--emit-event
-             allocator :resource-allocated
-             `(:pool-name ,pool-name :count ,(length allocated-ids)))
-            ;; Return a promise for the new total capacity.
-            (funcall (warp-resource-spec-get-current-capacity-fn spec))))))))
+      ;; Issue the asynchronous scale-up command to the pool manager.
+      (braid! (resource-pool-manager-service-scale-pool-up
+                pool-manager
+                pool-name
+                target-count)
+        (:then (_)
+          ;; On success, emit an event for observability and auditing purposes.
+          (warp-allocator--emit-event
+           allocator :resource-allocated
+           `(:pool-name ,pool-name
+             :count (- target-count current-capacity)))
+          ;; Resolve the promise with the final, successful target capacity.
+          (loom:resolved! target-count))))))
 
-(defun warp-allocator--handle-scale-down (allocator pool-name spec
-                                                    current-capacity
+(defun warp-allocator--handle-scale-down (allocator pool-name current-capacity
                                                     target-count)
   "Handles the logic for scaling a resource pool down.
 
-This function calculates the number of resources to remove, respecting
-the pool's `min-capacity`. It then invokes the pool's registered
-`deallocation-fn` and emits a `:resource-deallocated` event.
+This function uses the high-level `resource-pool-manager` to command
+a pool to scale down. It respects the pool's minimum capacity.
 
 Arguments:
-- `ALLOCATOR` (warp-allocator): The allocator instance.
-- `POOL-NAME` (string): The name of the pool to scale.
-- `SPEC` (warp-resource-spec): The resource spec for the pool.
-- `CURRENT-CAPACITY` (integer): The current number of resources.
-- `TARGET-COUNT` (integer): The desired number of resources.
+- `allocator` (warp-allocator): The allocator instance.
+- `pool-name` (string): The name of the pool to scale.
+- `current-capacity` (integer): The current number of resources.
+- `target-count` (integer): The desired number of resources.
 
 Returns:
-- (loom-promise): A promise that resolves to the new capacity of the pool."
-  (let* ((to-remove (- current-capacity target-count)))
-    ;; Cap the deallocation at the pool's minimum defined capacity.
-    (when (< target-count (warp-resource-spec-min-capacity spec))
+- (loom-promise): A promise that resolves to the new capacity of the
+  pool."
+  (let* ((pool-manager (warp-allocator-resource-pool-manager allocator))
+         ;; Fetch the pool's defined configuration to get its hard limits.
+         (pool-status (loom:await (resource-pool-manager-service-get-status
+                                    pool-manager
+                                    pool-name)))
+         (min-capacity (plist-get pool-status :min-capacity)))
+    ;; Safety Check 1: Enforce the minimum capacity limit.
+    ;; This prevents scaling down too far and potentially disabling a service.
+    (when (< target-count min-capacity)
       (warp:log! :warn (warp-allocator-id allocator)
                  "Scale to %d is below min %d for pool '%s'. Capping."
-                 target-count (warp-resource-spec-min-capacity spec)
-                 pool-name)
-      (setq to-remove (- current-capacity
-                         (warp-resource-spec-min-capacity spec))))
+                 target-count min-capacity pool-name)
+      (setq target-count min-capacity))
 
-    (if (<= to-remove 0)
+    ;; Safety Check 2: If the target is not smaller than the current size,
+    ;; no action is needed.
+    (if (>= target-count current-capacity)
         (loom:resolved! current-capacity)
-      (progn
-        (warp:log! :info (warp-allocator-id allocator)
-                   "Deallocating %d resources from pool '%s'."
-                   to-remove pool-name)
-        (braid! (funcall (warp-resource-spec-deallocation-fn spec) to-remove)
-          (:then (deallocated-count)
-            ;; Emit a standardized event for observability.
-            (warp-allocator--emit-event
-             allocator :resource-deallocated
-             `(:pool-name ,pool-name :count ,deallocated-count))
-            ;; Return a promise for the new total capacity.
-            (funcall (warp-resource-spec-get-current-capacity-fn spec))))))))
+      ;; Issue the asynchronous scale-down command to the pool manager.
+      (braid! (resource-pool-manager-service-scale-pool-down
+                pool-manager
+                pool-name
+                target-count)
+        (:then (_)
+          ;; On success, emit an event for observability and auditing.
+          (warp-allocator--emit-event
+           allocator :resource-deallocated
+           `(:pool-name ,pool-name
+             :count (- current-capacity target-count)))
+          ;; Resolve the promise with the final, successful target capacity.
+          (loom:resolved! target-count))))))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;---------------------------------------------------------------------
@@ -223,21 +251,30 @@ Returns:
 
 (warp:defservice-interface :allocator-service
   "Provides an API for managing and scaling resource pools.
-
 This is the formal service contract for the `warp-allocator` component.
 The autoscaler, CLI tools, and any other system that needs to
 programmatically change resource capacity will interact with the
 allocator through this interface. This design decouples the client
 from the allocator's internal implementation.
 
-:Methods:
-- `scale-pool`: Scales a named pool to a specific target size.
+Methods:
+- `scale-pool`: Scales a named pool to a specific target size or by a
+  delta.
 - `get-pool-status`: Retrieves the current size and status of a pool."
   :methods
-  '((scale-pool (pool-name target-count)
-     "Scales a resource pool to a specific `target-count`.")
+  '((scale-pool (pool-name &key target-count scale-up scale-down)
+     "Scales a resource pool to a specific `target-count` or by a
+      delta.")
     (get-pool-status (pool-name)
      "Retrieves the current size and status of a named pool.")))
+
+(warp:defservice-client allocator-client
+  :doc "A resilient client for the Allocator Service.
+This client stub is defined in the same module as the service, making
+the API contract clear. Other components can now simply request this
+client via dependency injection."
+  :for :allocator-service
+  :policy-set :resilient-client-policy)
 
 ;;;---------------------------------------------------------------------
 ;;; Allocator Implementation
@@ -245,7 +282,6 @@ from the allocator's internal implementation.
 
 (warp:defservice-implementation :allocator-service :allocator
   "Implementation of the `allocator-service` contract.
-
 This service is a thin facade over the core `warp-allocator` logic.
 It validates incoming requests and then calls the appropriate
 internal functions on the allocator component instance."
@@ -256,46 +292,60 @@ internal functions on the allocator component instance."
                    :auto-schema t
                    :policy-set-name :resilient-client-policy)
 
-  (scale-pool (pool-name target-count)
-    "Scales a resource pool to a specific `TARGET-COUNT` via the allocator.
+  (scale-pool (allocator pool-name &key target-count scale-up scale-down)
+    "Scales a resource pool via the allocator.
 
-:Arguments:
-- `ALLOCATOR`: The injected allocator component instance.
-- `POOL-NAME` (string): The name of the resource pool.
-- `TARGET-COUNT` (integer): The desired number of resources.
+Arguments:
+- `allocator`: The injected allocator component instance.
+- `pool-name` (string): The name of the resource pool.
+- `:target-count` (integer, optional): The desired absolute number of
+  resources.
+- `:scale-up` (integer, optional): The number of resources to add.
+- `:scale-down` (integer, optional): The number of resources to remove.
 
-:Returns:
-- (loom-promise): A promise that resolves with the final size of the pool."
-    (warp:allocator-scale-pool allocator pool-name :target-count target-count))
+Returns:
+- (loom-promise): A promise that resolves with the final size of the
+  pool."
+    (warp:allocator-scale-pool allocator pool-name
+                               :target-count target-count
+                               :scale-up scale-up
+                               :scale-down scale-down))
 
-  (get-pool-status (pool-name)
+  (get-pool-status (allocator pool-name)
     "Retrieves the status of a named pool via the allocator.
 
-:Arguments:
-- `ALLOCATOR`: The injected allocator component instance.
-- `POOL-NAME` (string): The name of the resource pool.
+Arguments:
+- `allocator`: The injected allocator component instance.
+- `pool-name` (string): The name of the resource pool.
 
-:Returns:
+Returns:
 - (loom-promise): A promise that resolves with the pool's status."
-    (let ((spec (gethash pool-name (warp-allocator-resource-pools allocator))))
-      (unless spec
-        (cl-return-from nil
-          (loom:rejected! (warp:error! :type 'warp-allocator-pool-not-found))))
-      (braid! (funcall (warp-resource-spec-get-current-capacity-fn spec))
-        (:then (capacity)
-          `(:pool-name ,pool-name :current-capacity ,capacity))))))
+    (let ((pool-manager (warp-allocator-resource-pool-manager allocator)))
+      (braid! (resource-pool-manager-service-get-status pool-manager pool-name)
+        (:then (status)
+          (loom:resolved! 
+            `(:pool-name ,pool-name 
+              :current-capacity ,(plist-get status :pool-size)))))))
 
 ;;;---------------------------------------------------------------------
 ;;; Allocator Component
 ;;;---------------------------------------------------------------------
 
 ;;;###autoload
-(cl-defun warp:allocator-create (&key id event-system config-options)
+(cl-defun warp:allocator-create (&key id 
+                                      event-system 
+                                      resource-pool-manager-client
+                                      config-options)
   "Creates and initializes a new `warp-allocator` instance.
+This factory function now explicitly requires a client for the resource
+pool manager service, formalizing the allocator's role as a policy engine
+that delegates to a separate service for execution.
 
 Arguments:
 - `:id` (string, optional): A unique identifier for this allocator.
 - `:event-system` (t, optional): An event system for emitting events.
+- `:resource-pool-manager-client` (t): The client for the
+  `resource-pool-manager-service`. This is a crucial dependency.
 - `:config-options` (plist, optional): Overrides for `allocator-config`.
 
 Returns:
@@ -304,7 +354,8 @@ Returns:
          (allocator (%%make-allocator
                      :id (or id (format "allocator-%s" (warp:uuid-string (warp:uuid4))))
                      :config config
-                     :event-system event-system)))
+                     :event-system event-system
+                     :resource-pool-manager resource-pool-manager-client)))
     (warp:log! :info (warp-allocator-id allocator)
                "Allocator instance created with ID: %s."
                (warp-allocator-id allocator))
@@ -315,7 +366,7 @@ Returns:
   "Starts the allocator's background polling loop.
 
 Arguments:
-- `ALLOCATOR` (warp-allocator): The allocator instance to start.
+- `allocator` (warp-allocator): The allocator instance to start.
 
 Returns:
 - (loom-promise): A promise that resolves to `t` on successful start."
@@ -323,10 +374,6 @@ Returns:
     (loom:with-mutex! (warp-allocator-lock allocator)
       (when (warp-allocator-polling-timer allocator)
         (cl-return-from warp:allocator-start (loom:resolved! t)))
-      ;; The polling timer periodically calls a function to update metrics
-      ;; from all registered pools. This feature is currently disabled
-      ;; as metrics are pushed via events, but the timer remains for future use.
-      ;; (warp-allocator--schedule-polling allocator)
       (warp:log! :info (warp-allocator-id allocator) "Allocator started.")
       (loom:resolved! t))))
 
@@ -335,7 +382,7 @@ Returns:
   "Stops the allocator's background polling loop gracefully.
 
 Arguments:
-- `ALLOCATOR` (warp-allocator): The allocator instance to stop.
+- `allocator` (warp-allocator): The allocator instance to stop.
 
 Returns:
 - (loom-promise): A promise that resolves to `t` on successful stop."
@@ -349,16 +396,15 @@ Returns:
 ;;;###autoload
 (defun warp:allocator-register-pool (allocator pool-name resource-spec)
   "Registers a `warp-resource-spec` with the allocator.
-
 This function makes the allocator aware of a new pool of resources that it
 can manage. It is the primary mechanism for connecting a concrete
 resource implementation (like a `warp-worker-pool`) to the generic
 allocation engine.
 
 Arguments:
-- `ALLOCATOR` (warp-allocator): The allocator instance.
-- `POOL-NAME` (string): A unique name for this resource pool.
-- `RESOURCE-SPEC` (warp-resource-spec): The contract defining the
+- `allocator` (warp-allocator): The allocator instance.
+- `pool-name` (string): A unique name for this resource pool.
+- `resource-spec` (warp-resource-spec): The contract defining the
   pool's capabilities, including its allocation and deallocation functions.
 
 Returns:
@@ -376,44 +422,72 @@ Returns:
     (loom:resolved! t)))
 
 ;;;###autoload
-(defun warp:allocator-scale-pool (allocator pool-name &key target-count)
-  "Scales a resource pool to a specific `TARGET-COUNT`.
-
+(cl-defun warp:allocator-scale-pool (allocator
+                                     pool-name
+                                     &key target-count
+                                          scale-up
+                                          scale-down)
+  "Scales a resource pool to a specific target or by a delta.
 This is the primary public function for commanding the allocator to change
 the size of a resource pool. It fetches the pool's specification and its
 current size, then delegates to the appropriate internal helper function
 to handle the actual scaling up or down.
 
 Arguments:
-- `ALLOCATOR` (warp-allocator): The allocator instance.
-- `POOL-NAME` (string): The name of the resource pool to scale.
-- `:TARGET-COUNT` (integer): The desired number of resources in the pool.
+- `allocator` (warp-allocator): The allocator instance.
+- `pool-name` (string): The name of the resource pool to scale.
+- `:target-count` (integer, optional): The desired absolute number of
+  resources.
+- `:scale-up` (integer, optional): The number of resources to add.
+- `:scale-down` (integer, optional): The number of resources to remove.
 
 Returns:
 - (loom-promise): A promise that resolves to the actual number of
   resources after scaling, or rejects on error."
-  (let ((spec (gethash pool-name (warp-allocator-resource-pools allocator))))
-    (unless spec
-      (cl-return-from warp:allocator-scale-pool
-        (loom:rejected!
-         (warp:error! :type 'warp-allocator-pool-not-found
-                      :message (format "Pool '%s' not found." pool-name)))))
-    (when (< target-count 0)
-      (cl-return-from warp:allocator-scale-pool
-        (loom:rejected!
-         (warp:error! :type 'warp-allocator-invalid-capacity
-                      :message "Target count must be non-negative."))))
+  (let ((pool-manager (warp-allocator-resource-pool-manager allocator)))
+    ;; Asynchronously fetch the current state of the pool before making a decision.
+    (braid! (resource-pool-manager-service-get-status pool-manager pool-name)
+      (:then (status)
+        (let* ((current-capacity (plist-get status :pool-size))
+               (min-capacity (plist-get status :min-capacity))
+               (max-capacity (plist-get status :max-capacity))
+               ;; Determine the final target size based on which keyword was provided.
+               ;; The order of precedence is: :target-count, :scale-up, :scale-down.
+               (final-target (cond
+                               (target-count target-count)
+                               (scale-up (+ current-capacity scale-up))
+                               (scale-down (- current-capacity scale-down))
+                               ;; If no scaling argument is given, do nothing.
+                               (t current-capacity)))
+               ;; Calculate the delta to determine the scaling direction (up, down, or no-op).
+               (delta (- final-target current-capacity)))
 
-    (braid! (funcall (warp-resource-spec-get-current-capacity-fn spec))
-      (:then (current-capacity)
-        (let ((delta (- target-count current-capacity)))
+          ;; Sanity check: prevent scaling to a negative number of resources.
+          (when (< final-target 0)
+            (signal (warp:error! 'warp-allocator-invalid-capacity
+                                 "Target count must be non-negative.")))
+
+          ;; Dispatch to the appropriate scaling action based on the delta.
           (cond
+           ;; A positive delta means we need to add resources.
            ((> delta 0)
-            (warp-allocator--handle-scale-up
-             allocator pool-name spec current-capacity target-count))
+            (warp:log! :info (warp-allocator-id allocator)
+                       "Scaling up pool '%s' by %d resources."
+                       pool-name delta)
+            (resource-pool-manager-service-scale-pool-up
+              pool-manager
+              pool-name
+              final-target))
+           ;; A negative delta means we need to remove resources.
            ((< delta 0)
-            (warp-allocator--handle-scale-down
-             allocator pool-name spec current-capacity target-count))
+            (warp:log! :info (warp-allocator-id allocator)
+                       "Scaling down pool '%s' by %d resources."
+                       pool-name (abs delta))
+            (resource-pool-manager-service-scale-pool-down
+              pool-manager
+              pool-name
+              final-target))
+           ;; A zero delta means the target is the current size; no action needed.
            (t (loom:resolved! current-capacity))))))))
 
 (provide 'warp-allocator)

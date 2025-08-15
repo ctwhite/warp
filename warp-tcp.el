@@ -1,4 +1,4 @@
-;;; warp-tcp-plugin.el --- Raw TCP Socket Transport Plugin -*- lexical-binding: t; -*-
+;;; warp-tcp.el --- Raw TCP Socket Transport Plugin -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
@@ -33,6 +33,13 @@
 ;;     reconnection logic, and error handling, making this a robust and
 ;;     self-healing transport implementation.
 ;;
+;; ## Enhancement: Rich Health Metrics
+;;
+;; This version is updated to adhere to the new `transport-protocol-service`
+;; interface contract, which requires implementations to provide rich health
+;; metrics via `get-health-metrics`. This function replaces the old, binary
+;; `health-check-fn` and provides a granular health score based on the
+;; liveness of the underlying process.
 
 ;;; Code:
 
@@ -47,6 +54,7 @@
 (require 'warp-state-machine)
 (require 'warp-transport-api)
 (require 'warp-plugin)
+(require 'warp-health)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -167,7 +175,7 @@ Side Effects:
 
 ;;;----------------------------------------------------------------------
 ;;; Protocol Implementation Functions
-;;;----------------------------------------------------------------------
+;;----------------------------------------------------------------------
 
 (defun warp-tcp-protocol--connect-fn (connection)
   "The `connect` method for the `:tcp` transport (client-side).
@@ -353,6 +361,27 @@ Returns:
        (warp:error! :type 'warp-tcp-connection-error
                     :message "TCP health check failed.")))))
 
+(defun warp-tcp-protocol--get-health-metrics-fn (connection)
+  "The `get-health-metrics` method for the `:tcp` transport.
+This new function implements the enhanced `transport-protocol-service`
+interface. It reports a health score based on the liveness of the
+underlying Emacs process that manages the TCP socket.
+
+Arguments:
+- `CONNECTION` (warp-transport-connection): The connection to inspect.
+
+Returns:
+- (loom-promise): A promise resolving to a `warp-connection-health-score`
+  object."
+  (let* ((raw-conn (warp-transport-connection-raw-connection connection))
+         (score (if (processp raw-conn)
+                    (if (process-live-p raw-conn) 1.0 0.0)
+                  ;; For a server listener, check its process.
+                  (if (process-live-p (plist-get raw-conn :process)) 1.0 0.0))))
+    ;; The final composite score is calculated here. For this simple transport,
+    ;; the score is a binary 1.0 or 0.0 based on process liveness.
+    (loom:resolved! (make-warp-connection-health-score :overall-score score))))
+
 (defun warp-tcp-protocol--address-generator-fn (&key id host)
   "The `address-generator` method for the `:tcp` transport.
 This function implements a part of the `transport-protocol-service` API.
@@ -385,7 +414,8 @@ Returns:
        :close-fn #'warp-tcp-protocol--close-fn
        :send-fn #'warp-tcp-protocol--send-fn
        :health-check-fn #'warp-tcp-protocol--health-check-fn
+       :get-health-metrics-fn #'warp-tcp-protocol--get-health-metrics-fn
        :address-generator-fn #'warp-tcp-protocol--address-generator-fn))))
 
-(provide 'warp-tcp-plugin)
-;;; warp-tcp-plugin.el ends here
+(provide 'warp-tcp)
+;;; warp-tcp.el ends here

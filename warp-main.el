@@ -8,11 +8,11 @@
 ;;
 ;; ## Architectural Role: Lifecycle Encapsulation
 ;;
-;; Why: This macro encapsulates all the boilerplate associated with the
+;; This macro encapsulates all the boilerplate associated with the
 ;; standard application lifecycle. It ensures that every Warp process is
 ;; initialized, started, and shut down in a consistent and robust manner.
 ;;
-;; How: It wraps the entire process in a `unwind-protect` block,
+;; It wraps the entire process in a `unwind-protect` block,
 ;; guaranteeing that `warp:shutdown` is always called, even if the
 ;; application encounters a critical error. It handles configuration
 ;; loading, runtime creation, and blocks indefinitely on a promise

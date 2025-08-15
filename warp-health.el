@@ -2,35 +2,58 @@
 
 ;;; Commentary:
 ;;
-;; This module provides a comprehensive, composite health checking system
-;; for the Warp framework. It moves beyond simple process-level checks
-;; ("is the process running?") to provide deep, granular insight into the
-;; operational status of a runtime and its critical dependencies ("is the
-;; process truly able to do its job?").
+;; This module provides a comprehensive, composite health checking
+;; system for the Warp framework. It moves beyond simple
+;; process-level checks ("is the process running?") to provide deep,
+;; granular insight into the operational status of a runtime and its
+;; critical dependencies ("is the process truly able to do its job?").
+;;
+;; ## The "Why": The Need for Deep, Operational Health
+;;
+;; In a distributed system, a process being "alive" is not the same as it
+;; being "healthy." A process could be running but stuck in a loop, unable
+;; to connect to its database, or consuming 100% CPU. Simple liveness
+;; probes are not enough to detect these "zombie" states.
+;;
+;; A robust health checking system provides this deep, operational insight.
+;; This is essential for:
+;; - **Reliable Load Balancing**: To ensure traffic is only sent to nodes
+;;   that can actually process it.
+;; - **Fast Failure Detection**: To quickly identify and remove failing
+;;   nodes from service.
+;; - **Automated Self-Healing**: To provide signals that trigger automated
+;;   recovery actions, like restarting a failing service.
 ;;
 ;; ## Architectural Role: The System's "Vital Signs Monitor"
 ;;
 ;; This module's architecture is designed for maximum extensibility and
 ;; ease of use, centered around a "define-and-discover" pattern:
 ;;
-;; 1. **Definition**: Individual health checks are defined as
-;; self-contained, declarative blocks using the `warp:defhealth-check`
-;; macro. This decouples the check's logic from its usage, allowing
-;; developers to add new checks anywhere without modifying core code.
+;; 1.  **Definition**: Individual health checks are defined as
+;;     self-contained, declarative blocks using the
+;;     `warp:defhealth-check` macro. This decouples the check's logic from
+;;     its usage, allowing developers to add new checks anywhere without
+;;     modifying core code.
 ;;
-;; 2. **Registration**: At load time, `warp:defhealth-check` adds the
-;; check's metadata (its function, dependencies, and documentation) to
-;; a central, discoverable registry.
+;; 2.  **Registration**: At load time, `warp:defhealth-check` adds the
+;;     check's metadata (its function, dependencies, and documentation) to
+;;     a central, discoverable registry.
 ;;
-;; 3. **Activation**: The `:health` plugin, configured per-profile (e.g.,
-;; `:worker`), declaratively lists which checks it needs by name. At
-;; startup, a `health-provider` component queries the registry for
-;; these named checks and activates them with the central
-;; `:health-check-service`.
+;; 3.  **Activation**: The `:health` plugin, configured per-profile
+;;     (e.g., `:worker`), declaratively lists which checks it needs by
+;;     name. At startup, a `health-provider` component queries the
+;;     registry for these named checks and activates them with the
+;;     central `health-check-service`.
 ;;
-;; This system enables true production-grade resilience and automation,
-;; powering features like smarter load balancing, faster fault detection,
-;; and automated self-healing.
+;; 4.  **Aggregation & Orchestration**: A `health-check-service` on each
+;;     node aggregates individual check statuses into a single report. On
+;;     leader nodes, a `health-orchestrator` collects these reports to
+;;     provide a cluster-wide view.
+;;
+;; 5.  **Predictive Health**: An advanced feature that goes beyond the
+;;     current state. It uses trend analysis on telemetry data to predict
+;;     *future* failures (e.g., "Disk space will be full in 10 minutes"),
+;;     allowing for proactive intervention.
 
 ;;; Code:
 
@@ -53,12 +76,13 @@
 (require 'warp-managed-worker)
 (require 'warp-redis)
 (require 'warp-registry)
+(require 'warp-telemetry)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Global State
 
 (defvar warp--health-contributor-registry
-  (warp:registry-create :name "health-contributors")
+  (warp:registry-create :name "health-contributors" :event-system nil)
   "A central, global registry for all discoverable health contributors.
 This is the heart of the pluggable architecture. `warp:defhealth-check`
 populates this registry.
@@ -66,15 +90,15 @@ populates this registry.
 Each entry is keyed by the check's name and the value is a plist:
 `(:fn CHECK-FN :deps DEPENDENCIES :doc DOCSTRING)`.")
 
-(defvar-local warp--predictive-health-registry
-  (warp:registry-create :name "predictive-health-sources")
+(defvar warp--predictive-health-registry
+  (warp:registry-create :name "predictive-health-sources" :event-system nil)
   "A central registry for pluggable predictive health sources.")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Schema Definitions
 
 (warp:defschema warp-health-status
-  ((:constructor make-warp-health-status))
+    ((:constructor make-warp-health-status))
   "Represents the result of a single health check for one component.
 This schema is the standard data transfer object (DTO) for
 reporting the health of an individual part of the system, like a
@@ -83,18 +107,17 @@ unit of health information in the system.
 
 Fields:
 - `status` (keyword): The health of the component. Must be one of
-`:UP` (healthy), `:DOWN` (failed), or `:DEGRADED` (impaired).
-Predictive checks may also use `:WARNING`.
+  `:UP` (healthy), `:DOWN` (failed), or `:DEGRADED` (impaired).
 - `details` (plist): A property list containing arbitrary,
-context-specific information, such as error messages or
-performance metrics (e.g., `(:latency 300)`). This provides
-human-readable context for operators and machine-readable data
-for automated systems."
+  context-specific information, such as error messages or
+  performance metrics (e.g., `(:latency 300)`). This provides
+  human-readable context for operators and machine-readable data
+  for automated systems."
   (status :DOWN :type keyword)
   (details nil :type (or null plist)))
 
 (warp:defschema warp-health-report
-  ((:constructor make-warp-health-report))
+    ((:constructor make-warp-health-report))
   "Represents the aggregated health report for an entire runtime.
 This is the top-level object sent from a worker to the cluster
 leader or exposed via an HTTP endpoint, providing a complete
@@ -102,22 +125,31 @@ snapshot of the worker's operational readiness.
 
 Fields:
 - `overall-status` (keyword): The calculated overall status of the
-node. The aggregation policy is 'worst status wins': if any
-component is `:DOWN`, the overall status is `:DOWN`.
+  node. The aggregation policy is 'worst status wins': if any
+  component is `:DOWN`, the overall status is `:DOWN`.
 - `timestamp` (float): The Unix timestamp when the report was
-generated. This is critical for detecting stale reports.
+  generated. This is critical for detecting stale reports.
 - `components` (hash-table): A hash-table mapping contributor names
-(e.g., `:cpu-usage`) to their `warp-health-status` objects."
+  (e.g., `:cpu-usage`) to their `warp-health-status` objects."
   (overall-status :DOWN :type keyword)
-  (timestamp      (float-time) :type float)
-  (components     (make-hash-table :test 'eq) :type hash-table))
+  (timestamp (float-time) :type float)
+  (components (make-hash-table :test 'eq) :type hash-table))
+
+(warp:defevent :health-degraded
+  "Signaled when a component or worker's health status degrades.
+This event is the primary trigger for the auto-remediation subsystem,
+making the control plane proactive and reactive."
+  :payload-schema '((:worker-id string)
+                    (:status keyword)
+                    (:reason string)
+                    (:report warp-health-report)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definitions
 
 (cl-defstruct (warp-health-check-service
                (:constructor %%make-health-check-service))
-  "The central service for aggregating health information.
+  "The central service for aggregating health information on a node.
 This component maintains a registry of 'health contributors'
 (active check functions) and provides an API to generate a
 comprehensive, aggregated health report. It is the engine that
@@ -125,36 +157,56 @@ drives the health checking process on a given node.
 
 Fields:
 - `id` (string): A unique identifier for this service instance,
-typically derived from the runtime instance ID. Used for logging.
+  typically derived from the runtime instance ID. Used for logging.
 - `contributors` (hash-table): Maps a contributor's name (keyword)
-to its check function. The function is a closure that returns a
-promise resolving to a `warp-health-status`.
+  to its check function. The function is a closure that returns a
+  promise resolving to a `warp-health-status`.
 - `lock` (loom-lock): A mutex protecting the `contributors`
-hash-table from concurrent modification, ensuring thread safety."
-  (id           nil :type string)
+  hash-table from concurrent modification, ensuring thread safety."
+  (id nil :type string)
   (contributors (make-hash-table :test 'eq) :type hash-table)
-  (lock         (loom:lock "health-check-service-lock") :type t))
+  (lock (loom:lock "health-check-service-lock") :type t))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Pluggable Predictive Health System
-
-(cl-defstruct warp-predictive-health-source
-  "Contract for a pluggable predictive health source.
-Modules register an instance of this struct to create a new,
-dynamically discovered predictive health check.
+(cl-defstruct (warp-health-orchestrator
+               (:constructor %%make-health-orchestrator))
+  "Leader-only component for monitoring the health of the entire cluster.
+It collects and caches health reports from all workers in the cluster,
+providing a single, centralized view of the entire cluster's health.
 
 Fields:
-- `name` (keyword): e.g., `:memory-exhaustion-predictor`.
-- `analyzer` (t): The strategy object, e.g., an instance of
-`linear-trend-analyzer`.
-- `threshold` (number): The critical value to predict crossing.
+- `name` (string): A descriptive name for the orchestrator.
+- `health-reports` (hash-table): A cache of the most recent health
+  report from each worker, keyed by worker ID.
+- `event-system` (warp-event-system): The event bus used to receive
+  health report events from workers."
+  (name nil :type string)
+  (health-reports (make-hash-table :test 'equal) :type hash-table)
+  (event-system nil :type (or null t)))
+
+(cl-defstruct (warp-predictive-health-source
+               (:constructor make-warp-predictive-health-source))
+  "Represents a pluggable source for predictive health checks.
+These sources define the logic for analyzing a telemetry metric trend to
+predict future failures.
+
+Fields:
+- `name` (keyword): The unique name of this predictive source.
 - `metric-name` (string): The telemetry metric to analyze.
-- `formatter-fn` (function): A lambda that formats the final
-health status message, e.g., `(lambda (time-str) ...)`."
-  name analyzer threshold metric-name formatter-fn)
+- `threshold` (number): The critical value to predict crossing for.
+- `analyzer` (t): The trend analyzer strategy instance.
+- `formatter-fn` (function): A function to format the prediction result."
+  (name nil :type keyword) (metric-name nil :type string)
+  (threshold 0.0 :type number) (analyzer nil :type t)
+  (formatter-fn nil :type function))
+
+(cl-defstruct linear-trend-analyzer
+  "A trend analysis strategy using simple linear regression.")
+
+(cl-defstruct wma-trend-analyzer
+  "A trend analysis strategy using a weighted moving average.")
 
 (cl-defgeneric warp:trend-analyzer-predict (analyzer points threshold)
-  "Predict time until a series of data points crosses a threshold.
+  "Predict time until a series of data `POINTS` crosses a `THRESHOLD`.
 This implements the Strategy design pattern, where different
 analyzers (e.g., linear, exponential) can be plugged in to
 provide different prediction models.
@@ -168,25 +220,12 @@ Returns:
 - (float or nil): Predicted time in seconds to reach threshold,
 or nil if trend is not increasing or cannot be predicted.")
 
-(cl-defstruct linear-trend-analyzer
-  "A trend analysis strategy using simple linear regression.")
-
 (cl-defmethod warp:trend-analyzer-predict ((_analyzer linear-trend-analyzer)
                                            points threshold)
   "Predict time to threshold using a linear trend slope.
 This implementation calculates the slope of the best-fit line for
 the provided data points and extrapolates to predict when the
-`THRESHOLD` will be reached.
-
-Arguments:
-- `_ANALYZER` (linear-trend-analyzer): The analyzer instance.
-- `POINTS` (list): A list of `(timestamp . value)` data points.
-- `THRESHOLD` (number): The target value.
-
-Returns:
-- (float or nil): Predicted time in seconds to reach threshold,
-or nil if the trend is stable or decreasing."
-  ;; A trend can only be calculated with at least two data points.
+`THRESHOLD` will be reached."
   (when (> (length points) 1)
     (let* ((slope (warp-health--calculate-linear-trend points))
            (current-value (cdar (last points))))
@@ -195,9 +234,19 @@ or nil if the trend is stable or decreasing."
       (when (> slope 0.001)
         (let ((value-remaining (- threshold current-value)))
           ;; If we're already over the threshold, time is 0.
-          (if (<= value-remaining 0)
-              0.0
-            (/ value-remaining slope)))))))
+          (if (<= value-remaining 0) 0.0 (/ value-remaining slope)))))))
+
+(cl-defmethod warp:trend-analyzer-predict ((_analyzer wma-trend-analyzer)
+                                           points threshold)
+  "Predicts time to threshold using a weighted moving average slope.
+This implementation gives more weight to recent data points, making
+it more responsive to sudden changes in trend."
+  (when (> (length points) 1)
+    (let* ((wma-slope (warp-health--calculate-wma-slope points))
+           (current-value (cdar (last points))))
+      (when (> wma-slope 0.001)
+        (let ((value-remaining (- threshold current-value)))
+          (if (<= value-remaining 0) 0.0 (/ value-remaining wma-slope)))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Private Functions
@@ -218,27 +267,27 @@ Returns:
 - (loom-promise): A promise resolving to a `warp-health-status`."
   (braid! (funcall check-body-fn)
     (:then (result)
-           (cond
-            ;; Case 1: Check returned a simple status keyword, e.g., `:UP`.
-            ((keywordp result) (make-warp-health-status :status result))
-            ;; Case 2: Check returned a detailed plist, e.g.,
-            ;; `(:status :DEGRADED :message "...")`.
-            ((and (consp result) (eq (car result) :status))
-             (make-warp-health-status
-              :status (plist-get result :status)
-              :details `((:message ,(plist-get result :message)))))
-            ;; Case 3: Check returned `t`, assume success.
-            (result (make-warp-health-status :status :UP))
-            ;; Case 4: Check returned `nil`, interpreted as a failure.
-            (t (make-warp-health-status
-                :status :DOWN
-                :details '((:error "Check returned nil"))))))
+      ;; This `cond` normalizes various possible return values into a
+      ;; consistent `warp-health-status` object.
+      (cond
+        ;; Case 1: Check returned a simple status keyword, e.g., `:UP`.
+        ((keywordp result) (make-warp-health-status :status result))
+        ;; Case 2: Check returned a detailed plist, e.g.,
+        ;; `(:status :DEGRADED :message "...")`.
+        ((and (consp result) (eq (car result) :status))
+         (make-warp-health-status
+          :status (plist-get result :status)
+          :details `((:message ,(plist-get result :message)))))
+        ;; Case 3: Check returned `t`, assume success.
+        (result (make-warp-health-status :status :UP))
+        ;; Case 4: Check returned `nil`, interpreted as a failure.
+        (t (make-warp-health-status
+            :status :DOWN :details '((:error "Check returned nil"))))))
     (:catch (err)
-            ;; Unhandled Exception: Any signaled error automatically results
-            ;; in a `:DOWN` status. This is a critical safety net.
-            (make-warp-health-status
-             :status :DOWN
-             :details `((:error ,(format "%S" err)))))))
+      ;; Unhandled Exception: Any signaled error automatically
+      ;; results in a `:DOWN` status. This is a critical safety net.
+      (make-warp-health-status
+       :status :DOWN :details `((:error ,(format "%S" err)))))))
 
 (defun warp-health--calculate-linear-trend (points)
   "Calculate slope of a best-fit line using least squares method.
@@ -251,16 +300,47 @@ Returns:
   (let* ((n (length points))
          (sum-x (apply #'+ (mapcar #'car points)))
          (sum-y (apply #'+ (mapcar #'cdr points)))
-         (sum-xy (apply #'+ (mapcar (lambda (p) (* (car p) (cdr p)))
-                                    points)))
-         (sum-x-sq (apply #'+ (mapcar (lambda (p) (* (car p) (car p)))
-                                      points)))
+         (sum-xy (apply #'+ (mapcar (lambda (p) (* (car p) (cdr p))) points)))
+         (sum-x-sq (apply #'+ (mapcar (lambda (p) (* (car p) (car p))) points)))
          (num (- (* n sum-xy) (* sum-x sum-y)))
          (den (- (* n sum-x-sq) (* sum-x sum-x))))
     (if (= den 0) 0.0 (/ num den))))
 
+(defun warp-health--calculate-wma-slope (points)
+  "Calculate the slope of a trend using a weighted moving average.
+This method gives more weight to recent data points to make the slope
+calculation more sensitive to sudden changes in trend.
+
+Arguments:
+- `points` (list): A list of `(timestamp . value)` data points.
+
+Returns:
+- (float): The calculated weighted moving average slope."
+  (let* ((n (length points))
+         (weights (cl-loop for i from 1 to n collect i))
+         (total-weight (apply #'+ weights))
+         (w-sum-x (apply #'+ (cl-loop for i from 0 for p in points
+                                      collect (* (car p) (elt weights i)))))
+         (w-sum-y (apply #'+ (cl-loop for i from 0 for p in points
+                                      collect (* (cdr p) (elt weights i)))))
+         (w-sum-x-sq (apply #'+ (cl-loop for i from 0 for p in points
+                                         collect (* (expt (car p) 2) (elt weights i)))))
+         (num (- (* total-weight w-sum-y) (* w-sum-x w-sum-x)))
+         (den (- (* total-weight w-sum-x-sq) (expt w-sum-x 2))))
+    (if (zerop den) 0.0 (/ (float num) den))))
+
 (defun warp-health--collect-check-dependencies (check-names)
-  "Inspects check definitions and returns a unique list of their dependencies."
+  "Inspect check definitions and return a unique list of dependencies.
+This function queries the `warp--health-contributor-registry` for the
+dependencies of each named check and returns a single, flattened
+list. The `health-check-service` itself is always added as a
+dependency.
+
+Arguments:
+- `CHECK-NAMES` (list): A list of keywords of the checks.
+
+Returns:
+- (list): A flattened, unique list of component dependencies."
   (let ((deps '()))
     (dolist (check check-names)
       (when-let (reg (warp:registry-get warp--health-contributor-registry check))
@@ -269,11 +349,39 @@ Returns:
     (push 'health-check-service deps)
     (delete-dups deps)))
 
+(defun warp-health--register-named-checks (service check-names context)
+  "Register a list of named health checks with the central `service`.
+This function encapsulates the core logic of wiring up the
+declarative health checks. It resolves their dependencies from the `CONTEXT`
+and registers a closure with the `health-check-service` that executes
+the check.
+
+Arguments:
+- `SERVICE` (warp-health-check-service): The central health service.
+- `CHECK-NAMES` (list): A list of keyword names of checks to register.
+- `CONTEXT` (plist): The component context containing dependencies.
+
+Returns: `t` on success."
+  (dolist (check-name check-names)
+    (let* ((info (warp:registry-get warp--health-contributor-registry check-name))
+           (fn (plist-get info :fn))
+           (deps (plist-get info :deps))
+           ;; Resolve all dependencies for the check from the context.
+           (dep-insts (mapcar (lambda (type) (warp:context-get-component
+                                              context type))
+                              deps)))
+      (warp:health-check-service-register-contributor
+       service check-name
+       ;; Register a nullary closure that captures the dependencies.
+       (lambda () (warp-health--make-check-promise
+                   (lambda () (apply fn dep-insts)))))))
+  t)
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;----------------------------------------------------------------
-;;; Health Contributor Macro Definition
+;;; Health Contributor Macros
 ;;;----------------------------------------------------------------
 
 ;;;###autoload
@@ -285,23 +393,18 @@ checks this way, they become modular, reusable, and automatically
 available to the entire system.
 
 Example:
-(warp:defhealth-check :my-check (config-service)
-\"Checks if the :is-ok flag is set.\"
-(if (warp:config-service-get config-service :is-ok)
-:UP
-'(:status :DOWN :message \"Flag not set!\")))
+  (warp:defhealth-check :my-check (config-service)
+    \"Checks if the :is-ok flag is set.\"
+    (if (warp:config-service-get config-service :is-ok)
+        :UP
+      '(:status :DOWN :message \"Flag not set!\")))
 
 Arguments:
-- `NAME` (keyword): The unique, namespaced name for this health
-  check, e.g., `:cpu-usage`.
-- `DEPENDENCIES` (list): A list of component type symbols that the
-  check requires. These are injected as arguments to `BODY`.
-- `BODY` (list): The Lisp code for the check. An optional
-  docstring can be the first element. The code should return a
-  status keyword, a status plist, or `t`/`nil`.
-
-Returns:
-- (symbol): The `NAME` of the defined health check."
+- `NAME` (keyword): The unique, namespaced name for this health check.
+- `DEPENDENCIES` (list): Component type symbols the check requires. These
+  are injected as arguments to `BODY`.
+- `BODY` (list): The Lisp code for the check. An optional docstring can
+  be the first element."
   (let ((docstring (when (stringp (car body)) (pop body))))
     `(progn
        (warp:registry-add warp--health-contributor-registry ,name
@@ -311,37 +414,57 @@ Returns:
                           :overwrite-p t)
        ,name)))
 
+;;;###autoload
+(defmacro warp:defhealth-provider (name docstring &rest check-defs)
+  "Define a health provider component that activates named health checks.
+This macro abstracts the boilerplate of creating a component that
+dynamically assembles a set of health checks for a given profile.
+
+Arguments:
+- `NAME` (symbol): The name of the component to create.
+- `DOCSTRING` (string): Documentation for the component.
+- `CHECK-DEFS` (plist): A property list containing `:checks`, a list of
+  check names (keywords) to activate."
+  (let* ((checks-to-load (plist-get check-defs :checks))
+         (all-deps (warp-health--collect-check-dependencies checks-to-load)))
+    `(warp:defcomponent ,name
+       :doc ,docstring
+       :requires ',all-deps
+       :start (lambda (_instance ctx &rest _)
+                (let ((h-service (warp:context-get-component
+                                  ctx :health-check-service)))
+                  (warp-health--register-named-checks
+                   h-service ',checks-to-load ctx))))))
+
 ;;;----------------------------------------------------------------
-;;; Health Check Service Factory & Registration
+;;; Health Check Service
 ;;;----------------------------------------------------------------
 
-(cl-defun warp:health-check-service-create (&key id)
+(defun warp:health-check-service-create (&key id)
   "Create a new health check service instance.
 This factory should be called once per runtime instance that
 requires health monitoring.
 
 Arguments:
-- `:ID` (string): A unique identifier for this service instance.
+- `ID` (string): A unique identifier for this service instance.
 
 Returns:
 - (warp-health-check-service): A new, initialized service."
   (%%make-health-check-service :id id))
 
-(defun warp:health-check-service-register-contributor (service name
-                                                               check-fn)
+(defun warp:health-check-service-register-contributor (service name check-fn)
   "Register a component as a health contributor.
 This adds a prepared check function to a service instance. It is
-the final step in activation, typically called by the
-`health-provider` component at startup.
+the final step in activation, typically called by a `health-provider`
+component at startup.
 
 Arguments:
 - `SERVICE` (warp-health-check-service): The service instance.
 - `NAME` (keyword): A unique name for the contributor (e.g., `:db`).
-- `CHECK-FN` (function): A nullary function that returns a promise
-  which resolves to a `warp-health-status` object.
+- `CHECK-FN` (function): A nullary function that returns a promise which
+  resolves to a `warp-health-status` object.
 
-Returns:
-- `t` on successful registration."
+Returns: `t` on successful registration."
   (loom:with-mutex! (warp-health-check-service-lock service)
     (puthash name check-fn (warp-health-check-service-contributors service)))
   (warp:log! :info (warp-health-check-service-id service)
@@ -353,49 +476,58 @@ Returns:
 This function asynchronously executes all registered health checks
 in parallel. It then aggregates their results into a single
 `warp-health-report`, calculating an overall system status using a
-'worst status wins' policy.
+'worst status wins' policy. Crucially, it emits a `:health-degraded`
+event if the system is not fully healthy, triggering auto-remediation.
 
 Arguments:
 - `SERVICE` (warp-health-check-service): The service instance.
 
 Returns:
-- (loom-promise): A promise that resolves with the final
-`warp-health-report`.
-
-Side Effects:
-- Executes all registered checks, which may involve I/O or system
-calls."
+- (loom-promise): A promise resolving with the final `warp-health-report`."
   (let* ((contributors (warp-health-check-service-contributors service))
          (contributor-names (hash-table-keys contributors))
-         (check-promises
-          (cl-loop for name in contributor-names
-                   for check-fn = (gethash name contributors)
-                   collect (funcall check-fn))))
+         (check-promises (cl-loop for name in contributor-names
+                                  for fn = (gethash name contributors)
+                                  collect (funcall fn))))
     (braid! (loom:all check-promises)
       (:then (results)
-             (let ((report (make-warp-health-report))
-                   (overall-status :UP))
-               ;; Populate the report with individual component statuses.
-               (cl-loop for name in contributor-names
-                        for result in results
-                        do (puthash name result
-                                    (warp-health-report-components report)))
+        (let ((report (make-warp-health-report))
+              (overall-status :UP)
+              (degraded-reason nil))
+          (cl-loop for name in contributor-names for result in results
+                   do (puthash name result (warp-health-report-components
+                                            report)))
+          ;; The aggregation policy is "worst status wins".
+          (maphash
+           (lambda (name status-obj)
+             (let ((status (warp-health-status-status status-obj)))
+               (cond
+                 ((eq status :DOWN)
+                  (setq overall-status :DOWN)
+                  (setq degraded-reason
+                        (format "Health check '%s' is DOWN." name)))
+                 ((and (eq status :DEGRADED) (not (eq overall-status :DOWN)))
+                  (setq overall-status :DEGRADED)
+                  (unless degraded-reason
+                    (setq degraded-reason
+                          (format "Health check '%s' is DEGRADED." name)))))))
+           (warp-health-report-components report))
 
-               ;; Calculate final status using "worst status wins" policy.
-               (maphash
-                (lambda (_name status-obj)
-                  (let ((status (warp-health-status-status status-obj)))
-                    (cond
-                     ((eq status :DOWN) (setq overall-status :DOWN))
-                     ((and (eq status :DEGRADED)
-                           (not (eq overall-status :DOWN)))
-                      (setq overall-status :DEGRADED)))))
-                (warp-health-report-components report))
+          (setf (warp-health-report-overall-status report) overall-status)
 
-               (setf (warp-health-report-overall-status report) overall-status)
-               report)))))
+          ;; Emit a health-degraded event if the status is not healthy.
+          ;; This is the primary trigger for auto-remediation.
+          (unless (eq overall-status :UP)
+            (when-let* ((ctx (current-component-context))
+                        (event-system (warp:context-get-component ctx :event-system))
+                        (runtime (warp:context-get-component ctx :runtime-instance)))
+              (warp:emit-event event-system :health-degraded
+                               `(:worker-id ,(warp-runtime-id runtime)
+                                 :status ,overall-status
+                                 :reason ,(or degraded-reason "Health degraded")
+                                 :report ,report))))
+          report)))))
 
-;;;###autoload
 (defun warp:health-register-predictive-source (source)
   "Register a new predictive health source and its check.
 This is the public entry point for adding new predictive
@@ -406,8 +538,7 @@ on it, seamlessly integrating it into the main health system.
 Arguments:
 - `SOURCE` (warp-predictive-health-source): The source to register.
 
-Returns:
-- The `SOURCE` object."
+Returns: The `SOURCE` object."
   (warp:registry-add warp--predictive-health-registry
                      (warp-predictive-health-source-name source)
                      source :overwrite-p t)
@@ -422,349 +553,310 @@ Returns:
       (braid! (warp:telemetry-pipeline-get-metric-history
                telemetry-pipeline metric "5m")
         (:then (history)
-               (if-let (time (warp:trend-analyzer-predict
-                              analyzer history threshold))
-                   `(:status :DEGRADED
-                     :message ,(funcall formatter
-                                        (format "%.0f" (/ time 60))))
-                 :UP))))))
+          (if-let (time (warp:trend-analyzer-predict analyzer history
+                                                     threshold))
+              `(:status :DEGRADED
+                :message ,(funcall formatter (format "%.0f" (/ time 60))))
+            :UP))))))
+
+;;;----------------------------------------------------------------
+;;; Plugin, Components, and Default Checks
+;;;----------------------------------------------------------------
+
+(warp:defplugin :health
+  "Provides a composite, declarative health checking system."
+  :version "2.2.2"
+  :dependencies '(warp-component warp-telemetry warp-redis
+                  warp-managed-worker)
+  :profiles
+  `((:worker
+     :doc "Installs the standard health check suite for a worker."
+     :components (health-check-service worker-health-provider))
+    (:cluster-worker
+     :doc "Installs health checks for the cluster leader."
+     :components (health-check-service cluster-health-provider
+                                       health-orchestrator
+                                       health-rpc-handler)))
+  :components
+  `(;; --- Common Components ---
+    (health-check-service
+     :doc "The central service on a node that aggregates health reports."
+     :requires '(runtime-instance event-system)
+     :factory (lambda (runtime _es)
+                (warp:health-check-service-create
+                 :id (format "health-%s" (warp-runtime-id runtime)))))
+    (worker-health-provider
+     ,(warp:defhealth-provider worker-health-provider
+        "Activates all standard health checks for a generic worker."
+        :checks '(:cpu-usage :memory-usage :request-queue
+                  :event-queue-health :master-connection-health
+                  :executor-pool-saturation)))
+    (cluster-health-provider
+     ,(warp:defhealth-provider cluster-health-provider
+        "Activates cluster-specific health checks for a leader."
+        :checks '(:redis-connectivity :coordinator-liveness
+                  :worker-population :memory-exhaustion-predictor
+                  :disk-space-predictor)))
+    ;; --- Leader-Only Components ---
+    (health-orchestrator
+     :doc "The leader-only authority for monitoring cluster health. It
+collects and caches health reports from all workers."
+     :requires '(event-system)
+     :factory (lambda (es) (%%make-health-orchestrator
+                            :name "cluster-health-orc" :event-system es))
+     :start (lambda (self _ctx)
+              (warp:subscribe (warp-health-orchestrator-event-system self)
+                              :health-report-received
+                              (lambda (event)
+                                (let* ((data (warp-event-data event))
+                                       (id (plist-get data :worker-id))
+                                       (report (plist-get data :report)))
+                                  (puthash id report
+                                           (warp-health-orchestrator-health-reports
+                                            self)))))))
+    (health-rpc-handler
+     :doc "Provides an RPC endpoint for workers to submit health reports."
+     :requires '(command-router event-system)
+     :start (lambda (_self ctx)
+              (let ((router (warp:context-get-component ctx :command-router))
+                    (es (warp:context-get-component ctx :event-system)))
+                (warp:command-router-add-route
+                 router :submit-health-report
+                 :handler-fn (lambda (cmd _ctx)
+                               (let* ((args (warp-rpc-command-args cmd))
+                                      (id (plist-get args :worker-id))
+                                      (report (plist-get args :report)))
+                                 (warp:emit-event es :health-report-received
+                                                  `(:worker-id ,id
+                                                    :report ,report)))
+                               (loom:resolved! `(:status "ok")))))))))
 
 ;;;----------------------------------------------------------------
 ;;; Core Health Check Definitions
 ;;;----------------------------------------------------------------
 
-(warp:defhealth-check :cpu-usage (system-monitor config)
-  "Monitors CPU utilization.
-Sustained high CPU can indicate an infinite loop or resource
-starvation. This check distinguishes between a 'degraded' state
-(high CPU) and a 'down' state (critically high CPU)."
-  ;; Algorithm: Threshold-based state change.
-  ;; The check compares the current CPU utilization against two
-  ;; thresholds to determine the health status.
-  (let* ((metrics (warp:system-monitor-get-process-metrics
-                   system-monitor (emacs-pid)))
-         (cpu (gethash :cpu-utilization metrics 0.0))
-         (unhealthy-th (warp:config-service-get
-                        config :cpu-unhealthy-threshold 95.0))
-         (degraded-th (warp:config-service-get
-                       config :cpu-degraded-threshold 80.0)))
-    (cond ((> cpu unhealthy-th)
-           ;; Rationale: If CPU is over the unhealthy threshold, it's a
-           ;; critical failure. The system is likely unresponsive or
-           ;; completely stuck.
-           `(:status :DOWN
-             :message ,(format "CPU at %.1f%% > unhealthy (%.0f%%)"
-                               cpu unhealthy-th)))
-          ((> cpu degraded-th)
-           ;; Rationale: High CPU over the degraded threshold suggests a
-           ;; performance bottleneck. The system is still functional but
-           ;; cannot handle additional load. A load balancer should
-           ;; divert traffic away.
-           `(:status :DEGRADED
-             :message ,(format "CPU at %.1f%% > degraded (%.0f%%)"
-                               cpu degraded-th)))
-          (t :UP))))
+(warp:defhealth-check :cpu-usage (telemetry-pipeline config-service)
+  "Monitors CPU utilization via the telemetry pipeline.
+This check retrieves the latest CPU utilization metric from the
+central telemetry pipeline and compares it against configured
+thresholds to determine the health status.
 
-(warp:defhealth-check :memory-usage (system-monitor config)
-  "Monitors memory usage against a configured threshold.
-Exceeding the memory threshold is a critical failure, often
-preceding a crash or severe GC pressure."
-  ;; Algorithm: Simple threshold comparison.
-  ;; The check retrieves the current memory usage and compares it
-  ;; against a single configured maximum.
-  (let* ((metrics (warp:system-monitor-get-process-metrics
-                   system-monitor (emacs-pid)))
-         (mem-mb (gethash :memory-utilization-mb metrics 0.0))
-         (threshold (warp:config-service-get
-                     config :memory-threshold-mb 1024.0)))
-    (if (> mem-mb threshold)
-        ;; Rationale: Exceeding the memory threshold is a critical failure.
-        ;; It indicates a memory leak or an unmanageable workload that will
-        ;; likely lead to an out-of-memory error or a process crash.
-        `(:status :DOWN
-          :message ,(format "Memory at %.0fMB > threshold (%.0fMB)"
-                            mem-mb threshold))
-      :UP)))
+Arguments:
+- `telemetry-pipeline` (warp-telemetry-pipeline): The telemetry service instance.
+- `config-service` (warp-config-service): The configuration service instance.
 
-(warp:defhealth-check :request-queue (rpc-system config)
-  "Monitors the incoming RPC request queue length.
-A persistently full queue indicates the worker cannot keep up with
-its workload. This reports 'degraded' to signal load balancers to
-divert traffic."
-  ;; Algorithm: Ratio-based thresholding.
-  ;; The check calculates the ratio of active requests to the maximum
-  ;; allowed. This allows the check to scale dynamically with the
-  ;; configured `max-concurrent-requests`.
-  (let* ((metrics (warp:rpc-system-metrics rpc-system))
-         (active (gethash :active-request-count metrics 0))
-         (max (warp:config-service-get config :max-concurrent-requests 50))
-         (unhealthy-r (warp:config-service-get
-                       config :queue-unhealthy-ratio 0.95))
-         (degraded-r (warp:config-service-get
-                      config :queue-degraded-ratio 0.80))
-         (ratio (when (> max 0) (/ (float active) max))))
-    (cond ((and ratio (> ratio unhealthy-r))
-           ;; Rationale: If the queue is nearly full, the system is at
-           ;; a breaking point. It cannot accept new requests and will
-           ;; likely start rejecting them.
-           `(:status :DOWN
-             :message ,(format "RPC queue at %.0f%% > unhealthy"
-                               (* 100 ratio))))
-          ((and ratio (> ratio degraded-r))
-           ;; Rationale: A high queue-length ratio indicates that the
-           ;; worker is under heavy load. A load balancer should receive
-           ;; this signal and reroute traffic to less-loaded workers.
-           `(:status :DEGRADED
-             :message ,(format "RPC queue at %.0f%% > degraded"
-                               (* 100 ratio))))
-          (t :UP))))
+Returns:
+- (loom-promise): A promise that resolves to `:UP`, or a plist like
+  `'(:status :DEGRADED ...)` or `'(:status :DOWN ...)` with details."
+  (braid! (warp:telemetry-pipeline-get-latest-metric
+           telemetry-pipeline "system.cpu.utilization")
+    (:then (metric-value)
+      (let* ((cpu (or metric-value 0.0))
+             (unhealthy-th (warp:config-service-get
+                            config-service :cpu-unhealthy-threshold 95.0))
+             (degraded-th (warp:config-service-get
+                           config-service :cpu-degraded-threshold 80.0)))
+        (cond ((> cpu unhealthy-th)
+               `(:status :DOWN :message
+                 ,(format "CPU at %.1f%% > unhealthy (%.0f%%)" cpu unhealthy-th)))
+              ((> cpu degraded-th)
+               `(:status :DEGRADED :message
+                 ,(format "CPU at %.1f%% > degraded (%.0f%%)" cpu degraded-th)))
+              (t :UP))))))
+
+(warp:defhealth-check :memory-usage (telemetry-pipeline config-service)
+  "Monitors memory usage against a configured threshold via the
+telemetry pipeline.
+This check retrieves the latest memory usage metric from the central
+telemetry pipeline and compares it to a configured threshold.
+
+Arguments:
+- `telemetry-pipeline` (warp-telemetry-pipeline): The telemetry service instance.
+- `config-service` (warp-config-service): The configuration service instance.
+
+Returns:
+- (loom-promise): A promise that resolves to `:UP`, or a plist like
+  `'(:status :DOWN ...)` with details if the threshold is breached."
+  (braid! (warp:telemetry-pipeline-get-latest-metric
+           telemetry-pipeline "system.memory.usage.mb")
+    (:then (metric-value)
+      (let* ((mem-mb (or metric-value 0.0))
+             (threshold (warp:config-service-get
+                         config-service :memory-threshold-mb 1024.0)))
+        (if (> mem-mb threshold)
+            `(:status :DOWN :message
+              ,(format "Memory at %.0fMB > threshold (%.0fMB)" mem-mb threshold))
+          :UP)))))
+
+(warp:defhealth-check :request-queue (telemetry-pipeline config-service)
+  "Monitors the incoming RPC request queue length via the telemetry
+pipeline.
+This check retrieves the number of active RPC requests from the
+telemetry pipeline and compares it against a configured maximum
+capacity.
+
+Arguments:
+- `telemetry-pipeline` (warp-telemetry-pipeline): The telemetry service instance.
+- `config-service` (warp-config-service): The configuration service instance.
+
+Returns:
+- (loom-promise): A promise that resolves to `:UP`, or a plist like
+  `'(:status :DEGRADED ...)` or `'(:status :DOWN ...)` with details."
+  (braid! (warp:telemetry-pipeline-get-latest-metric
+           telemetry-pipeline "rpc.requests.active")
+    (:then (active-requests)
+      (let* ((active (or active-requests 0))
+             (max (warp:config-service-get
+                   config-service :max-concurrent-requests 50))
+             (unhealthy-r (warp:config-service-get
+                           config-service :queue-unhealthy-ratio 0.95))
+             (degraded-r (warp:config-service-get
+                          config-service :queue-degraded-ratio 0.80))
+             (ratio (when (> max 0) (/ (float active) max))))
+        (cond ((and ratio (> ratio unhealthy-r))
+               `(:status :DOWN :message
+                 ,(format "RPC queue at %.0f%% > unhealthy" (* 100 ratio))))
+              ((and ratio (> ratio degraded-r))
+               `(:status :DEGRADED :message
+                 ,(format "RPC queue at %.0f%% > degraded" (* 100 ratio))))
+              (t :UP))))))
 
 (warp:defhealth-check :event-queue-health (event-system)
   "Monitors the internal event processing queue (`warp-stream`).
-Saturation of this queue indicates that a core process or event
-handler may be stuck, affecting runtime responsiveness."
-  ;; Algorithm: Ratio-based thresholding, similar to the RPC queue.
-  ;; This check monitors a core internal buffer to detect backpressure
-  ;; from a slow or blocked consumer.
+This check directly inspects the internal state of the event
+system's queue to detect backpressure.
+
+Arguments:
+- `event-system` (warp-event-system): The global event system component.
+
+Returns:
+- (plist or keyword): A status keyword (`:UP`) or a status plist
+  (`'(:status :DEGRADED ...)` or `'(:status :DOWN ...)`)."
   (let* ((q (warp-event-system-event-queue event-system))
          (status (warp:stream-status q))
          (len (plist-get status :buffer-length))
          (max (plist-get status :max-buffer-size))
          (ratio (when (and max (> max 0)) (/ (float len) max))))
     (cond ((and ratio (> ratio 0.95))
-           ;; Rationale: A nearly full event queue means a core component
-           ;; is failing to process events. This will cascade, causing the
-           ;; entire runtime to become unresponsive.
-           `(:status :DOWN
-             :message ,(format "Event queue at %.0f%% > unhealthy"
-                               (* 100 ratio))))
+           `(:status :DOWN :message
+             ,(format "Event queue at %.0f%% > unhealthy" (* 100 ratio))))
           ((and ratio (> ratio 0.80))
-           ;; Rationale: A high ratio signals backpressure. While not a
-           ;; total failure yet, it's a strong indicator of a performance
-           ;; issue that requires attention.
-           `(:status :DEGRADED
-             :message ,(format "Event queue at %.0f%% > degraded"
-                               (* 100 ratio))))
+           `(:status :DEGRADED :message
+             ,(format "Event queue at %.0f%% > degraded" (* 100 ratio))))
           (t :UP))))
 
 (warp:defhealth-check :master-connection-health (dialer-service)
   "Checks liveness of the connection to the cluster leader.
-Losing connection to the control plane is a critical failure for a
-worker, as it can no longer receive jobs. This performs a ping.
+This check uses the high-level `dialer-service` to establish a
+temporary connection to the leader and sends a low-level ping to
+verify connectivity.
 
-This check now uses the high-level `dialer-service` to abstract
-away the details of connection management."
-  ;; Algorithm: Asynchronous network check.
-  ;; This function performs a simple network operation (ping) over the
-  ;; existing connection to the leader to verify its liveness. It uses
-  ;; `braid!` to handle the asynchronous nature of network I/O.
+Arguments:
+- `dialer-service` (warp-dialer-service): The central dialer component.
+
+Returns:
+- (loom-promise): A promise that resolves to `:UP`, or a plist like
+  `'(:status :DOWN ...)` if the connection or ping fails."
   (braid! (warp:dialer-dial dialer-service :leader)
-    (:then (conn)
-           (braid! (warp:transport-ping conn)
-             (:then (lambda (_) :UP))
-             (:catch (err)
-               ;; Rationale: If the ping fails, the connection is
-               ;; broken. The worker cannot communicate with the leader.
-               `(:status :DOWN
-                 :message ,(format "Ping failed: %S" err)))))
-    (:catch (err)
-            ;; Rationale: If the connection attempt itself fails,
-            ;; communication with the leader is impossible.
-            `(:status :DOWN
-              :message ,(format "Failed to connect to leader: %S" err)))))
+    (:then (conn) (braid! (warp:transport-ping conn)
+                          (:then (lambda (_) :UP))
+                          (:catch (err) `(:status :DOWN :message ,(format "Ping failed: %S" err)))))
+    (:catch (err) `(:status :DOWN :message ,(format "Failed to connect to leader: %S" err)))))
 
 (warp:defhealth-check :executor-pool-saturation (executor-pool)
   "Monitors saturation of the sandboxed execution pool.
-A saturated pool is a bottleneck. Marking the worker as 'degraded'
-in this state can inform autoscalers or load balancers."
-  ;; Algorithm: Ratio-based thresholding on pool capacity.
-  ;; The check monitors the ratio of busy threads to the total pool size.
-  (let* ((pool executor-pool)
-         (status (warp:executor-pool-status pool))
+This check looks at the ratio of busy threads to total threads in
+the executor pool. High saturation can be a sign of a bottleneck or a
+deadlocked component.
+
+Arguments:
+- `executor-pool` (warp-executor-pool): The sandboxed executor pool.
+
+Returns:
+- (plist or keyword): A status keyword (`:UP`) or a status plist
+  (`'(:status :DEGRADED ...)` or `'(:status :DOWN ...)`)."
+  (let* ((status (warp:executor-pool-status executor-pool))
          (total (plist-get (plist-get status :resources) :total))
          (busy (plist-get (plist-get status :resources) :busy))
          (ratio (when (> total 0) (/ (float busy) total))))
     (cond ((and ratio (> ratio 0.95))
-           ;; Rationale: A near-total saturation means the pool is
-           ;; completely blocked. The worker cannot execute new tasks.
-           `(:status :DOWN
-             :message ,(format "Executor pool at %.0f%% saturation"
-                               (* 100 ratio))))
+           `(:status :DOWN :message
+             ,(format "Executor pool at %.0f%% saturation" (* 100 ratio))))
           ((and ratio (> ratio 0.85))
-           ;; Rationale: High saturation is a clear signal of heavy load
-           ;; and is useful for load balancers to make smart routing
-           ;; decisions, sending new requests elsewhere.
-           `(:status :DEGRADED
-             :message ,(format "Executor pool at %.0f%% saturation"
-                               (* 100 ratio))))
+           `(:status :DEGRADED :message
+             ,(format "Executor pool at %.0f%% saturation" (* 100 ratio))))
           (t :UP))))
 
 (warp:defhealth-check :redis-connectivity (redis-service)
   "Checks connectivity to the Redis server via PING.
-Cluster state and job queues often rely on Redis, making a
-connection failure a critical event."
-  ;; Algorithm: Asynchronous connectivity check.
-  ;; This check performs a standard `PING` command to the Redis service
-  ;; and expects a `PONG` reply. This is the canonical way to test
-  ;; a connection's liveness in Redis.
+This check sends a PING command to the Redis service to verify the
+connection's liveness and responsiveness.
+
+Arguments:
+- `redis-service` (warp-redis-service): The Redis service component.
+
+Returns:
+- (loom-promise): A promise resolving to `:UP`, or a plist like
+  `'(:status :DOWN ...)` on failure."
   (braid! (warp:redis-ping redis-service)
-    (:then (reply)
-           (if (string= reply "PONG")
-               :UP
-             `(:status :DOWN
-               :message ,(format "Redis PING returned: %s" reply))))
-    (:catch (err)
-            ;; Rationale: If the command fails, the connection is broken.
-            `(:status :DOWN
-              :message ,(format "Failed to ping Redis: %S" err)))))
+    (:then (reply) (if (string= reply "PONG")
+                       :UP
+                     `(:status :DOWN :message ,(format "Redis PING returned: %s" reply))))
+    (:catch (err) `(:status :DOWN :message ,(format "Failed to ping Redis: %S" err)))))
 
 (warp:defhealth-check :coordinator-liveness (coordinator-worker)
   "Checks if the leader election coordinator process is running.
-On a leader node, this process maintains the leadership lease. If
-it dies, the node is effectively non-functional as a leader."
-  ;; Algorithm: Local process status check.
-  ;; This check simply inspects the state of a managed sub-process.
+This check is a leader-only check that verifies the liveness of the
+managed worker responsible for the leadership lease.
+
+Arguments:
+- `coordinator-worker` (warp-managed-worker): The managed worker for
+  the coordinator.
+
+Returns:
+- (plist or keyword): `:UP` if the worker is running, otherwise a plist
+  `'(:status :DOWN ...)`."
   (if (warp:managed-worker-is-running-p coordinator-worker)
       :UP
-    ;; Rationale: The coordinator is a critical, leader-only process.
-    ;; If it is not running, the node cannot perform leader-exclusive
-    ;; tasks and is effectively dead.
     `(:status :DOWN :message "Coordinator process not running.")))
 
 (warp:defhealth-check :worker-population (state-manager)
   "Checks if there are any active workers in the cluster.
-A leader can be healthy but have no workers to do tasks. This
-check reports `:DEGRADED` as a useful signal for operators."
-  ;; Algorithm: State-based logical check.
-  ;; This check doesn't test a system's liveness, but rather its
-  ;; functionality. It looks at the shared cluster state to see if
-  ;; any workers are registered.
+This is a high-level check for the cluster leader to verify that the
+cluster has workers to perform tasks.
+
+Arguments:
+- `state-manager` (warp-state-manager): The distributed state manager.
+
+Returns:
+- (loom-promise): A promise that resolves to `:UP` or a plist like
+  `'(:status :DEGRADED ...)` if no workers are found."
   (braid! (warp:state-manager-get state-manager '(:workers))
     (:then (workers-map)
-           (if (or (not workers-map) (zerop (hash-table-count workers-map)))
-               ;; Rationale: The system can't do work if there are no
-               ;; workers. This is not a fatal error for the leader,
-               ;; but it's a degraded state for the cluster as a whole.
-               `(:status :DEGRADED :message "No active workers in cluster.")
-             :UP))))
+      (if (or (not workers-map) (zerop (hash-table-count workers-map)))
+          `(:status :DEGRADED :message "No active workers in cluster.")
+        :UP))))
 
-;;;----------------------------------------------------------------
-;;; Health Plugin Definition
-;;;----------------------------------------------------------------
-
-(warp:defplugin :health
-  "Provides a composite, declarative health checking system.
-This plugin provides the core framework for health monitoring in Warp.
-It installs the `health-check-service` for aggregating reports and
-a `health-provider` component that dynamically discovers and
-activates all health checks relevant to the current runtime profile."
-  :version "2.2.0"
-  :dependencies '(warp-component)
-  :profiles
-  `((:worker
-     :doc "Installs the standard health check suite for a worker."
-     :components
-     ((health-check-service
-       :doc "The central service that aggregates health reports."
-       :requires '(runtime-instance)
-       :factory (lambda (runtime)
-                  (warp:health-check-service-create
-                   :id (format "health-%s" (warp-runtime-instance-id runtime)))))
-      (health-provider
-       :doc "The component that activates all health checks for this profile."
-       ;; The `warp-health--collect-check-dependencies` macro is a powerful
-       ;; tool that reads the dependencies of a list of named health checks
-       ;; and generates a single `:requires` list for this component. This
-       ;; ensures that all dependencies for all checks are injected correctly.
-       :requires ,(warp-health--collect-check-dependencies
-                   '(:cpu-usage :memory-usage :request-queue
-                     :event-queue-health :master-connection-health
-                     :executor-pool-saturation))
-       :start (lambda (instance ctx &rest _)
-                (let* ((h-service (warp:context-get-component ctx :health-check-service))
-                       (checks '(:cpu-usage :memory-usage :request-queue
-                                 :event-queue-health :master-connection-health
-                                 :executor-pool-saturation)))
-                  ;; Iterate over each defined check for this profile.
-                  (dolist (check-name checks)
-                    (let* ((info (warp:registry-get
-                                  warp--health-contributor-registry check-name))
-                           (fn (plist-get info :fn))
-                           (deps (plist-get info :deps))
-                           ;; Get the actual component instances for each dependency
-                           ;; from the current context.
-                           (dep-insts (mapcar
-                                       (lambda (type)
-                                         (warp:context-get-component ctx (intern (symbol-name type) :keyword)))
-                                       deps)))
-                      ;; Register a contributor function with the health service.
-                      ;; The contributor function is a closure that encapsulates
-                      ;; the check's logic and its resolved dependencies.
-                      (warp:health-check-service-register-contributor
-                       h-service check-name
-                       (lambda () (warp-health--make-check-promise
-                                   (lambda () (apply fn dep-insts)))))))))))
-    (:cluster-worker
-     :doc "Installs health checks for the cluster leader."
-     :dependencies '(state-manager telemetry-pipeline)
-     :components
-     ((health-orchestrator
-       :doc "A leader-only component that tracks health reports from all workers."
-       :requires '(state-manager)
-       :factory (lambda (sm) `(:state-manager ,sm)))
-      (health-provider
-       :doc "Activates cluster-specific and predictive health checks."
-       :requires ,(warp-health--collect-check-dependencies
-                   '(:redis-connectivity :coordinator-liveness
-                     :worker-population
-                     :memory-exhaustion-predictor
-                     :disk-space-predictor))
-       :start (lambda (instance ctx &rest _)
-                (let* ((h-service (warp:context-get-component ctx :health-check-service))
-                       (checks '(:redis-connectivity :coordinator-liveness
-                                 :worker-population
-                                 :memory-exhaustion-predictor
-                                 :disk-space-predictor)))
-                  ;; This loop performs the same dynamic registration process
-                  ;; as the worker profile, but with a different set of checks.
-                  (dolist (check-name checks)
-                    (let* ((info (warp:registry-get
-                                  warp--health-contributor-registry check-name))
-                           (fn (plist-get info :fn))
-                           (deps (plist-get info :deps))
-                           (dep-insts (mapcar
-                                       (lambda (type)
-                                         (warp:context-get-component ctx (intern (symbol-name type) :keyword)))
-                                       deps)))
-                      (warp:health-check-service-register-contributor
-                       h-service check-name
-                       (lambda () (warp-health--make-check-promise
-                                   (lambda () (apply fn dep-insts)))))))))))))
-                                   
 ;;;----------------------------------------------------------------
 ;;; Register Default Predictors
-;;;----------------------------------------------------------------
+;;----------------------------------------------------------------
 
 (defun warp-health--register-default-predictors ()
   "Register the system's default predictive health sources."
   (warp:health-register-predictive-source
    (make-warp-predictive-health-source
     :name :memory-exhaustion-predictor
-    :metric-name "memory-usage-mb"
-    :threshold 2048
-    :analyzer (make-linear-trend-analyzer)
-    :formatter-fn (lambda (time-min)
-                    (format "Memory exhaustion predicted in %s min"
-                            time-min))))
+    :metric-name "system.memory.usage.mb" :threshold 2048
+    :analyzer (make-wma-trend-analyzer)
+    :formatter-fn (lambda (time-min) (format "Memory exhaustion predicted in %s min"
+                                             time-min))))
   (warp:health-register-predictive-source
    (make-warp-predictive-health-source
     :name :disk-space-predictor
-    :metric-name "disk-usage-percent"
-    :threshold 95.0
-    :analyzer (make-linear-trend-analyzer)
-    :formatter-fn (lambda (time-min)
-                    (format "Disk space critical in %s min"
-                            time-min))))
+    :metric-name "system.disk.usage.percent" :threshold 95.0
+    :analyzer (make-wma-trend-analyzer)
+    :formatter-fn (lambda (time-min) (format "Disk space critical in %s min"
+                                             time-min))))
   t)
 
 (warp-health--register-default-predictors)

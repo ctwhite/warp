@@ -1,4 +1,4 @@
-;;; warp-websocket-plugin.el --- Low-Level WebSocket Transport Plugin -*- lexical-binding: t; -*-
+;;; warp-websocket.el --- Low-Level WebSocket Transport Plugin -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
@@ -35,6 +35,13 @@
 ;;     which is responsible for UI updates, is never blocked by a large volume of
 ;;     incoming data, a critical consideration for a responsive user experience.
 ;;
+;; ## Enhancement: Rich Health Metrics
+;;
+;; This version is updated to adhere to the new `transport-protocol-service`
+;; interface contract, which requires implementations to provide rich health
+;; metrics via `get-health-metrics`. This function replaces the old, binary
+;; `health-check-fn` and provides a granular health score based on the
+;; liveness of the underlying process.
 
 ;;; Code:
 
@@ -53,6 +60,7 @@
 (require 'warp-state-machine)
 (require 'warp-transport-api)
 (require 'warp-plugin)
+(require 'warp-health)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -208,43 +216,44 @@ Returns:
 - A `cons` cell `(FRAME . REMAINING-BYTES)` on success, where `FRAME`
   is a plist of the decoded frame data. Returns `nil` if the input
   data is incomplete for a full frame."
-  (when (>= (length byte-string) 2)
-    (let* ((byte1 (aref byte-string 0))
-           (byte2 (aref byte-string 1))
-           (finp (> (logand byte1 #x80) 0))
-           (opcode (logand byte1 #x0F))
-           (maskedp (> (logand byte2 #x80) 0))
-           (len-ind (logand byte2 #x7F))
-           (offset 2) payload-len masking-key)
-      (cond
-       ((<= len-ind 125) (setq payload-len len-ind))
-       ((= len-ind 126)
-        (when (< (length byte-string) (+ offset 2)) (cl-return-from nil))
-        (setq payload-len (bindat-get-field
-                           (bindat-unpack '((v u16)) (substring byte-string
-                                                                offset
-                                                                (+ offset 2)))
-                           'v))
-        (cl-incf offset 2))
-       (t
-        (when (< (length byte-string) (+ offset 8)) (cl-return-from nil))
-        (setq payload-len (bindat-get-field
-                           (bindat-unpack '((v u64)) (substring byte-string
-                                                                offset
-                                                                (+ offset 8)))
-                           'v))
-        (cl-incf offset 8)))
-      (when maskedp
-        (when (< (length byte-string) (+ offset 4)) (cl-return-from nil))
-        (setq masking-key (substring byte-string offset (+ offset 4)))
-        (cl-incf offset 4))
-      (let ((frame-end (+ offset payload-len)))
-        (when (< (length byte-string) frame-end) (cl-return-from nil))
-        (let* ((raw (substring byte-string offset frame-end))
-               (payload (if maskedp (warp-websocket--mask-data masking-key raw)
-                          raw)))
-          (cons `(:opcode ,opcode :fin ,finp :payload ,payload)
-                (substring byte-string frame-end)))))))
+  (cl-block warp-websocket--decode-frame
+    (when (>= (length byte-string) 2)
+      (let* ((byte1 (aref byte-string 0))
+            (byte2 (aref byte-string 1))
+            (finp (> (logand byte1 #x80) 0))
+            (opcode (logand byte1 #x0F))
+            (maskedp (> (logand byte2 #x80) 0))
+            (len-ind (logand byte2 #x7F))
+            (offset 2) payload-len masking-key)
+        (cond
+        ((<= len-ind 125) (setq payload-len len-ind))
+        ((= len-ind 126)
+          (when (< (length byte-string) (+ offset 2)) (cl-return-from warp-websocket--decode-frame nil))
+          (setq payload-len (bindat-get-field
+                            (bindat-unpack '((v u16)) (substring byte-string
+                                                                  offset
+                                                                  (+ offset 2)))
+                            'v))
+          (cl-incf offset 2))
+        (t
+          (when (< (length byte-string) (+ offset 8)) (cl-return-from warp-websocket--decode-frame nil))
+          (setq payload-len (bindat-get-field
+                            (bindat-unpack '((v u64)) (substring byte-string
+                                                                  offset
+                                                                  (+ offset 8)))
+                            'v))
+          (cl-incf offset 8)))
+        (when maskedp
+          (when (< (length byte-string) (+ offset 4)) (cl-return-from warp-websocket--decode-frame nil))
+          (setq masking-key (substring byte-string offset (+ offset 4)))
+          (cl-incf offset 4))
+        (let ((frame-end (+ offset payload-len)))
+          (when (< (length byte-string) frame-end) (cl-return-from warp-websocket--decode-frame nil))
+          (let* ((raw (substring byte-string offset frame-end))
+                (payload (if maskedp (warp-websocket--mask-data masking-key raw)
+                            raw)))
+            (cons `(:opcode ,opcode :fin ,finp :payload ,payload)
+                  (substring byte-string frame-end))))))))
 
 ;;;----------------------------------------------------------------------
 ;;; Server-Side Logic
@@ -652,6 +661,27 @@ Returns:
        (warp:error! :type 'warp-websocket-error
                     :message "WebSocket health check failed.")))))
 
+(defun warp-websocket-protocol--get-health-metrics-fn (connection)
+  "The `get-health-metrics` method for the `:websocket` transport.
+This new function implements the enhanced `transport-protocol-service`
+interface. It reports a health score based on the liveness of the
+underlying Emacs process that manages the WebSocket connection.
+
+Arguments:
+- `CONNECTION` (warp-transport-connection): The connection to inspect.
+
+Returns:
+- (loom-promise): A promise resolving to a `warp-connection-health-score`
+  object."
+  (let* ((raw-conn (warp-transport-connection-raw-connection connection))
+         (score (if (processp raw-conn)
+                    (if (process-live-p raw-conn) 1.0 0.0)
+                  ;; For a server listener, check its process.
+                  (if (process-live-p (plist-get raw-conn :process)) 1.0 0.0))))
+    ;; The final composite score is calculated here. For this simple transport,
+    ;; the score is a binary 1.0 or 0.0 based on process liveness.
+    (loom:resolved! (make-warp-connection-health-score :overall-score score))))
+
 (defun warp-websocket-protocol--address-generator-fn (&key id host)
   "The `address-generator` method for the `:websocket` transport.
 This function implements a part of the `transport-protocol-service` API.
@@ -685,7 +715,8 @@ Returns:
        :close-fn #'warp-websocket-protocol--close-fn
        :send-fn #'warp-websocket-protocol--send-fn
        :health-check-fn #'warp-websocket-protocol--health-check-fn
+       :get-health-metrics-fn #'warp-websocket-protocol--get-health-metrics-fn
        :address-generator-fn #'warp-websocket-protocol--address-generator-fn))))
 
-(provide 'warp-websocket-plugin)
-;;; warp-websocket-plugin.el ends here
+(provide 'warp-websocket)
+;;; warp-websocket.el ends here

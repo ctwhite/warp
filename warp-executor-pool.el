@@ -5,41 +5,44 @@
 ;; This module provides a high-level, resilient pool for executing Lisp
 ;; forms in sandboxed, isolated sub-processes.
 ;;
-;; ## Architectural Role
+;; ## The "Why": The Need for Process Isolation
 ;;
-;; Why: The `warp-executor-pool` is a specialized implementation of the
-;; resource pool pattern. It uses `warp-resource-pool` as its foundation
-;; to manage the lifecycle of Emacs sub-processes and `warp-process` to
-;; launch them securely. It delegates all code evaluation to the
-;; `warp-exec` module, ensuring that execution adheres to a formal security
-;; policy.
+;; While `warp-thread-pool` is excellent for running trusted code
+;; concurrently, threads within the same process share memory and a global
+;; state. A misbehaving or crashing thread can take down the entire
+;; application.
 ;;
-;; Its purpose is distinct from `warp-thread-pool`, and developers should
-;; choose the appropriate tool for their needs:
+;; For executing potentially unstable, resource-intensive, or untrusted
+;; code, a stronger boundary is needed. An **OS process** provides this.
+;; The `warp-executor-pool` manages a fleet of `emacs -Q` sub-processes,
+;; where each task runs in complete isolation. If a task crashes or hangs
+;; its sub-process, the main application is unaffected.
 ;;
-;; - Use `warp-thread-pool`: For trusted, high-performance, in-process
-;;   concurrency for standard Elisp functions.
+;; This makes it the ideal tool for running third-party plugins, complex
+;; data processing jobs, or any code that requires a secure, sandboxed
+;; environment with strict resource limits.
 ;;
-;; - Use `warp-executor-pool`: For sandboxed, out-of-process, isolated code
-;;   execution that requires a formal security policy.
+;; ## The "How": A Pool of Secure Runtimes
 ;;
-;; ## Key Features:
+;; The executor pool is a specialized `warp-resource-pool` that manages a
+;; fleet of pre-warmed, ready-to-use Emacs sub-processes.
 ;;
-;; - **Process Isolation**: Each task runs in a separate `emacs -Q`
-;;   sub-process, preventing any task from affecting the state of the main
-;;   process or other tasks.
+;; 1.  **The Secure Bootstrap**: Each sub-process is not a blank Emacs. It
+;;     runs a bootstrap script that sets up a minimal, self-contained
+;;     "micro-runtime" consisting of an IPC server and a local instance of
+;;     the `:security-manager-service`.
 ;;
-;; - **Secure Launch & Execution**: Uses `warp:process-launch` to support
-;;   sandboxing via `systemd-run` or `sudo`. All submitted code is
-;;   evaluated via the `warp-exec` security framework.
+;; 2.  **The Execution Flow**: When a form is submitted to the pool:
+;;     - The pool checks out a ready sub-process (via its IPC client) from
+;;       the resource pool.
+;;     - It sends the Lisp form to the sub-process over IPC.
+;;     - The sub-process's IPC server receives the form and passes it to its
+;;       local `:security-manager-service` for sandboxed evaluation.
+;;     - The result is sent back to the main process over IPC.
+;;     - The sub-process resource is returned to the pool for reuse.
 ;;
-;; - **Promise-Based API**: `warp:executor-pool-submit` provides a modern,
-;;   asynchronous interface for developers.
-;;
-;; - **Self-Healing Pool**: Built on `warp-resource-pool`, it automatically
-;;   manages the lifecycle of sub-processes, including creating, destroying,
-;;   and restarting processes that have crashed.
-;;
+;; This architecture cleanly separates the execution environment from the
+;; main application, providing maximum security and stability.
 
 ;;; Code:
 
@@ -56,317 +59,279 @@
 (require 'warp-ipc)
 (require 'warp-uuid)
 (require 'warp-exec)
-(require 'warp-security-policy)
-(require 'warp-service) ; New dependency
-(require 'warp-security-service)
+(require 'warp-security-engine)
+(require 'warp-service)
+(require 'warp-plugin)
+(require 'warp-channel)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Configuration
 
 (warp:defconfig executor-pool-config
   "Defines the configuration for a `warp-executor-pool` instance.
 
-Why: This holds all tunable parameters that govern the pool's behavior,
-from scaling limits to the security policies of the sub-processes.
-
 Fields:
 - `name` (string): A unique, human-readable name for the pool.
 - `min-size` (integer): The minimum number of idle sub-processes.
 - `max-size` (integer): The absolute maximum number of sub-processes.
-- `idle-timeout` (float): The time in seconds a sub-process can remain
-  idle before it is terminated.
-- `request-timeout` (float): The maximum time in seconds to wait for a
-  single task to execute before the request fails.
-- `security-level` (keyword): The security policy to enforce on all
-  executed code (e.g., `:strict`, `:moderate`)."
-  (name            "default-executor-pool" :type string)
-  (min-size        1       :type integer :validate (>= $ 0))
-  (max-size        4       :type integer :validate (>= $ 1))
-  (idle-timeout    300.0   :type float   :validate (>= $ 0.0))
-  (request-timeout 60.0    :type float   :validate (> $ 0.0))
-  (security-level  :strict :type keyword))
+- `idle-timeout` (float): Seconds a sub-process can be idle before termination.
+- `request-timeout` (float): Max time in seconds to wait for a task to execute.
+- `security-level` (keyword): The default security policy to enforce on
+  all executed code (e.g., `:strict`)."
+  (name "default-executor-pool" :type string)
+  (min-size 1 :type integer :validate (>= $ 0))
+  (max-size 4 :type integer :validate (>= $ 1))
+  (idle-timeout 300.0 :type float :validate (>= $ 0.0))
+  (request-timeout 60.0 :type float :validate (> $ 0.0))
+  (security-level :strict :type keyword))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definitions
 
 (cl-defstruct (warp-executor-pool (:constructor %%make-executor-pool))
   "Manages a pool of sandboxed sub-processes for task execution.
-
-Why: This struct is the main runtime object for the executor pool. It
-acts as a high-level wrapper, orchestrating the underlying generic
-resource pool which does the heavy lifting of process management.
+This acts as a high-level wrapper, orchestrating the underlying generic
+resource pool which manages the process lifecycles.
 
 Fields:
 - `name` (string): The unique name of this pool instance.
-- `config` (executor-pool-config): The configuration object for this pool.
+- `config` (executor-pool-config): Configuration object for this pool.
+- `process-manager` (t): The process manager service client, used for
+  launching new sub-processes.
 - `resource-pool` (warp-resource-pool): The underlying generic resource
-  pool instance that manages the lifecycle of the actual sub-process
-  resources."
-  (name          nil :type string)
-  (config        nil :type (or null t))
+  pool that manages the actual sub-processes."
+  (name nil :type string)
+  (config nil :type (or null t))
+  (process-manager nil :type (or null t))
   (resource-pool nil :type (or null t)))
 
-(cl-defstruct (warp-secure-execution-client
-               (:constructor make-secure-execution-client)
-               (:copier nil))
-  "Client for the `secure-execution-service`.
-
-Why: This struct provides the `submit` method for interacting with the
-service's implementation.
-
-Fields:
-- `pool` (warp-executor-pool): The executor pool instance to use."
-  (pool nil :type (or null warp-executor-pool)))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Private Functions
 
-;;;###autoload
-(defun warp-executor--resource-factory (config)
-  "A factory hook to create a new sandboxed sub-process resource.
-
-Why: This function implements the `:factory-fn` contract required by the
-underlying `warp-resource-pool`. Its sole responsibility is to launch a
-new, clean Emacs sub-process using the secure `warp:process-launch`
-function, and then establish an IPC channel for communication.
-
-Arguments:
-- `CONFIG` (executor-pool-config): The configuration for the pool.
+(defun warp-executor--get-bootstrap-forms ()
+  "Return the Lisp forms to bootstrap a secure sub-process.
+These forms set up a minimal component system, the security engine, and
+an IPC server within the sandboxed sub-process.
 
 Returns:
-- (loom-promise): A promise that resolves with a `warp-ipc-client` object
-  connected to the newly created sub-process."
-  (let* ((ipc-id (format "executor-%s" (warp:uuid-string (warp:uuid4))))
-         ;; This is the Lisp code that the sub-process will execute on
-         ;; startup. It now loads the full security stack, making the
-         ;; sub-process a capable, secure execution engine.
-         (bootstrap-forms
-          `((require 'warp-ipc)
-            (require 'warp-exec)
-            (require 'warp-security-service)
-            ;; Create an execution system within the sub-process.
-            (defvar-local warp--exec-system (warp:exec-system-create))
-            (let ((server (warp:ipc-server-create :id ,ipc-id)))
-              (warp:ipc-server-start server)
-              ;; Keep the process alive to listen for IPC requests.
-              (while t (accept-process-output nil 1))))))
-    ;; Use our secure, high-level process launcher. This correctly handles
-    ;; security policies like `run-as-user` or `systemd-run`.
-    (warp:process-launch (make-warp-lisp-process-strategy
-                          :eval-forms bootstrap-forms))
-    ;; Give the process a moment to start before we connect to it.
-    (braid! (loom:delay! 0.2)
-      (:then (lambda (_) (warp:ipc-client-create :id ipc-id))))))
+- (list): A list of Lisp forms to be evaluated on startup."
+  `((require 'warp-ipc) (require 'warp-component) (require 'warp-config)
+    (require 'warp-security-engine) (require 'warp-service)
+    ;; 1. Define the necessary components for a minimal security runtime.
+    (warp:defcomponent security-engine :factory #'warp:security-engine-create)
+    (warp:defcomponent default-security-engine
+      :requires '(security-engine)
+      :factory (lambda (engine) `(:security-engine ,engine)))
+    ;; 2. Create and start the minimal component system.
+    (let* ((cs (warp:component-system-create
+                :definitions (list (warp:defcomponent security-engine
+                                     :factory #'warp:security-engine-create)
+                                   (warp:defcomponent default-security-engine
+                                     :requires '(security-engine)
+                                     :factory (lambda (e)
+                                                `(:security-engine ,e))))))
+           (sec-svc (warp:component-system-get cs :default-security-engine)))
+      (warp:component-system-start cs)
+      ;; 3. Set up the IPC server to handle requests from the main process.
+      (let ((server (warp:ipc-server-create
+                     :id (warp:env "executor-ipc-id")
+                     :handler (lambda (req)
+                                (let ((form (plist-get req :form))
+                                      (level (plist-get req :level)))
+                                  ;; 4. Execute the form using the local
+                                  ;;    security service.
+                                  (warp-service-invoke
+                                   sec-svc :execute-form form level nil))))))
+        (warp:ipc-server-start server)
+        ;; 5. Keep the process alive to handle multiple requests.
+        (while t (accept-process-output nil 1))))))
 
-;;;###autoload
+(defun warp-executor--resource-factory (pool)
+  "Factory hook to create a new sandboxed sub-process resource.
+This `warp-resource-pool` callback launches a new Emacs sub-process and
+establishes an IPC channel for communication.
+
+Arguments:
+- `POOL` (warp-executor-pool): The executor pool instance.
+
+Returns:
+- (loom-promise): A promise resolving with a `warp-ipc-client` connected
+  to the new sub-process."
+  (let* ((process-mgr (warp-executor-pool-process-manager pool))
+         (ipc-id (format "executor-%s" (warp:uuid-string (warp:uuid4))))
+         (bootstrap-forms (warp-executor--get-bootstrap-forms))
+         (env-vars `((,(warp:env 'executor-ipc-id) . ,ipc-id))))
+    ;; 1. Launch the sandboxed sub-process.
+    (process-manager-service-launch
+     proc-mgr
+     (make-warp-lisp-process-strategy :eval-forms bootstrap-forms)
+     :env env-vars)
+    ;; 2. Connect to the new process's IPC server with retries to handle
+    ;;    variable process startup times.
+    (loom:retry (lambda () (warp:ipc-client-create :id ipc-id))
+                :retries 5 :delay 0.1)))
+
 (defun warp-executor--resource-destructor (ipc-client)
-  "A destructor hook to cleanly terminate an executor sub-process.
-
-Why: This function implements the `:destructor-fn` contract for the
-`warp-resource-pool`. It gracefully shuts down the IPC connection, which
+  "Destructor hook to cleanly terminate an executor sub-process.
+This `warp-resource-pool` callback shuts down the IPC connection, which
 in turn causes the sub-process to exit.
 
 Arguments:
-- `IPC-CLIENT` (warp-ipc-client): The IPC client connected to the
-  sub-process that needs to be terminated.
+- `IPC-CLIENT` (warp-ipc-client): The client connected to the sub-process.
 
 Returns:
-- (loom-promise): A promise that resolves when termination is complete."
-  (warp:log! :debug "executor-pool" "Destroying executor sub-process %s"
+- (loom-promise): A promise resolving when termination is complete."
+  (warp:log! :debug "executor-pool" "Destroying executor process %s"
              (warp:ipc-client-server-id ipc-client))
   (warp:ipc-client-shutdown ipc-client))
 
-;;;###autoload
-(defun warp-executor--task-executor (task-form ipc-client config)
-  "The function that executes a task on a specific sub-process resource.
-
-Why: This function is the bridge between a submitted task and an active
-sub-process. It delegates the actual execution to the remote process's
-security policy framework.
-
-How: It constructs a Lisp form that, when evaluated in the sub-process,
-will create the appropriate security policy (e.g., `:strict`) and use
-it to safely execute the user's `task-form`.
+(defun warp-executor--task-executor (task-form ipc-client pool-config req-config)
+  "Send a task to a specific sub-process resource for execution.
 
 Arguments:
 - `TASK-FORM` (sexp): The Lisp form to be executed remotely.
-- `IPC-CLIENT` (warp-ipc-client): The client connected to the executor process.
-- `CONFIG` (executor-pool-config): The pool's configuration.
+- `IPC-CLIENT` (warp-ipc-client): Client connected to the executor.
+- `POOL-CONFIG` (executor-pool-config): The pool's base configuration.
+- `REQ-CONFIG` (executor-pool-config): Request-specific config.
 
 Returns:
-- (loom-promise): A promise that resolves with the result of the remote
-  evaluation or rejects on failure or timeout."
-  (let* ((security-level (executor-pool-config-security-level config))
-         ;; This is the form that will be sent to and evaluated by the
-         ;; sub-process. It instructs the sandboxed sub-process to create a
-         ;; security policy and use it to execute the original task,
-         ;; ensuring enforcement happens remotely.
-         (form-to-send
-          `(let ((policy (warp:security-policy-create ',security-level
-                                                     :exec-system warp--exec-system)))
-             (warp:security-policy-execute-form policy ',task-form))))
+- (loom-promise): A promise resolving with the result of the remote
+  evaluation."
+  (let ((security-level (executor-pool-config-security-level req-config))
+        (timeout (executor-pool-config-request-timeout pool-config)))
+    ;; Send the request to the sub-process as a data plist.
     (warp:ipc-client-send-request
-     ipc-client form-to-send
-     :timeout (executor-pool-config-request-timeout config))))
+     ipc-client
+     `(:form ,task-form :level ,security-level)
+     :timeout timeout)))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;----------------------------------------------------------------------
-;;; Secure Execution Service Interface
+;;; Secure Execution Service
 ;;;----------------------------------------------------------------------
 
 (warp:defservice-interface :secure-execution-service
-  "Provides a high-level API for submitting code for secure, sandboxed execution.
-
-Why: This is the formal service contract for any component that provides a
-secure execution environment, decoupling clients from the underlying
-implementation details (e.g., whether the code is run in a thread, a
-sub-process, or a VM).
-
-:Methods:
-- `submit-form`: Submits a Lisp form for execution within a sandbox."
+  "Provides a high-level API for secure, sandboxed code execution.
+This is the formal service contract that decouples clients from the
+underlying implementation (e.g., a process pool vs. another mechanism)."
   :methods
   '((submit-form (form &key security-level)
      "Submits a Lisp form for sandboxed execution.")))
 
 ;;;----------------------------------------------------------------------
-;;; Secure Execution Service Implementation
-;;;----------------------------------------------------------------------
-
-(warp:defservice-implementation :secure-execution-service :executor-pool
-  "Implements the `secure-execution-service` contract using `warp-executor-pool`.
-
-Why: This is the concrete implementation of the service, acting as a facade
-over the executor pool's core functionality."
-  :version "1.0.0"
-  :expose-via-rpc (:client-class secure-execution-client)
-
-  (submit-form (pool form &key security-level)
-    "Submits a Lisp form to the executor pool for execution.
-
-How: This method implements the `:submit-form` method of the service. It
-takes a Lisp `form`, retrieves a sub-process from the pool, and executes
-the form within that process under the appropriate security context.
-
-:Arguments:
-- `pool` (warp-executor-pool): The injected executor pool instance.
-- `form` (any): The Lisp s-expression to execute.
-- `security-level` (keyword, optional): The security level to enforce.
-  Defaults to the pool's configured level.
-
-:Returns:
-- (loom-promise): A promise that resolves with the result of the form."
-    (let ((exec-security-level (or security-level
-                                   (executor-pool-config-security-level
-                                    (warp-executor-pool-config pool)))))
-      (warp:with-pooled-resource (executor-client (warp-executor-pool-resource-pool pool))
-        ;; Here, we assemble the remote evaluation form. It instructs the
-        ;; sandboxed sub-process to create a security policy and execute
-        ;; the user's form under its rules.
-        (let ((remote-exec-form
-               `(let ((policy (warp:security-policy-create ',exec-security-level
-                                                          :exec-system warp--exec-system)))
-                  (warp:security-policy-execute-form policy ',form nil))))
-          (warp:ipc-client-send-request ipc-client remote-exec-form))))))
-
-;;;----------------------------------------------------------------------
-;;; Public Functions
+;;; Pool Management
 ;;;----------------------------------------------------------------------
 
 ;;;###autoload
 (defun warp:executor-pool-create (&rest options)
-  "Creates and initializes a new sandboxed sub-process executor pool.
-
-Why: This factory function builds the complete executor pool. It does
-this by creating an instance of the generic `warp-resource-pool` and
-wiring it up with our specialized factory and destructor functions for
+  "Create and initialize a new sandboxed sub-process executor pool.
+This factory builds the complete executor pool by creating a generic
+`warp-resource-pool` and wiring it up with specialized hooks for
 managing Emacs sub-processes.
 
 Arguments:
-- `&rest OPTIONS` (plist): A property list conforming to
-  `executor-pool-config` to configure this pool instance.
+- `OPTIONS` (plist): A property list conforming to `executor-pool-config`.
 
 Returns:
 - (warp-executor-pool): A new, initialized executor pool instance."
   (let* ((config (apply #'make-executor-pool-config options))
          (pool-name (executor-pool-config-name config))
-         ;; The executor pool is built on the foundation of the generic
-         ;; resource pool. We provide it with our specialized hooks for
-         ;; creating and destroying our specific resource type (sandboxed
-         ;; Emacs sub-processes).
+         (process-mgr (warp:component-system-get (current-component-system)
+                                                 :process-manager-service))
+         (pool-instance (%%make-executor-pool :name pool-name
+                                              :config config
+                                              :process-manager process-mgr))
+         ;; The core of the executor pool is a generic resource pool.
          (resource-pool
           (warp:resource-pool-create
            `(:name ,(intern (format "%s-resources" pool-name))
              :min-size ,(executor-pool-config-min-size config)
              :max-size ,(executor-pool-config-max-size config)
              :idle-timeout ,(executor-pool-config-idle-timeout config)
-             :factory-fn (lambda () (warp-executor--resource-factory config))
-             :destructor-fn (lambda (res) (warp-executor--resource-destructor res))))))
+             ;; Provide our custom lifecycle hooks for sub-processes.
+             :factory-fn (lambda () (warp-executor--resource-factory
+                                     pool-instance))
+             :destructor-fn (lambda (res) (warp-executor--resource-destructor
+                                           res))))))
+    (setf (warp-executor-pool-resource-pool pool-instance) resource-pool)
     (warp:log! :info pool-name "Executor pool '%s' created." pool-name)
-    (%%make-executor-pool :name pool-name
-                          :config config
-                          :resource-pool resource-pool)))
-
-;;;###autoload
-(defun warp:executor-pool-submit (pool task-form)
-  "Submits a Lisp form to the pool for secure, sandboxed execution.
-
-Why: This is the primary public API for offloading work to an isolated
-sub-process. It automatically handles the entire resource lifecycle:
-it checks out an available sub-process from the pool, sends the
-`TASK-FORM` to it to be evaluated under the pool's configured security
-policy, and returns a promise for the result.
-
-How: The use of `warp:with-pooled-resource` is critical as it guarantees
-that the sub-process is safely returned to the pool for reuse, even if
-the task fails or times out.
-
-Arguments:
-- `POOL` (warp-executor-pool): The executor pool instance.
-- `TASK-FORM` (sexp): The Lisp form to be executed in the sandbox.
-
-Returns:
-- (loom-promise): A promise that will be resolved with the task's result
-  or rejected on failure or timeout."
-  (let ((resource-pool (warp-executor-pool-resource-pool pool))
-        (config (warp-executor-pool-config pool)))
-    (warp:with-pooled-resource (executor-client resource-pool)
-      ;; This body is executed with a checked-out IPC client. The task
-      ;; executor function handles the communication and delegates security.
-      (warp-executor--task-executor task-form executor-client config))))
+    pool-instance))
 
 ;;;###autoload
 (defun warp:executor-pool-shutdown (pool)
-  "Shuts down the executor pool gracefully.
-
-Why: This function terminates all active and idle sub-processes managed
-by the pool and cleans up all associated IPC resources.
+  "Shut down the executor pool gracefully.
+This terminates all active and idle sub-processes managed by the pool.
 
 Arguments:
 - `POOL` (warp-executor-pool): The executor pool to shut down.
 
 Returns:
-- (loom-promise): A promise that resolves when the shutdown is complete."
-  (warp:log! :info (warp-executor-pool-name pool)
-             "Shutting down executor pool...")
+- (loom-promise): A promise resolving when the shutdown is complete."
+  (warp:log! :info (warp-executor-pool-name pool) "Shutting down executor pool.")
   (warp:resource-pool-shutdown (warp-executor-pool-resource-pool pool)))
 
 ;;;###autoload
-(defun warp:executor-pool-status (pool)
-  "Returns a plist with the current status of an executor pool.
-
-Why: This function queries the status of the underlying
-`warp-resource-pool`, providing metrics like the number of active and
-idle executor processes.
+(defun warp:executor-pool-submit-form (pool form &key security-level)
+  "Submit a Lisp form to the executor pool for sandboxed execution.
 
 Arguments:
-- `POOL` (warp-executor-pool): The pool to inspect.
+- `POOL` (warp-executor-pool): The pool instance to submit to.
+- `FORM` (any): The Lisp s-expression to execute.
+- `SECURITY-LEVEL` (keyword, optional): The security level to enforce,
+  overriding the pool's default for this single execution.
 
 Returns:
-- (plist): A property list with status info, such as `:pool-size`,
-  `:active-count`, and `:idle-count`."
-  (warp:resource-pool-status (warp-executor-pool-resource-pool pool)))
+- (loom-promise): A promise that resolves with the result of the form."
+  (let* ((resource-pool (warp-executor-pool-resource-pool pool))
+         (config (warp-executor-pool-config pool))
+         (final-config (if security-level
+                           (make-executor-pool-config
+                            :security-level security-level
+                            :request-timeout
+                            (executor-pool-config-request-timeout config))
+                         config)))
+    ;; Safely acquire a resource, execute the task, and release the resource.
+    (warp:with-pooled-resource (executor-client resource-pool)
+      (warp-executor--task-executor form executor-client config
+                                    final-config))))
+
+;;;----------------------------------------------------------------------
+;;; Plugin and Component Definitions
+;;;----------------------------------------------------------------------
+
+(warp:defplugin :executor-pool
+  "Provides a pool for executing Lisp forms in sandboxed sub-processes.
+This plugin is the primary provider for the `:secure-execution-service`."
+  :version "1.1.0"
+  :dependencies '(warp-component warp-service warp-security-engine
+                  warp-ipc warp-process warp-resource-pool config-service)
+  :components '(secure-execution-service executor-pool))
+
+(warp:defcomponent executor-pool
+  :doc "A specialized resource pool for sandboxed Lisp execution."
+  :requires '(config-service process-manager-service)
+  :factory (lambda (config-svc proc-mgr)
+             (let ((config-options
+                    (warp:config-service-get config-svc :executor-pool)))
+               (apply #'warp:executor-pool-create config-options)))
+  :start (lambda (pool _ctx)
+           (warp:resource-pool-start (warp-executor-pool-resource-pool pool)))
+  :stop (lambda (pool _ctx)
+          (warp:resource-pool-shutdown (warp-executor-pool-resource-pool
+                                        pool))))
+
+(warp:defservice-implementation :secure-execution-service
+  :default-secure-execution-service
+  "Implements the `secure-execution-service` using `warp-executor-pool`."
+  :version "1.0.0"
+  :requires '(executor-pool)
+  (submit-form (self form &key security-level)
+    "Submit a Lisp form to the executor pool for execution."
+    (let ((pool (plist-get self :executor-pool)))
+      (warp:executor-pool-submit-form pool form
+                                      :security-level security-level))))
 
 (provide 'warp-executor-pool)
 ;;; warp-executor-pool.el ends here

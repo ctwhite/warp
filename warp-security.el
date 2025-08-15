@@ -1,1126 +1,422 @@
-;;; warp-service.el --- Unified Service Definition, Registry, and RPC Generation -*- lexical-binding: t; -*-
+;;; warp-security.el --- Pluggable Security Auditing and Monitoring -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
-;; This module is the foundation for a Service-Oriented Architecture (SOA)
-;; within the Warp framework. It provides the core machinery for defining,
-;; implementing, discovering, and consuming services, effectively acting as
-;; the central nervous system for distributed communication.
+;; This module provides a comprehensive security layer focused on auditing,
+;; compliance, and real-time threat detection. It is designed to complement
+;; the preventative measures in `warp-security-engine.el` by providing
+;; robust detection and response capabilities.
 ;;
-;; ## Architectural Goal: A "Service Mesh in a Box"
+;; ## The "Why": The Need for Detection and Auditing
 ;;
-;; Modern distributed systems often rely on a "service mesh" to handle the
-;; complex and failure-prone nature of network communication. A service
-;; mesh typically consists of two parts:
+;; While prevention (sandboxing, firewalls) is the first line of defense, it's
+;; not sufficient on its own. A mature security posture requires the ability
+;; to answer the questions: "What is happening on my system right now?" and
+;; "What happened in the past?"
 ;;
-;; 1. **The Control Plane**: A central authority that knows about all
-;; services, their locations, and their health. It configures the network.
-;; 2. **The Data Plane**: Lightweight proxies that sit next to each service,
-;; intercepting all network traffic to apply rules like load balancing,
-;; retries, and circuit breaking.
+;; This module provides the tools for this by focusing on:
+;; - **Detection**: Identifying suspicious or malicious activity that may
+;;   indicate an active threat or a system misconfiguration.
+;; - **Auditing**: Creating a permanent, immutable record of critical
+;;   system events. This is essential for meeting compliance requirements
+;;   (like SOC 2 or HIPAA) and for performing forensic analysis after a
+;;   security incident.
 ;;
-;; This module provides the tools to build both planes directly within the
-;; Warp framework, turning a collection of workers into a cohesive,
-;; resilient, and observable system.
+;; ## The "How": An Extensible Rule Engine and Audit Trail
 ;;
-;; ### How This File Implements Service Mesh Concepts
+;; 1.  **The Strategy Pattern for Rules**: Security threats are diverse, so
+;;     the system must be extensible. This module uses the Strategy
+;;     Pattern: each type of threat detection (e.g., checking a network
+;;     whitelist, looking for a suspicious command pattern) is a separate
+;;     "rule strategy". The `warp:defsecurity-rule` macro allows new rules
+;;     to be plugged into the system at any time without changing core code.
 ;;
-;; - **API Contract (The Source of Truth)**:
-;; The `warp:defservice-interface` macro defines a language-agnostic
-;; contract for a service. This is the cornerstone of SOA, ensuring all
-;; parties (clients and servers) agree on the API.
+;; 2.  **The Runtime Security Monitor**: This component acts as a "security
+;;     guard" that periodically "patrols" the system. On each patrol, it
+;;     gathers recent activity logs (telemetry) and shows them to each
+;;     registered security rule. If a rule spots something suspicious, it
+;;     raises an alarm by emitting a `:security-finding-detected` event.
 ;;
-;; - **Code Generation (Automating the Boilerplate)**:
-;; The `warp:defservice-implementation` macro is the engine that brings
-;; the contract to life. At compile time, it reads the contract and
-;; **auto-generates the entire RPC stack**:
-;; - Type-safe data schemas for requests.
-;; - A "smart client" struct with methods that hide all network complexity.
-;; - Server-side command handlers and routing logic.
-;; This eliminates boilerplate and ensures the client and server are
-;; always perfectly synchronized.
-;;
-;; - **Policy Registry**: A central registry for named, reusable policies.
-;; This new system allows for fine-grained control over the service mesh's
-;; behavior. A service no longer has hardcoded policies; instead, it
-;; declares which named policy set it wants to use.
-;;
-;; - **Smart Client & Middleware (The Data Plane)**:
-;; The `warp-service-client` and its associated middleware pipeline act
-;; as the data plane. When a generated client method is called, it doesn't
-;; just make a network request. Instead, it executes a series of steps:
-;; 1. **Discover**: Asks the registry for a list of healthy endpoints.
-;; 2. **Load Balance**: Intelligently selects one endpoint from the list.
-;; 3. **Apply Resilience**: Wraps the call in circuit breakers and retries.
-;; 4. **Connect & Call**: Manages the connection and makes the RPC call.
-;; This offloads all complex network logic from the application developer
-;; to the framework.
+;; 3.  **The Audit Trail**: This component acts as a "secure flight recorder".
+;;     It subscribes to a configured list of critical system events (e.g.,
+;;     `:user-logged-in`, `:firewall-rule-changed`) and writes every
+;;     occurrence to a durable, append-only log via the `state-manager`.
+;;     This provides a permanent record for compliance and forensics.
 
 ;;; Code:
 
 (require 'cl-lib)
-(require 's)
 (require 'loom)
-(require 'braid)
 
-(require 'warp-log)
-(require 'warp-error)
-(require 'warp-event)
-(require 'warp-balancer)
-(require 'warp-registry)
-(require 'warp-rpc)
 (require 'warp-component)
 (require 'warp-plugin)
-(require 'warp-protocol)
-(require 'warp-middleware)
-(require 'warp-circuit-breaker)
+(require 'warp-event)
+(require 'warp-log)
+(require 'warp-state-manager)
+(require 'warp-telemetry)
+(require 'warp-registry)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
 
-(define-error 'warp-service-error
-  "Base error for all service-related operations."
+(define-error 'warp-security-error
+  "A generic error for security operations."
   'warp-error)
 
-(define-error 'warp-service-not-found
-  "The requested service could not be found or no healthy endpoints were available."
-  'warp-service-error)
+(define-error 'warp-security-rule-evaluation-error
+  "An error occurred during the evaluation of a security rule."
+  'warp-security-error)
 
-(define-error 'warp-service-contract-violation
-  "A service implementation does not fulfill its interface contract."
-  'warp-error)
-
-(define-error 'warp-service-rpc-config-error
-  "An invalid configuration was provided for RPC generation."
-  'warp-service-error)
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Global State
 
-(defvar warp--service-interface-registry (make-hash-table :test 'eq)
-  "Global registry for all service interface contracts.
-Populated by `warp:defservice-interface`, this is the source of truth
-for all API contracts in the system.")
+(defvar warp--security-rule-registry
+  (warp:registry-create :name "security-rules" :event-system nil)
+  "A central registry for all discoverable security rules.
+`warp:defsecurity-rule` populates this registry, and the
+`runtime-security-monitor` consumes it.")
 
-(defvar warp--service-implementations-registry (make-hash-table :test 'eq)
-  "Global registry mapping interface names to their implementations.")
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Struct Definitions
 
-(defvar warp--service-initializers '()
-  "A list of service initializer functions.
-Generated by `warp:defservice-implementation`, these are run once at
-startup by the `:service-loader` component to register services.")
+(cl-defstruct network-whitelist-rule
+  "A concrete rule strategy that checks for unauthorized network connections.
+This is used to enforce network policies by ensuring that the runtime
+only communicates with an approved set of hosts.
 
-(defvar warp--policy-registry (make-hash-table :test 'eq)
-  "A new global registry for all named, reusable service policies.
-This registry is populated by the `warp:defpolicy` macro.")
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Policy Schemas and Generic Dispatch
-
-(cl-defstruct (warp-retry-policy
-               (:constructor make-warp-retry-policy))
-  "A policy for handling failed requests via retries.
 Fields:
-- `retries` (integer): The number of times to retry a failed request.
-- `delay-strategy` (keyword): The strategy to use for delays between retries.
-- `delay-options` (plist): A property list of options for the delay strategy.")
+- `name` (keyword): The unique identifier for this rule instance.
+- `severity` (keyword): The severity of a violation, e.g., `:warning` or `:critical`.
+- `whitelist` (list): A list of strings, where each string is an allowed
+  destination hostname or IP address."
+  (name nil :type keyword)
+  (severity :warning :type keyword)
+  (whitelist '() :type list))
 
-(cl-defstruct (warp-timeout-policy
-               (:constructor make-warp-timeout-policy))
-  "A policy for enforcing a timeout on a request.
+(cl-defstruct process-pattern-rule
+  "A concrete rule strategy that scans executed commands for malicious patterns.
+This is useful for detecting common attack vectors like privilege escalation
+or the use of known malicious tools.
+
 Fields:
-- `timeout` (float): The timeout duration for a single request in seconds.")
+- `name` (keyword): The unique identifier for this rule instance.
+- `severity` (keyword): The severity of a violation.
+- `pattern` (string): The regular expression to match against the full
+  command line of executed processes."
+  (name nil :type keyword)
+  (severity :warning :type keyword)
+  (pattern "" :type string))
 
-(cl-defstruct (warp-load-balancer-policy
-               (:constructor make-warp-load-balancer-policy))
-  "A policy for selecting a service endpoint from a list of healthy ones.
+(cl-defstruct statistical-anomaly-rule
+  "A concrete rule strategy that checks for statistical deviations from a baseline.
+This rule is used for anomaly detection, identifying when a system metric
+(like CPU or memory usage) behaves unusually compared to its historical norm.
+
 Fields:
-- `type` (keyword): The load balancing algorithm to use for this service.
-- `options` (plist): A property list of options for the algorithm.")
+- `name` (keyword): The unique identifier for this rule instance.
+- `severity` (keyword): The severity of a violation.
+- `metric` (string): The name of the telemetry metric to analyze (e.g., \"cpu.utilization\").
+- `z-score-threshold` (float): The number of standard deviations from
+  the historical mean that constitutes an anomaly. A common value is 3.0."
+  (name nil :type keyword)
+  (severity :warning :type keyword)
+  (metric "" :type string)
+  (z-score-threshold 3.0 :type float))
 
-(cl-defgeneric warp:apply-retry-policy (policy callable)
-  "Applies the retry policy to a callable function.
-This generic function is the core of the retry policy strategy.
+(cl-defstruct custom-security-rule
+  "A generic rule strategy that encapsulates its evaluation logic in a lambda.
+This provides maximum flexibility for defining complex or highly specific rules
+that don't fit the other predefined strategy types.
+
+Fields:
+- `name` (keyword): The unique identifier for this rule instance.
+- `severity` (keyword): The severity of a violation.
+- `logic-fn` (function): A lambda that accepts one argument (the telemetry data
+  plist) and returns a 'finding' plist if triggered, otherwise nil."
+  (name nil :type keyword)
+  (severity :warning :type keyword)
+  (logic-fn nil :type (or null function)))
+
+(cl-defstruct (warp-security-audit-trail (:constructor %%make-security-audit-trail))
+  "The component that creates a durable, append-only audit trail.
+It acts as a secure flight recorder by subscribing to critical system
+events and persisting them to a durable state backend, providing a
+permanent record for compliance and forensics.
+
+Fields:
+- `event-system` (t): The system event bus, used to subscribe to auditable events.
+- `state-manager` (t): The durable state store for persisting audit logs.
+- `audit-events` (list): A list of event keywords (e.g., `:user-login`) to be captured.
+- `compliance-frameworks` (list): A list of compliance standards this trail helps
+  satisfy (e.g., '(:soc2 :hipaa)).
+- `subscription-ids` (list): A list of IDs for the active event subscriptions,
+  used for cleanup on shutdown."
+  (event-system nil :type t)
+  (state-manager nil :type t)
+  (audit-events nil :type list)
+  (compliance-frameworks nil :type list)
+  (subscription-ids nil :type list))
+
+(cl-defstruct (warp-runtime-security-monitor (:constructor %%make-runtime-security-monitor))
+  "The component that periodically scans for security violations.
+This component is the engine for real-time threat detection. It runs on a timer,
+fetches recent system activity from the telemetry pipeline, and evaluates all
+registered security rules against that data.
+
+Fields:
+- `telemetry-pipeline` (t): The service for querying recent system activity data.
+- `event-system` (t): The system event bus, used for emitting security finding events.
+- `poller` (loom-poller): The background task scheduler used to run the periodic scan."
+  (telemetry-pipeline nil :type t)
+  (event-system nil :type t)
+  (poller (loom:poll :name "runtime-security-monitor") :type t))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Security Rule Strategy Pattern
+
+(cl-defgeneric warp:security-rule-evaluate (rule telemetry-data)
+  "Evaluate a security `RULE` against a snapshot of `TELEMETRY-DATA`.
+This is the generic function for all security rule strategies, forming the
+core contract for the Strategy Pattern. Each concrete rule type must implement
+a method for this function.
+
 Arguments:
-- `policy` (warp-retry-policy): The policy to apply.
-- `callable` (function): The function to execute and potentially retry."
-  (:method ((policy warp-retry-policy) callable)
-    (let ((retries (warp-retry-policy-retries policy)))
-      (loom:retry (funcall callable) :retries retries))))
-
-(cl-defgeneric warp:apply-load-balancer-policy (policy endpoints)
-  "Applies the load balancing policy to a list of endpoints.
-Arguments:
-- `policy` (warp-load-balancer-policy): The load balancing policy.
-- `endpoints` (list): The list of available service endpoints."
-  (:method ((policy warp-load-balancer-policy) endpoints)
-    (let ((load-balancer-type (warp-load-balancer-policy-type policy)))
-      (warp:balance endpoints
-                    (warp:balancer-strategy-create :type load-balancer-type)))))
-
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Public API for Policies
-
-(defmacro warp:defpolicy (name type docstring &rest options)
-  "Defines and registers a named, reusable service policy.
-This macro is the primary API for creating policies. It registers a policy
-blueprint in a global registry, making it available for consumption by
-other services.
-
-Arguments:
-- `name` (keyword): The unique name for this policy (for example, `:aggressive-retry-policy`).
-- `type` (keyword): The type of policy (for example, `:retry`, `:timeout`).
-- `docstring` (string): Documentation for the policy.
-- `options` (plist): A property list of policy-specific options.
+- `RULE` (t): The concrete rule strategy instance to evaluate.
+- `TELEMETRY-DATA` (plist): A property list containing recent system
+  activity, such as network connections and executed commands.
 
 Returns:
-- `name` (symbol).
+- (plist or nil): A 'finding' plist containing details of the violation
+  if the rule is triggered, otherwise returns nil."
+  (:documentation "Evaluate a security RULE against TELEMETRY-DATA."))
 
-Side Effects:
-- Registers the policy in the global `warp--policy-registry`."
-  (let ((policy-constructor (intern (format "make-warp-%s-policy" type))))
-    `(progn
-       (puthash ',name (list :type ',type :constructor ',policy-constructor
-                             :options ',options)
-                warp--policy-registry)
-       ',name)))
+(cl-defmethod warp:security-rule-evaluate ((rule network-whitelist-rule) data)
+  "Find the first connection event where the destination host is not in
+the rule's whitelist."
+  (cl-find-if (lambda (conn)
+                (not (member (plist-get conn :destination-host)
+                             (network-whitelist-rule-whitelist rule))))
+              (plist-get data :connections)))
+
+(cl-defmethod warp:security-rule-evaluate ((rule process-pattern-rule) data)
+  "Find the first shell command event that matches the rule's regexp."
+  (cl-find-if (lambda (cmd)
+                (string-match-p (process-pattern-rule-pattern rule)
+                                (plist-get cmd :command-line)))
+              (plist-get data :commands)))
+
+(cl-defmethod warp:security-rule-evaluate ((rule statistical-anomaly-rule) data)
+  "Check if a metric's current value is a statistical outlier."
+  (let* ((metric-name (statistical-anomaly-rule-metric rule))
+         (metrics-with-baseline (plist-get data :metrics-with-baseline)))
+    (when-let (metrics (gethash metric-name metrics-with-baseline))
+      (let* ((current (plist-get metrics :value))
+             (mean (plist-get metrics :mean))
+             (std-dev (plist-get metrics :std-dev)))
+        ;; Ensure std-dev is non-zero to avoid division errors.
+        (when (and current mean std-dev (> std-dev 1e-6))
+          (let ((z-score (abs (/ (- current mean) std-dev))))
+            (when (> z-score (statistical-anomaly-rule-z-score-threshold
+                              rule))
+              `(:details "Metric deviates from baseline" :metric ,metric-name
+                :value ,current :mean ,mean :z-score ,z-score))))))))
+
+(cl-defmethod warp:security-rule-evaluate ((rule custom-security-rule) data)
+  "Evaluate a custom rule by invoking its stored logic function."
+  (funcall (custom-security-rule-logic-fn rule) data))
 
 ;;;###autoload
-(defmacro warp:defpolicy-set (name docstring &rest policy-names)
-  "Defines a reusable collection of named policies.
-This macro bundles a list of policy names into a single, named unit.
+(defmacro warp:defsecurity-rule (name &key type severity spec evaluate)
+  "Define and register a new security monitoring rule.
+This macro is the primary API for extending the runtime security monitor.
+It supports two modes of definition:
+1.  Type-based: Uses a predefined strategy (e.g., `:network-whitelist`)
+    and configures it with the `:spec` property list.
+2.  Logic-based: Uses the `:evaluate` keyword to provide a custom
+    lambda function for maximum flexibility.
 
 Arguments:
-- `name` (keyword): The name for the policy set.
-- `docstring` (string): Documentation for the policy set.
-- `policy-names` (list): A list of policy names to include in the set."
-  `(defconst ,name ',policy-names ,docstring))
-  
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Private Middleware & Pipeline Logic
+- `NAME` (keyword): A unique, namespaced name for the rule.
+- `:type` (keyword, optional): The predefined strategy type, e.g.,
+  `:network-whitelist`, `:process-pattern`, `:statistical-anomaly`.
+- `:severity` (keyword): The severity of a finding, e.g., `:warning`, `:critical`.
+- `:spec` (plist, optional): A property list of arguments for a type-based rule.
+  (e.g., `'(:whitelist (\"host1\"))`).
+- `:evaluate` (form, optional): A lambda of the form `(lambda (telemetry-data) ...)`
+  for a custom rule.
 
-(defun warp-service--rpc-call-middleware-function (context next-function)
-  "Middleware to execute the RPC call on the server side.
+Returns: The `NAME` of the rule."
+  `(if ,evaluate
+       ;; Branch 1: Logic-based rule. Create a `custom-security-rule`
+       ;; instance with the provided inline lambda.
+       (warp:registry-add warp--security-rule-registry ',name
+                          (make-custom-security-rule
+                           :name ',name :severity ',severity
+                           :logic-fn ,evaluate)
+                          :overwrite-p t)
+     ;; Branch 2: Type-based rule. Instantiate a predefined strategy struct.
+     (let ((rule-struct-name
+            (cl-case ,type
+              (:network-whitelist 'network-whitelist-rule)
+              (:process-pattern 'process-pattern-rule)
+              (:statistical-anomaly 'statistical-anomaly-rule)))
+           (constructor-args `(:name ',name :severity ',',severity)))
+       ;; Assemble the constructor arguments based on the rule type's spec.
+       (cl-case ,type
+         (:network-whitelist (setq constructor-args
+                                   (append `(:whitelist
+                                             ,(plist-get spec :whitelist))
+                                           constructor-args)))
+         (:process-pattern (setq constructor-args
+                                 (append `(:pattern
+                                           ,(plist-get spec :pattern))
+                                         constructor-args)))
+         (:statistical-anomaly (setq constructor-args
+                                     (append `(:metric
+                                               ,(plist-get spec :metric)
+                                               :z-score-threshold
+                                               ,(plist-get spec :threshold))
+                                             constructor-args))))
+       ;; Dynamically call the correct `make-*` constructor and register the rule.
+       (warp:registry-add warp--security-rule-registry ',name
+                          (apply #',(intern (format "make-%s"
+                                                    rule-struct-name))
+                                 constructor-args)
+                          :overwrite-p t))))
 
-Arguments:
-- `context` (plist): The context containing `:command` and `:impl-instance`.
-- `next-function` (function): A nullary function to continue the pipeline.
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Private Component Logic
 
-Returns:
-- (loom-promise): A promise that resolves with the updated context."
-  (let ((command (plist-get context :command))
-        (implementation (plist-get context :impl-instance)))
-    (braid! (apply (warp-command-executor command) (list implementation command context))
-      (:then (result)
-             (funcall next-function (plist-put context :result result))))))
-
-(defun warp-service--dial-endpoint-middleware (context next-function)
-  "Middleware to discover, balance, and connect to a service endpoint.
-
-Why: This new middleware replaces three older stages. It delegates the
-entire complex process of finding and connecting to a service to the
-high-level `dialer-service`.
-
-How: It retrieves the `dialer-service` from the `service-client`'s
-context and calls `warp:dialer-dial` with the logical service name.
-The resulting connection is then added to the pipeline's context for
-the next stage.
-
-Arguments:
-- `context` (plist): The pipeline context, containing `:service-client`
-  and `:service-name`.
-- `next-function` (function): The function to continue the pipeline.
-
-Returns:
-- (loom-promise): A promise that resolves after `next-function` completes."
-  (let* ((client (plist-get context :service-client))
-         (service-name (plist-get context :service-name))
-         (dialer (warp-service-client-dialer client)))
-    (braid! (warp:dialer-dial dialer service-name)
-      (:then (connection)
-             ;; Add the connection handle to the context and proceed.
-             (funcall next-function (plist-put context :connection connection))))))
-
-(defun warp-service--apply-resilience-middleware (context next-function)
-  "Middleware to wrap the downstream call in resilience policies.
-
-Arguments:
-- `context` (plist): Context with `:service-client` and `:service-name`.
-- `next-function` (function): The rest of the pipeline to call.
-
-Returns:
-- (loom-promise): Promise for the result of the resiliently executed pipeline."
-  (let* ((client (plist-get context :service-client))
-         (service-name (plist-get context :service-name))
-         (policies (gethash service-name (warp-service-client-policies client)))
-         (retry-policy (gethash :retry-policy policies))
-         (timeout-policy (gethash :timeout-policy policies))
-         (circuit-breaker-config (plist-get policies :circuit-breaker))
-         (callable (lambda () (funcall next-function context)))
-         final-callable)
-    ;; Wrap the core `callable` with resilience patterns, inside-out.
-    (setq final-callable callable)
-    ;; 1. Innermost layer: Timeout Policy
-    (when timeout-policy
-      (setq final-callable
-            (lambda () (loom:with-timeout (warp-timeout-policy-timeout timeout-policy)
-                         (funcall final-callable)))))
-    ;; 2. Next layer: Circuit Breaker
-    (when circuit-breaker-config
-      (let ((breaker (apply #'warp:circuit-breaker-get-or-create
-                            (symbol-name service-name) circuit-breaker-config)))
-        (setq final-callable
-              (lambda () (warp:circuit-breaker-execute breaker final-callable)))))
-    ;; 3. Outermost layer: Retry Policy
-    (when retry-policy
-      (setq final-callable (lambda () (warp:apply-retry-policy retry-policy final-callable))))
-    ;; Execute the fully wrapped function.
-    (funcall final-callable)))
-
-(defun warp-service--rpc-client-send-middleware (context next-function)
-  "Middleware to send the RPC command over the wire on the client side.
+(defun warp-runtime-security--run-scan (monitor)
+  "Run a single security scan cycle.
+This fetches recent telemetry, evaluates all registered security rules
+against it, and emits an event for any violations (findings).
 
 Arguments:
-- `context` (plist): The full context for the RPC call.
-- `next-function` (function): The function to continue the pipeline.
-
-Returns:
-- (loom-promise): A promise that resolves with the updated context."
-  (let* ((client (plist-get context :service-client))
-         (rpc (warp-service-client-rpc-system client))
-         (connection (plist-get context :connection))
-         (endpoint (plist-get context :selected-endpoint))
-         (command (plist-get context :command))
-         (options (plist-get context :options)))
-    (braid! (warp:rpc-send
-             rpc connection
-             :recipient-id (warp-service-endpoint-worker-id endpoint)
-             :command command
-             :stream (plist-get options :stream)
-             :expect-response (not (plist-get options :fire-and-forget)))
-      (:then (result) (funcall next-function (plist-put context :result result)))
-      (:catch (error)
-              (error (plist-get options :service-error-type)
-                     (format "RPC to '%s' failed" (plist-get options :method-name))
-                     error)))))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Private Functions
-
-;;;---------------------------------------------------------------------------
-;;; RPC Generation Helpers (Internal)
-;;;---------------------------------------------------------------------------
-
-(defun warp-service--generate-client-struct (client-class protocol-name)
-  "Generate the `cl-defstruct` form for a protocol's client.
-
-Arguments:
-- `client-class` (symbol): The symbol name for the client struct.
-- `protocol-name` (symbol): The name of the service protocol.
-
-Returns:
-- (list): A complete `(cl-defstruct ...)` S-expression."
-  `(cl-defstruct (,client-class
-                  (:constructor ,(intern (format "make-%s" client-class))))
-     ,(format "Client for the %s protocol." protocol-name)
-     (service-client (cl-assert nil) :type (or null t))))
-
-(defun warp-service--generate-auto-schema-form (protocol method args)
-  "Generate a `warp:defschema` form for an RPC method's arguments.
-
-Arguments:
-- `protocol` (symbol): The protocol namespace.
-- `method` (symbol): The specific method name.
-- `args` (list): The raw argument list from the method's definition.
-
-Returns:
-- (list): A complete `(warp:defschema ...)` S-expression."
-  (let* ((schema-name (intern (format "warp-%s-%s-request" protocol method)))
-         ;; Filter out lambda-list keywords from the data payload.
-         (fields (cl-loop for argument in args
-                          unless (memq argument '(&key &optional &rest))
-                          collect `(,argument nil :serializable-p t))))
-    `(warp:defschema ,schema-name (:generate-protobuf t) ,@fields)))
-
-(defun warp-service--generate-client-method (client-class protocol rpc-definition specs
-                                                          global-options client-middleware)
-  "Generate a client-side stub function (`cl-defun`) for an RPC method.
-
-Arguments:
-- `client-class` (symbol): The name of the client struct.
-- `protocol` (symbol): The name of the protocol namespace.
-- `rpc-definition` (list): The base definition of the RPC method.
-- `specs` (list): The full list of method specifications from the interface.
-- `global-options` (plist): RPC options that apply to all methods.
-- `client-middleware` (list): User-provided middleware stages.
-
-Returns:
-- (list): A complete `(cl-defun ...)` S-expression."
-  (let* ((method (car rpc-definition)) (arguments (cadr rpc-definition))
-         (specification (cl-find method specs :key #'car))
-         (options (append (plist-get (cdddr specification) :rpc-options) global-options))
-         (schema (plist-get options :request-schema))
-         (client-function (intern (format "%s-%s" client-class method)))
-         (command (intern (format ":%s/%s" protocol method)))
-         (service-name (intern (symbol-name protocol) :keyword))
-         (error-type (intern (format "%s-RPC-ERROR" protocol)))
-         (payload (cl-loop for argument in arguments
-                           unless (memq argument '(&key &optional &rest))
-                           collect `(,(intern (symbol-name argument) :keyword)
-                                     ,argument)))
-         (options-property-list `(:method-name ',method
-                                  :service-error-type ',error-type
-                                  :stream ,(plist-get options :stream)
-                                  :fire-and-forget ,(plist-get options :fire-and-forget)))
-         (pipeline-name (intern (format "client-pipeline-%s/%s"
-                                        protocol method))))
-    ;; This is the generated client-side function that the user will call.
-    `(cl-defun ,client-function (client ,@arguments)
-       ,(format "Sends a %S RPC with discovery and resilience." command)
-       (let* ((service-client (,(intern (format "%s-service-client" client-class)) client))
-              ;; 1. Package arguments into a structured RPC command.
-              (command-object (make-warp-rpc-command
-                               :name ',command
-                               :arguments (,(intern (format "make-%s" schema)) ,@payload)))
-              ;; 2. Prepare the initial context for the middleware pipeline.
-              (context `(:service-client ,service-client :service-name ,service-name
-                                         :command ,command-object :options ,options-property-list))
-              ;; 3. Define the full execution pipeline.
-              (pipeline
-               (warp:middleware-pipeline-create
-                :name ',pipeline-name
-                :stages
-                (append
-                 ,client-middleware
-                 (list (warp:defmiddleware-stage
-                        :apply-resilience
-                        #'warp-service--apply-resilience-middleware)
-                       (warp:defmiddleware-stage
-                        :dial-endpoint ;; New, unified stage using the dialer
-                        #'warp-service--dial-endpoint-middleware)
-                       (warp:defmiddleware-stage
-                        :send-rpc-command
-                        #'warp-service--rpc-client-send-middleware))))))
-         ;; 4. Run the pipeline and extract the final result.
-         (braid! (warp:middleware-pipeline-run pipeline context)
-           (:then (final-context) (plist-get final-context :result)))))))
-
-(defun warp-service--generate-command-definition (protocol rpc-definition)
-  "Generate a `warp:defcommand` form for a single RPC method.
-
-Arguments:
-- `protocol` (symbol): The protocol namespace for the command.
-- `rpc-definition` (list): The full definition of a single RPC method.
-
-Returns:
-- (list): A complete `(warp:defcommand ...)` S-expression."
-  (let* ((method (car rpc-definition))
-         (handler (plist-get (cddr rpc-definition) :handler))
-         (command (intern (format ":%s/%s" protocol method)))
-         (documentation (cadr handler)) (arguments (caddr handler)) (body (cdddr handler)))
-    `(warp:defcommand ,command ,documentation :arguments ',arguments :execute (lambda ,arguments ,@body))))
-
-(defun warp-service--generate-handler-registration
-    (router protocol rpc-definition implementation-key server-middleware)
-  "Generate the Lisp form to add a command handler to a router.
-
-Arguments:
-- `router` (symbol): The variable name holding the router instance.
-- `protocol` (symbol): The protocol namespace.
-- `rpc-definition` (list): The definition of a single RPC method.
-- `implementation-key` (keyword): The dependency injection key for the service component.
-- `server-middleware` (list): User-provided server-side middleware stages.
-
-Returns:
-- (list): A complete `(warp:command-router-add-route ...)` S-expression."
-  (let* ((method (car rpc-definition))
-         (command (intern (format ":%s/%s" protocol method)))
-         (pipeline-name (intern (format "pipeline-%s" command))))
-    ;; This generated form wires the RPC command to a server-side pipeline.
-    `(warp:command-router-add-route ,router ',command
-       :handler-function
-       (lambda (command-object context)
-         (let* ((system (plist-get context :host-system))
-                ;; 1. Resolve the concrete service implementation via DI.
-                (implementation (warp:component-system-get system ,implementation-key))
-                (plugin-system (warp:component-system-get system :plugin-system))
-                ;; 2. Discover any additional middleware from plugins.
-                (contributions (when plugin-system (warp:get-plugin-contributions
-                                                    plugin-system :service-rpc-middleware)))
-                ;; 3. Assemble the final server-side pipeline.
-                (pipeline (warp:middleware-pipeline-create
-                           :name ',pipeline-name
-                           :stages (append ,server-middleware (car contributions)
-                                           (list (warp:defmiddleware-stage
-                                                  :rpc-call
-                                                  #'warp-service--rpc-call-middleware-function))))))
-           ;; 4. Run the pipeline.
-           (warp:middleware-pipeline-run pipeline `(:command ,command-object
-                                                    :context ,context
-                                                    :impl-instance ,implementation)))))))
-
-(defun warp-service--generate-protocol-forms (protocol interface-name implementation-name rpc-options)
-  "Orchestrate the entire code generation process for a service's RPC.
-
-Arguments:
-- `protocol` (symbol): The unique name for the generated protocol.
-- `interface-name` (symbol): The service interface being implemented.
-- `implementation-name` (symbol): The name of the component with the implementation.
-- `rpc-options` (plist): Configuration options for the RPC layer.
-
-Returns:
-- (list): A `(progn ...)` S-expression containing all generated code.
-
-Signals:
-- `warp-service-contract-violation`: If `interface-name` is not a known interface."
-  (let* ((client-class (plist-get rpc-options :client-class))
-         (auto-schema (plist-get rpc-options :auto-schema))
-         (server-middleware (plist-get rpc-options :server-middleware))
-         (client-middleware (plist-get rpc-options :client-middleware))
-         (implementation-key (intern (format ":%s" implementation-name)))
-         (interface-definition (gethash interface-name warp--service-interface-registry))
-         (methods (plist-get interface-definition :methods))
-         (registration-function (intern (format "%%register-%s-handlers" protocol)))
-         (error-type (when client-class
-                       (intern (format "%s-RPC-ERROR" protocol)))))
-    ;; 1. Sanity check: The implementation must reference a valid interface.
-    (unless interface-definition
-      (error 'warp-service-contract-violation
-             (format "Service interface '%s' not found" interface-name)))
-
-    ;; 2. Iterate over each method to generate its client and server components.
-    (let ((schema-forms) (client-forms) (command-definitions) (handler-registrations))
-      (dolist (specification methods)
-        (cl-destructuring-bind (method arguments &key documentation rpc-options) specification
-          (let* ((implementation-function (intern (format "%s-%s" implementation-name method)))
-                 (handler-arguments (remove-if #'keywordp arguments))
-                 (schema (when auto-schema
-                           (intern (format "warp-%s-%s-request"
-                                           protocol method))))
-                 ;; Create a structured representation for this RPC method.
-                 (rpc-definition `(,method ,arguments
-                                           ,@(when auto-schema `(:request-schema ,schema))
-                                           :handler
-                                           (lambda (,implementation-name command-object _context)
-                                             ,(or documentation "Proxy handler")
-                                             (apply #',implementation-function ,implementation-name
-                                                    (mapcar (lambda (a)
-                                                              `(plist-get
-                                                                (warp-rpc-command-arguments command-object)
-                                                                ',(intern (symbol-name a)
-                                                                          :keyword)))
-                                                            handler-arguments))))))
-            ;; Generate all required forms for this method.
-            (when auto-schema
-              (push (warp-service--generate-auto-schema-form
-                     protocol method arguments) schema-forms))
-            (when client-class
-              (push (warp-service--generate-client-method
-                     client-class protocol rpc-definition methods rpc-options
-                     client-middleware) client-forms))
-            (push (warp-service--generate-command-definition
-                   protocol rpc-definition) command-definitions)
-            (push (warp-service--generate-handler-registration
-                   'router protocol rpc-definition implementation-key server-middleware)
-                  handler-registrations))))
-
-      ;; 3. Assemble all generated forms into a single `progn` block.
-      `(progn
-         ,@(when error-type
-             `((define-error ',error-type "RPC error" 'warp-service-error)))
-         ,@(nreverse schema-forms)
-         ,@(when client-class
-             `(,(warp-service--generate-client-struct client-class protocol)))
-         ,@(nreverse client-forms)
-         ,@(nreverse command-definitions)
-         (defun ,registration-function (router)
-           ,(format "Register all handlers for the %s protocol." protocol)
-           ,@(nreverse handler-registrations))))))
-
-;;;---------------------------------------------------------------------------
-;;; Service Registry & Client Logic (Internal)
-;;;---------------------------------------------------------------------------
-
-(defun warp-service-registry--add-service-endpoint (registry worker-id address info)
-  "Create and register a single service endpoint in the catalog.
-
-Arguments:
-- `registry` (warp-service-registry): The service registry instance.
-- `worker-id` (string): The ID of the worker hosting the service.
-- `address` (string): The network address of the worker.
-- `info` (warp-service-info): The service description from the worker.
-
-Returns:
-- (loom-promise): A promise that resolves when the endpoint is added."
-  (let* ((reg (warp-service-registry-endpoint-registry registry))
-         (service-name (warp-service-info-name info))
-         (key (format "%s@%s" service-name worker-id))
-         (endpoint (make-warp-service-endpoint
-                    :service-name service-name :worker-id worker-id
-                    :address address :health-status :healthy)))
-    (warp:log! :info (warp-service-registry-id registry) "Registering: %s" key)
-    (warp:registry-add reg key endpoint :overwrite-p t)))
-
-(defun warp-service-registry--remove-all-worker-endpoints (registry worker-id)
-  "Remove all service endpoints associated with a given worker.
-
-Arguments:
-- `registry` (warp-service-registry): The service registry instance.
-- `worker-id` (string): The ID of the worker whose endpoints must be removed.
-
-Returns:
-- (loom-promise): A promise resolving when removal is complete."
-  (let ((reg (warp-service-registry-endpoint-registry registry)))
-    ;; Query for all endpoints belonging to the specified worker.
-    (when-let ((endpoint-ids (warp:registry-query reg :worker-id worker-id)))
-      (warp:log! :info (warp-service-registry-id registry)
-                 "Deregistering all %d endpoints for worker: %s"
-                 (length endpoint-ids) worker-id)
-      ;; Remove all found endpoints in parallel.
-      (loom:all (mapcar #'(lambda (id) (warp:registry-remove reg id)) endpoint-ids)))))
-
-(defun warp-service-registry--on-worker-event (registry event-type event)
-  "The reactive controller for the service registry.
-This function is subscribed to worker lifecycle events and is responsible
-for maintaining the integrity and eventual consistency of the service
-endpoint catalog. It acts as the 'listener' part of the control plane,
-reacting to changes in the cluster state to keep the service map accurate.
-
-Arguments:
-- `REGISTRY` (warp-service-registry): The service registry instance.
-- `EVENT-TYPE` (keyword): The type of event (for example, `:worker-registered`).
-- `EVENT` (warp-event): The full event object containing the payload.
-
-Returns:
-- (loom-promise): A promise that resolves when the handling is complete.
-
-Side Effects:
-- Modifies the `endpoint-registry` by adding, removing, or updating entries.
-
-Signals:
-- None. Errors are logged but do not stop the handler."
-  (let* ((reg (warp-service-registry-endpoint-registry registry))
-         (data (warp-event-data event))
-         (worker-id (plist-get data :worker-id)))
-    (pcase event-type
-      ;; WHAT: A new worker has successfully registered with the cluster.
-      ;; WHY: We need to add all the services this new worker provides to
-      ;; our central catalog so that clients can discover and use them.
-      (:worker-registered
-       (let ((services (plist-get data :services))
-             (address (plist-get data :address)))
-         (when services
-           ;; Process all announced services in parallel.
-           (loom:all
-            (mapcar #'(lambda (info)
-                        (warp-service-registry--add-service-endpoint
-                         registry worker-id address info))
-                    services)))))
-
-      ;; WHAT: A worker has shut down or been terminated.
-      ;; WHY: We must immediately remove all of its service endpoints from
-      ;; the catalog to prevent clients from attempting to route
-      ;; requests to a dead worker (a "black hole").
-      (:worker-deregistered
-       (warp-service-registry--remove-all-worker-endpoints registry worker-id))
-
-      ;; WHAT: A worker's health status has changed (for example, from :UP to :DEGRADED).
-      ;; WHY: The health of an endpoint is critical information for the load
-      ;; balancer. We need to update the status in the registry so that
-      ;; the load balancer can make smarter routing decisions (for example,
-      ;; sending less traffic to a degraded worker).
-      (:worker-health-status-changed
-       (let ((new-status (plist-get data :status)))
-         ;; 1. Find all endpoint registry IDs associated with this worker.
-         (when-let ((endpoint-ids (warp:registry-query reg :worker-id worker-id)))
-           (warp:log! :info (warp-service-registry-id registry)
-                      "Updating health for worker %s to %s for %d endpoints."
-                      worker-id new-status (length endpoint-ids))
-           ;; 2. Atomically update all found endpoints.
-           ;; This assumes `warp:registry-update-all` exists, which takes a list
-           ;; of keys and an update function to prevent race conditions.
-           (warp:registry-update-all reg endpoint-ids
-             (lambda (old-endpoint)
-               (when old-endpoint
-                 (let ((new-endpoint (copy-warp-service-endpoint old-endpoint)))
-                   (setf (warp-service-endpoint-health-status new-endpoint) new-status)
-                   ;; Return the new value for the atomic update.
-                   new-endpoint))))))))))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Public API
-
-;;;---------------------------------------------------------------------------
-;;; Service Interface Definition
-;;;---------------------------------------------------------------------------
-
-;;;###autoload
-(defmacro warp:defservice-interface (name &rest spec)
-  "Define a service interface contract.
-This macro establishes a formal, abstract contract for a service, which
-is the single source of truth for its API.
-
-Arguments:
-- `name` (symbol): The unique name of the service interface.
-- `spec` (plist): A property list defining the interface's contract.
-- `:methods`: A list of method specs: `(METHOD-NAME ARGS &key DOC ...)`.
-- `:events`: A list of events this service may emit.
-
-Returns:
-- `name` (symbol).
-
-Side Effects:
-- Registers the interface contract in a global registry at compile time."
-  (let* ((docstring (when (stringp (car spec)) (car spec)))
-         (body (if docstring (cdr spec) spec)))
-    `(progn
-       (puthash ',name (list :doc ,docstring ,@body)
-                warp--service-interface-registry)
-       ',name)))
-
-;;;---------------------------------------------------------------------------
-;;; Unified Service Implementation & RPC Generation
-;;;---------------------------------------------------------------------------
-
-;;;###autoload
-(defmacro warp:defservice-implementation (interface-name impl-name &rest body)
-  "Define a service implementation and, optionally, expose it via RPC.
-This powerful macro connects an abstract service interface to concrete Lisp
-functions and can generate the entire client-server RPC stack.
-
-Arguments:
-- `interface-name` (symbol): The `defservice-interface` this fulfills.
-- `impl-name` (symbol): A unique name for this implementation component.
-- `body` (list): Macro body including options and method implementations.
-- `:expose-via-rpc`: A property list of options to enable RPC generation.
-- `:policy-set-name`: The name of a policy set to use for client communication.
-- `(method-name ...)`: Lisp forms defining each method's implementation.
-
-Returns:
-- `impl-name` (symbol).
-
-Side Effects:
-- Expands to a `progn` block defining structs, functions, and commands.
-- Adds a runtime initializer function to a global list for auto-loading."
-  (declare (indent 2))
-  (let* ((rpc-options (plist-get body :expose-via-rpc))
-         (version (plist-get body :version "0.0.0"))
-         (protocol (when rpc-options (intern (format "%s-protocol" interface-name))))
-         (implementations (let ((b (copy-list body)))
-                            (remf b :expose-via-rpc) (remf b :version) b))
-         (initializer-function (intern (format "%%init-%s-service" impl-name)))
-         ;; New code to get the policy set name from the macro body.
-         (policy-set-name (plist-get rpc-options :policy-set-name)))
-
-    `(progn
-       ;; 1. Define the implementation functions for each method.
-       ,@(mapcar (lambda (implementation)
-                   `(defun ,(intern (format "%s-%s" impl-name (car implementation)))
-                      (,impl-name ,@(cadr implementation)) ,@(cddr implementation)))
-                 implementations)
-
-       ;; 2. Generate all RPC-related code if requested.
-       ,(when rpc-options
-          (warp-service--generate-protocol-forms
-           protocol interface-name impl-name rpc-options))
-
-       ;; 3. Define a single, self-contained initializer function.
-       (defun ,initializer-function (runtime)
-         "Initializes and registers the service and its protocol."
-         (let* ((system (warp:runtime-instance-component-system runtime))
-                (router (warp:component-system-get system :command-router)))
-           ;; 3a. Register the generated RPC handlers with the router.
-           ,(when rpc-options
-              `(,(intern (format "%%register-%s-handlers" protocol)) router))
-
-           ;; 3b. Announce the service to the central cluster registry.
-           (warp:emit-event
-            (warp:component-system-get system :event-system)
-            :service-registered
-            `(:service-info
-              ,(make-warp-service-info
-                :name ,(symbol-name interface-name)
-                :version ,version
-                :commands
-                ',(when rpc-options
-                    (mapcar (lambda (s) (intern (format ":%s/%s"
-                                                        protocol (car s))))
-                            (plist-get (gethash interface-name
-                                                warp--service-interface-registry)
-                                       :methods))))
-                :worker-id ,(warp:runtime-instance-id runtime)
-                :address ,(warp:runtime-instance-config-listen-address
-                           (warp:runtime-instance-config runtime))))
-            (warp:log! :info "service-loader"
-                       "Service '%s' (%s) registered."
-                       ',interface-name ',impl-name)))
-
-       ;; 4. Add the initializer to the global list for auto-loading.
-       (add-to-list 'warp--service-initializers ',initializer-function t)
-       ',impl-name)))
-
-;;;###autoload
-(defun warp:service-run-initializers (runtime)
-  "Run all registered service initializer functions.
-
-Arguments:
-- `RUNTIME` (warp-runtime-instance): The current runtime instance."
-  (when warp--service-initializers
-    (dolist (fn warp--service-initializers)
-      (funcall fn runtime))))
-      
-;;;---------------------------------------------------------------------------
-;;; Service Client
-;;;---------------------------------------------------------------------------
-
-;;;###autoload
-(defmacro warp:defservice-client (name &key for policy-set)
-  "Declaratively define a component that is a client for a service.
-
-Why: This macro provides a high-level abstraction for creating and
-injecting service clients. It eliminates the boilerplate of manually
-defining a component that depends on the generic `:service-client`
-and the auto-generated constructor from a `defservice-implementation`.
-
-How: It expands into a standard `warp:defcomponent` definition at
-compile time. The generated component correctly depends on the generic
-`:service-client` and uses its factory to instantiate the specific,
-type-safe client for the service specified in the `:for` key.
-
-Arguments:
-- `NAME` (symbol): The unique name for this new client component.
-- `:for` (keyword): The keyword name of the target service interface.
-- `:policy-set` (keyword, optional): The name of a resilience policy
-  (defined via `warp:defpolicy`) to apply to this client."
-
-  (let* ((service-name-str (symbol-name for))
-         ;; e.g., :my-service -> my-service-protocol-client
-         (client-struct-name (intern (format "%s-protocol-client" service-name-str)))
-         ;; e.g., :my-service -> make-my-service-protocol-client
-         (client-constructor (intern (format "make-%s" client-struct-name))))
-    `(warp:defcomponent ,name
-       :doc ,(format "A declarative client component for the '%s' service." for)
-       :requires '(service-client)
-       :factory (lambda (generic-client)
-                  ;; The generic :service-client is now configured with the
-                  ;; specific policy set for this declarative client.
-                  ,(when policy-set
-                     `(setf (warp-service-client-policy-set generic-client) ,policy-set))
-                  ;; Call the auto-generated constructor for the specific client.
-                  (,client-constructor :service-client generic-client)))))
-
-;;;---------------------------------------------------------------------------
-;;; Service Registry & Client Functions
-;;;---------------------------------------------------------------------------
-
-(defun warp:service-registry-create (&key id event-system rpc-system
-                                          load-balancer)
-  "Create and initialize a new `warp-service-registry` component.
-
-Arguments:
-- `:id` (string): A unique identifier for this registry instance.
-- `:event-system` (warp-event-system): The cluster's central event bus.
-- `:rpc-system` (warp-rpc-system): The master's RPC system.
-- `:load-balancer` (warp-balancer-strategy): The cluster's load balancer.
-
-Returns:
-- (warp-service-registry): A new, initialized registry instance."
-  (let* ((reg-name (format "service-catalog-%s" id))
-         (endpoint-reg (warp:registry-create
-                        :name reg-name :event-system event-system
-                        :indices `((:service-name
-                                    . ,#'warp-service-endpoint-service-name)
-                                   (:worker-id
-                                    . ,#'warp-service-endpoint-worker-id))))
-         (registry (%%make-service-registry
-                    :id (format "service-registry-%s" id)
-                    :endpoint-registry endpoint-reg
-                    :event-system event-system
-                    :load-balancer load-balancer)))
-    ;; The registry listens for worker lifecycle events to maintain an
-    ;; up-to-date catalog of available services.
-    (dolist (event-type '(:worker-registered
-                          :worker-deregistered
-                          :worker-health-status-changed))
-      (warp:subscribe event-system event-type
-                      (lambda (event)
-                        (warp-service-registry--on-worker-event registry event-type event))))
-    ;; The registry exposes its lookup API via RPC so that clients
-    ;; can query it for service endpoints.
-    (when rpc-system
-      (let ((router (warp:rpc-system-command-router rpc-system)))
-        (warp:defrpc-handlers router
-          (:service-select-endpoint
-           (lambda (cmd _)
-             (let ((args (warp-rpc-command-args cmd)))
-               (warp:service-registry-select-endpoint
-                registry (plist-get args :service-name)))))
-          (:service-list-all
-           (lambda (_c _x) (warp:service-registry-list-all registry))))))
-    registry))
-
-(cl-defun warp:service-client-create (&key rpc-system dialer policy-set-name)
-  "Create a new client-side service component with a named policy set.
-
-Why: This factory assembles a 'smart client' that bundles the RPC system
-for communication, the dialer for intelligent connection management,
-and a set of resilience policies for fault tolerance.
-
-How: It retrieves a policy set from the global registry, dynamically
-creates policy objects from it, and stores them in a hash table for use
-by the client's internal middleware pipeline.
-
-Arguments:
-- `:rpc-system` (warp-rpc-system): The RPC system for sending requests.
-- `:dialer` (warp-dialer-service): The dialer service for discovering
-  and connecting to endpoints.
-- `:policy-set-name` (keyword): The name of a policy set defined via
-  `warp:defpolicy`.
-
-Returns:
-- (warp-service-client): A new client instance configured with policies.
-
-Signals:
-- `error`: If the `policy-set-name` is not found in the registry."
-  (let* ((policy-set (gethash policy-set-name warp--policy-registry))
-         (policies (make-hash-table :test 'eq)))
-    (unless policy-set
-      (error "Policy set '%s' not found in registry." policy-set-name))
-    ;; Iterate over the policy set and create policy objects.
-    (dolist (policy-spec policy-set)
-      (let* ((policy-name (car policy-spec))
-             (policy-type (getf policy-spec :type))
-             (policy-options (getf policy-spec :options)))
-        (puthash policy-name (apply (getf policy-spec :constructor) policy-options) policies)))
-    (%%make-service-client
-     :rpc-system rpc-system
-     :dialer dialer
-     :policies policies)))
-
-;;;---------------------------------------------------------------------------
-;;; Service Plugin Definition
-;;;---------------------------------------------------------------------------
-
-(warp:defplugin :service-discovery
-  "Provides the core service discovery and gateway infrastructure.
-This plugin installs the service mesh infrastructure into the runtime.
-
-It uses a profile-based approach to provide different capabilities:
-- For a `:worker`, it provides the ability to host and announce services.
-- For a `:cluster-worker`, it provides the centralized control plane
-for service registration, discovery, and routing."
-  :version "1.4.0"
-  :dependencies '(warp-component warp-event warp-balancer warp-registry
-                  warp-rpc warp-protocol warp-plugin warp-config
-                  warp-state-manager warp-managed-worker
-                  warp-dialer) 
+- `MONITOR` (warp-runtime-security-monitor): The monitor instance.
+
+Side Effects: Emits a `:security-finding-detected` event for each violation."
+  (let* ((pipeline (warp-runtime-security-monitor-telemetry-pipeline monitor))
+         (event-system (warp-runtime-security-monitor-event-system monitor))
+         (rules (warp:registry-list-values warp--security-rule-registry)))
+    (warp:log! :debug "security-monitor" "Running scan with %d rules."
+               (length rules))
+    ;; Step 1: Fetch a summary of recent activity from the telemetry pipeline.
+    (let ((telemetry-data (loom:await
+                           (warp:telemetry-pipeline-get-activity-summary
+                            pipeline "1m"))))
+      ;; Step 2: Evaluate each registered rule against the telemetry data.
+      (dolist (rule rules)
+        (condition-case err
+            (when-let (finding (warp:security-rule-evaluate rule
+                                                            telemetry-data))
+              (let ((rule-plist (cl-struct-to-plist rule)))
+                (warp:log! :warn "security-monitor" "FINDING: Rule '%s' triggered."
+                           (plist-get rule-plist :name))
+                ;; Step 3: If a rule is violated, emit a standardized event.
+                (warp:emit-event event-system :security-finding-detected
+                                 `(:rule ,(plist-get rule-plist :name)
+                                   :severity ,(plist-get rule-plist
+                                                         :severity)
+                                   :details ,finding
+                                   :timestamp ,(float-time)))))
+          ;; Gracefully handle errors during rule evaluation to prevent
+          ;; one bad rule from crashing the entire scan.
+          (error
+           (warp:log! :error "security-monitor" "Error evaluating rule '%s': %S"
+                      (plist-get (cl-struct-to-plist rule) :name) err)))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Plugin Definition and Components
+
+(warp:defplugin :security
+  "Provides comprehensive security, audit trails, and compliance monitoring."
+  :version "2.2.0"
+  :dependencies '(cluster-orchestrator telemetry event-system state-manager)
   :profiles
-  `((:worker
-     :doc "Enables the service loader, allowing a worker to host services."
+  `((:cluster-worker
      :components
-     `((service-loader
-        :doc "Dynamically discovers and initializes all defined services."
-        :requires '(runtime-instance)
-        :priority 90 ; Run late to ensure dependencies are ready.
-        :start (lambda (_instance ctx runtime)
-                 ;; When the component starts, it runs all the service
-                 ;; initializer functions that were registered by
-                 ;; `warp:defservice-implementation` macros at load time.
-                 (warp:service-run-initializers runtime)))))
+     `(security-audit-trail runtime-security-monitor)))
 
-    (:cluster-worker
-     :doc "Enables the full service discovery stack for a cluster leader."
-     :components
-     `(;; The dialer is now a core component of the service mesh. It
-       ;; provides a high-level abstraction for connecting to services.
-       (dialer-service
-        :doc "The unified dialer service for the cluster."
-        :requires '(config-service service-registry load-balancer)
-        :factory (lambda (cfg-svc registry balancer)
-                   (let* ((dialer (%%make-dialer-service
-                                   :service-registry registry
-                                   :load-balancer balancer))
-                          ;; Read the pool settings from the central config.
-                          (pool-config (warp:config-service-get
-                                        cfg-svc :connection-pool))
-                          (pool (warp:resource-pool-create
-                                 :name (intern
-                                        (format "%s-conn-pool"
-                                                (warp-dialer-service-id dialer)))
-                                 ;; Define how to create a new connection.
-                                 :factory-fn (lambda (address)
-                                               (warp-dialer--connection-factory
-                                                dialer address))
-                                 ;; Define how to destroy a connection.
-                                 :destructor-fn #'warp-dialer--connection-destructor
-                                 ;; Define how to check a connection's health.
-                                 :health-check-fn #'warp-dialer--connection-health-check
-                                 ;; Apply the loaded configuration.
-                                 :idle-timeout (plist-get pool-config
-                                                          :idle-timeout 300)
-                                 :max-size (plist-get pool-config
-                                                      :max-size 50)
-                                 :min-size (plist-get pool-config
-                                                      :min-size 1)
-                                 :max-wait-time (plist-get pool-config
-                                                           :max-wait-time 5.0))))
-                     ;; Set the created pool back into the dialer struct.
-                     (setf (warp-dialer-service-connection-pool dialer) pool)
-                     dialer))
-        :start (lambda (self ctx) (warp:dialer-start self))
-        :stop (lambda (self ctx) (warp:dialer-shutdown self)))
+  :components
+  `((security-audit-trail
+     :doc "Creates a durable audit trail by subscribing to critical events
+and persisting them to the state manager. This provides a permanent,
+append-only log for compliance and forensics."
+     :requires '(event-system state-manager)
+     :factory (lambda (es sm)
+                (%%make-security-audit-trail
+                 :event-system es :state-manager sm
+                 ;; In a real system, this list would be dynamically configurable.
+                 :audit-events '(:user-login :firewall-rule-change
+                                 :critical-error)))
+     :start (lambda (self _ctx)
+              "Start the audit trail by subscribing to configured events."
+              (let ((es (warp-security-audit-trail-event-system self))
+                    (sm (warp-security-audit-trail-state-manager self))
+                    (sub-ids '()))
+                (dolist (evt-type (warp-security-audit-trail-audit-events
+                                   self))
+                  (push (warp:subscribe
+                         es evt-type
+                         (lambda (event)
+                           ;; Create a unique, time-based key for the audit log entry.
+                           (let ((log-key (format "audit-%s-%s" (float-time)
+                                                  (warp-event-id event))))
+                             (warp:state-manager-update
+                              sm `(:security :audit ,log-key) event)))
+                         :priority :low)
+                        sub-ids))
+                (setf (warp-security-audit-trail-subscription-ids self)
+                      sub-ids)))
+     :stop (lambda (self _ctx)
+             "Stop the audit trail by unsubscribing from all events."
+             (let ((es (warp-security-audit-trail-event-system self)))
+               (dolist (sub-id (warp-security-audit-trail-subscription-ids
+                                self))
+                 (warp:unsubscribe es sub-id)))))
 
-       (load-balancer
-        :doc "The routing brain of the service mesh. Selects the best
-worker using a configurable, metrics-aware strategy."
-        :requires '(config state-manager)
-        :factory
-        (lambda (cfg state-mgr)
-          (warp:balancer-strategy-create
-           ;; The specific balancing algorithm is read from config.
-           :type (warp:config-service-get cfg :load-balance-strategy)
-           ;; Filter out any unhealthy workers from selection.
-           :health-check-fn
-           #'(lambda (w) (eq (warp-managed-worker-health-status w) :healthy))
-           ;; Provides the balancer the full list of potential worker targets.
-           :get-all-workers-fn
-           (lambda (&key pool-name)
-             (let ((workers (hash-table-values
-                             (warp:state-manager-get state-mgr '(:workers)))))
-               (if pool-name
-                   (cl-remove-if-not
-                    #'(lambda (w) (string= (warp-managed-worker-pool-name w)
-                                           pool-name))
-                    workers)
-                 workers)))
-           ;; Calculates a 'load score', heavily penalizing degraded workers
-           ;; to route traffic away from them.
-           :connection-load-fn
-           (lambda (m-worker)
-             (let* ((metrics (warp-managed-worker-last-reported-metrics
-                              m-worker))
-                    (base-load (if metrics (gethash :active-request-count
-                                                    metrics 0) 0)))
-               (if (eq (warp-managed-worker-health-status m-worker) :degraded)
-                   (+ base-load
-                      (cluster-config-resource-degraded-load-penalty cfg))
-                 base-load)))
-           ;; Enables adaptive, weighted load balancing by calculating a
-           ;; worker's 'effective weight' in real-time.
-           :dynamic-effective-weight-fn
-           (lambda (m-worker)
-             (let* ((health (warp-managed-worker-health-status m-worker))
-                    (weight (warp-managed-worker-initial-weight m-worker))
-                    (metrics (warp-managed-worker-last-reported-metrics
-                              m-worker))
-                    (cpu (if metrics (gethash :cpu-utilization
-                                              metrics 0.0) 0.0))
-                    (reqs (if metrics (gethash :active-request-count
-                                               metrics 0) 0)))
-               (pcase health
-                 (:unhealthy 0.0) ; A weight of 0 receives no traffic.
-                 (:degraded (* weight 0.25)) ; Receives 25% of normal traffic.
-                 ;; For healthy workers, apply penalties based on load.
-                 (_ (let ((cpu-penalty (cond ((> cpu 80.0) 0.1)
-                                              ((> cpu 50.0) 0.5)
-                                              (t 1.0)))
-                          (req-penalty (cond ((> reqs 50) 0.1)
-                                             ((> reqs 20) 0.5)
-                                             (t 1.0))))
-                      (max 0.001 (* weight cpu-penalty req-penalty))))))))))
-        :metadata `(:leader-only t))
+    (runtime-security-monitor
+     :doc "Periodically scans for security violations by running all
+registered rules against recent telemetry data. This component acts as the
+runtime detection engine."
+     :requires '(telemetry-pipeline event-system)
+     :factory (lambda (tp es)
+                (%%make-runtime-security-monitor :telemetry-pipeline tp
+                                                 :event-system es))
+     :start (lambda (self _ctx)
+              "Start the monitor's periodic security scan."
+              (let ((poller (warp-runtime-security-monitor-poller self)))
+                (loom:poll-register-periodic-task
+                 poller 'security-scan
+                 (lambda () (warp-runtime-security--run-scan self))
+                 :interval 60.0) ; Run scan every 60 seconds.
+                (loom:poll-start poller)))
+     :stop (lambda (self _ctx)
+             "Stop the monitor's periodic scan."
+             (loom:poll-shutdown (warp-runtime-security-monitor-poller
+                                  self))))))
 
-       (service-registry
-        :doc "The authoritative, reactive catalog for all cluster services."
-        :requires '(cluster-orchestrator event-system rpc-system load-balancer)
-        :factory (lambda (cluster es rpc lb)
-                   (warp:service-registry-create
-                    :id (warp-cluster-id cluster) :event-system es
-                    :rpc-system rpc :load-balancer lb))
-        :metadata `(:leader-only t))
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Register Default Security Rules
 
-       (service-gateway
-        :doc "The central entry point for routing service requests."
-        :requires '(cluster-orchestrator service-client rpc-system)
-        :factory (lambda (cluster client rpc)
-                   (warp:gateway-create
-                    :name (format "%s-gateway" (warp-cluster-id cluster))
-                    :service-client client :rpc-system rpc))
-        :metadata `(:leader-only t)))
-     )))
+;; These are registered when the module is loaded.
+;; Users or other plugins can add more rules using `warp:defsecurity-rule`.
 
-;;;---------------------------------------------------------------------------
-;;; Individual Policy Definitions
-;;;---------------------------------------------------------------------------
+(warp:defsecurity-rule :unexpected-network-connections
+  :type :network-whitelist
+  :severity :critical
+  :spec '(:whitelist ("127.0.0.1" "warp-registry.local")))
 
-(warp:defpolicy :default-retry
-  "A standard, defensive retry policy for transient network failures.
-Applies 3 retries with an exponential backoff delay to give services
-time to recover."
-  :type :retry
-  :retries 3
-  :delay-strategy :exponential-backoff
-  :delay-options '((:max-delay 5.0)))
+(warp:defsecurity-rule :privilege-escalation-attempt
+  :type :process-pattern
+  :severity :critical
+  :spec '(:pattern "sudo|su -"))
 
-(warp:defpolicy :aggressive-retry
-  "An aggressive retry policy for critical operations that must succeed.
-Applies 5 retries with a shorter delay."
-  :type :retry
-  :retries 5
-  :delay-strategy :exponential-backoff
-  :delay-options '((:max-delay 2.0)))
+(warp:defsecurity-rule :unusual-resource-consumption
+  :type :statistical-anomaly
+  :severity :warning
+  :spec '(:metric "cpu.utilization" :threshold 3.0))
 
-(warp:defpolicy :no-retry
-  "A policy that explicitly disables automatic retries."
-  :type :retry
-  :retries 0)
-
-(warp:defpolicy :short-timeout
-  "A short timeout policy for fast, idempotent operations."
-  :type :timeout
-  :timeout 2.0)
-
-(warp:defpolicy :long-timeout
-  "A long timeout policy for potentially slow, long-running operations
-like complex queries or deployments."
-  :type :timeout
-  :timeout 300.0)
-
-(warp:defpolicy :round-robin-lb
-  "The default load balancing policy, distributing requests sequentially."
-  :type :load-balancer
-  :strategy :round-robin)
-
-(warp:defpolicy :least-connections-lb
-  "A load balancing policy that favors the least-loaded worker, ideal
-for routing to workers with varying capacities or workloads."
-  :type :load-balancer
-  :strategy :least-connections)
-
-;;;---------------------------------------------------------------------------
-;;; Policy Set Definitions
-;;;---------------------------------------------------------------------------
-
-(warp:defpolicy-set default-resilient-policy
-  "The standard, balanced policy set for most client communication."
-  :default-retry
-  :short-timeout
-  :round-robin-lb)
-
-(warp:defpolicy-set high-availability-policy
-  "A policy set optimized for critical services requiring high uptime.
-It uses more aggressive retries to handle transient faults."
-  :aggressive-retry
-  :short-timeout
-  :least-connections-lb)
-
-(warp:defpolicy-set long-timeout-policy
-  "A policy set for operations that are expected to take a long time,
-such as deployments or batch jobs. It disables retries by default."
-  :no-retry
-  :long-timeout
-  :round-robin-lb)
-
-(provide 'warp-service)  
-;;; warp-service.el ends here
+(provide 'warp-security)
+;;; warp-security.el ends here

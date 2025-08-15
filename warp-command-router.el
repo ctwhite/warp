@@ -2,32 +2,53 @@
 
 ;;; Commentary:
 ;;
-;; This module provides a flexible and extensible command routing system
-;; with middleware support. It is a foundational component of the Warp
-;; framework's RPC layer, responsible for directing incoming commands to
-;; the correct handlers.
+;; This module provides a flexible and extensible command routing system with
+;; middleware support. It is a foundational component of the Warp framework's
+;; RPC layer, acting as the central "traffic cop" that directs incoming
+;; commands to the correct handlers.
 ;;
-;; ## Core Features:
+;; ## The "Why": The Need for a Structured RPC Layer
 ;;
-;; - **Pattern-based Routing**: Commands are matched against defined
-;;   patterns (keywords, wildcard strings, or predicate functions),
-;;   allowing for flexible endpoint definitions.
+;; In any service-based application, when an RPC request arrives (e.g., to
+;; create a user or fetch a document), two questions must be answered:
+;; 1. What code should handle this request? (Routing)
+;; 2. What cross-cutting checks must be performed first? (Middleware)
 ;;
-;; - **Middleware Chain**: A sequence of functions (middleware) can be
-;;   executed before the main command handler. This is the ideal
-;;   mechanism for implementing cross-cutting concerns like
-;;   authentication, rate limiting, logging, and tracing without
-;;   cluttering the core handler logic.
+;; Answering these questions in an ad-hoc way leads to messy, hard-to-maintain
+;; code. The command router solves this by providing a formal, structured
+;; layer for processing commands.
 ;;
-;; - **Centralized Error Handling**: Provides a unified mechanism to
-;;   catch and respond to errors that occur at any stage of command
-;;   processing, from routing and validation to middleware and final
-;;   handler execution.
+;; ## The "How": A Middleware Pipeline Architecture
 ;;
-;; - **Declarative Command Pattern**: Integrates with a declarative
-;;   `warp:defcommand` macro that improves the structure, safety, and
-;;   testability of command definitions by bundling validation and
-;;   execution logic into a single, self-contained object.
+;; The router is built on the concept of a middleware pipeline, a powerful
+;; pattern for handling cross-cutting concerns.
+;;
+;; 1.  **Middleware as "Gates"**: Think of middleware as a series of gates
+;;     or checkpoints that a command must pass through before it reaches its
+;;     final destination. Each gate performs one specific task, such as:
+;;     - Logging the incoming request.
+;;     - Checking if the user is authenticated.
+;;     - Verifying that the request arguments are valid.
+;;     - Rate-limiting the user.
+;;     This keeps the final command handler clean and focused on its core
+;;     business logic.
+;;
+;; 2.  **The Dispatch Process**: When `warp:command-router-dispatch` is called:
+;;     - It first finds a **route** that matches the command's name.
+;;     - It assembles a **pipeline** by combining global middleware with any
+;;       middleware specific to that route.
+;;     - It then executes the pipeline. The command passes through each
+;;       middleware function in order.
+;;     - If all middleware stages pass, the final **handler** for the route
+;;       is executed.
+;;     - A centralized **error handler** catches any failures that occur at
+;;       any point in this process.
+;;
+;; 3.  **Declarative Commands (`warp:defcommand`)**: To further promote clean
+;;     architecture, this module provides a pattern for bundling a command's
+;;     validation rules (`:validate`) with its core logic (`:execute`). This
+;;     creates a self-contained, reusable, and easily testable command object
+;;     that can be used as a route handler.
 
 ;;; Code:
 
@@ -40,11 +61,10 @@
 (require 'warp-error)
 (require 'warp-rpc)
 (require 'warp-marshal)
-(require 'warp-security-policy)
-(require 'warp-middleware) 
+(require 'warp-security-engine)
+(require 'warp-middleware)
 
-;; Forward declaration for the RPC command struct, which is the primary
-;; data structure this router operates on.
+;; Forward declaration for the RPC command struct.
 (cl-deftype warp-rpc-command () t)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -55,101 +75,22 @@
   'warp-error)
 
 (define-error 'warp-command-route-not-found
-  "Signaled when no matching route is found for an incoming command."
+  "No matching route was found for an incoming command."
   'warp-command-router-error)
 
 (define-error 'warp-command-validation-failed
-  "Signaled when a command's arguments fail schema validation or the
-declarative command's validator function returns nil."
+  "A command's arguments failed schema or function validation."
   'warp-command-router-error)
 
 (define-error 'warp-command-middleware-error
-  "Signaled when an error occurs during middleware execution."
+  "An error occurred during middleware execution."
   'warp-command-router-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Declarative Command Pattern
-
-(cl-defstruct warp-command
-  "A declarative command object with validation, execution, and rollback.
-This struct represents a single, self-contained, and potentially
-transactional action. It centralizes all logic related to a command,
-making it robust and easy to reason about.
-
-Fields:
-- `name`: A unique symbol identifying this command.
-- `args`: A list of argument symbols the command expects.
-- `validator`: A function to validate command arguments before execution.
-- `executor`: The main function that performs the command's logic.
-- `undo-fn`: An optional function to roll back the command's effects."
-  (name nil :type symbol)
-  (args nil :type list)
-  (validator nil :type (or null function))
-  (executor nil :type function)
-  (undo-fn nil :type (or null function)))
-
-;;;###autoload
-(defmacro warp:defcommand (name &rest spec)
-  "Define a command with validation and execution logic.
-This macro is the primary interface for creating a declarative command. It
-instantiates a `warp-command` struct and defines a global variable to hold
-it. This command object can then be registered as a route handler in the
-command router, which will execute it safely via `warp:execute-command`.
-
-Arguments:
-- `NAME` (symbol): The name of the command.
-- `SPEC` (plist): A property list containing the command's definition:
-  - `:args` (list): The argument list for the command's functions.
-  - `:validate` (form): An optional Lisp form that evaluates to `t` if
-    the arguments are valid. This form is wrapped in a lambda.
-  - `:execute` (form): A Lisp form (typically a lambda) that performs
-    the command's core logic.
-  - `:undo` (form): An optional Lisp form (typically a lambda) for
-    rolling back the command's effects.
-
-Returns:
-- (symbol): The name of the generated global variable for the command."
-  (let ((command-var (intern (format "warp-command-%s" name))))
-    `(defvar ,command-var
-       (make-warp-command
-        :name ',name
-        :args ',(plist-get spec :args)
-        :validator ,(when-let (form (plist-get spec :validate))
-                      `(lambda ,(plist-get spec :args) ,form))
-        :executor ,(plist-get spec :execute)
-        :undo-fn ,(plist-get spec :undo)))))
-
-;;;###autoload
-(defun warp:execute-command (command &rest args)
-  "Executes a declarative command after validating its arguments.
-This is the standard, safe way to run a `warp-command` object. It ensures
-that the validator, if one is defined, passes before the main executor is
-called. This prevents invalid data from reaching the core logic.
-
-Arguments:
-- `COMMAND` (warp-command): The command object to execute.
-- `ARGS` (list): The arguments to pass to the command's functions.
-
-Returns:
-- (any): The result of the command's `:executor` function.
-
-Signals:
-- `warp-command-validation-failed`: If the command's validator exists
-  and returns nil."
-  (if (or (not (warp-command-validator command))
-          (apply (warp-command-validator command) args))
-      (apply (warp-command-executor command) args)
-    (signal 'warp-command-validation-failed
-            (format "Command '%s' failed validation for args: %S"
-                    (warp-command-name command) args))))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Core Router Components
+;;; Struct Definitions
 
 (cl-defstruct warp-command-middleware
-  "Represents a middleware for the RPC command router.
-Middleware allows for wrapping command handlers with reusable logic, such as
-logging, authentication, or metrics collection.
+  "Represents a middleware for the command router.
 
 Fields:
 - `name` (symbol): The name of the middleware.
@@ -159,118 +100,199 @@ Fields:
   (handler nil :type function))
 
 (cl-defstruct (warp-command-route (:constructor make-warp-command-route))
-  "Represents a single command routing rule and its associated logic.
-This struct holds a handler, middleware, and an optional validation schema
-that should be applied during dispatch.
+  "Represents a single command routing rule.
 
 Fields:
-- `name`: A unique keyword identifying this route.
-- `pattern`: A pattern to match incoming command names. Can be a
-  keyword, a wildcard string, or a predicate function.
-- `handler-fn`: The function or `warp-command` object to execute if the
+- `name` (keyword): A unique keyword identifying this route.
+- `pattern` (t): A pattern to match command names (keyword, wildcard
+  string, or predicate function).
+- `handler-fn` (function or warp-command): The handler to execute if the
   route matches.
-- `middleware`: An ordered list of middleware functions specific to
-  this route.
-- `schema`: An optional schema for validating command arguments."
-  (name       (cl-assert nil) :type keyword)
-  (pattern    (cl-assert nil) :type t)
+- `middleware` (list): Middleware specific to this route.
+- `schema` (t, optional): Schema for validating command arguments."
+  (name (cl-assert nil) :type keyword)
+  (pattern (cl-assert nil) :type t)
   (handler-fn (cl-assert nil) :type (or function warp-command))
-  (middleware nil             :type list)
-  (schema     nil             :type (or null t)))
+  (middleware nil :type list)
+  (schema nil :type (or null t)))
 
 (cl-defstruct (warp-command-router (:constructor %%make-command-router))
   "Manages routes, middleware, and error handling for command processing.
-This is the central component for directing incoming RPC commands. It
-maintains a collection of routes and applies global middleware before
-delegating to route-specific logic.
 
 Fields:
-- `name`: A unique name for this router instance, used in logs.
-- `routes`: A list of `warp-command-route` objects. They are matched
-  in the order they are added.
-- `fallback-handler`: A function to call if no route matches an
-  incoming command.
-- `error-handler`: A function called if any middleware or handler
-  signals an error during dispatch.
-- `global-middleware`: A list of middleware functions applied to ALL
-  incoming commands before any route-specific middleware."
-  (name              "default-router" :type string)
-  (routes            nil              :type list)
-  (fallback-handler  nil              :type (or null function))
-  (error-handler     nil              :type (or null function))
-  (global-middleware nil              :type list))
+- `name` (string): A unique name for this router instance, used in logs.
+- `routes` (list): A list of `warp-command-route` objects.
+- `fallback-handler` (function): Function to call if no route matches.
+- `error-handler` (function): Function called if any error is signaled.
+- `global-middleware` (list): Middleware applied to ALL commands."
+  (name "default-router" :type string)
+  (routes nil :type list)
+  (fallback-handler nil :type (or null function))
+  (error-handler nil :type (or null function))
+  (global-middleware nil :type list))
+
+(cl-defstruct (warp-command (:constructor %%make-warp-command))
+  "A declarative command object with validation and execution logic.
+This struct represents a single, self-contained action, making it
+robust and easy to reason about.
+
+Fields:
+- `name` (symbol): A unique symbol identifying this command.
+- `args` (list): The lambda-list of argument symbols the command expects.
+- `validator` (function): A function `(lambda (&rest args))` that returns
+  non-nil if the command's arguments are valid before execution.
+- `executor` (function): The function `(lambda (&rest args))` that
+  performs the command's core logic.
+- `undo-fn` (function, optional): A function `(lambda (&rest args))` to
+  roll back the command's effects."
+  (name nil :type symbol)
+  (args nil :type list)
+  (validator nil :type (or null function))
+  (executor nil :type function)
+  (undo-fn nil :type (or null function)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Private Middleware
+;;; Private Functions
 
-(defun warp-command-router--run-final-handler-middleware (context next-fn)
-  "The final middleware stage that executes the RPC handler.
+(defun warp-command-router--run-final-handler-middleware (context _next-fn)
+  "The final middleware stage that executes the actual route handler.
+This is the terminal link in the middleware pipeline. It dispatches to
+the correct handler, which can be a simple function or a declarative
+`warp-command` object.
 
-This is the end of the line for the middleware pipeline. It takes the
-final `command` and `context` and dispatches to the correct handler,
-which could be a simple function or a declarative `warp-command` object.
+Arguments:
+- `CONTEXT` (plist): The pipeline context.
+- `_NEXT-FN` (function): The next function in the chain (a no-op).
 
-:Arguments:
-- `context` (plist): The pipeline context, which must contain the final
-  `:command`, `:route`, and `:original-context`.
-- `next-fn` (function): The next function in the chain (a no-op).
-
-:Returns:
+Returns:
 - (loom-promise): A promise that resolves with the handler's result."
   (let* ((cmd (plist-get context :command))
          (route (plist-get context :route))
          (original-context (plist-get context :original-context))
-         (handler (warp-command-route-handler-fn route))
-         (final-handler (if (warp-command-p handler)
-                            (lambda (rpc-cmd ctx)
-                              (warp-command-router--execute-declarative-command
-                               handler rpc-cmd ctx))
-                          (lambda (rpc-cmd ctx)
-                            (funcall handler rpc-cmd ctx)))))
-    (loom:await (funcall final-handler cmd original-context))))
+         (handler (warp-command-route-handler-fn route)))
+    ;; Dispatch to the correct handler type.
+    (if (warp-command-p handler)
+        ;; For declarative commands, use the safe public executor.
+        (apply #'warp:execute-command handler
+               (warp-rpc-command-args cmd))
+      ;; For simple functions, just call it directly.
+      (funcall handler cmd original-context))))
+
+(defun warp-command-router--find-matching-route (router command)
+  "Find the first route whose pattern matches the given `COMMAND`.
+
+Arguments:
+- `ROUTER` (warp-command-router): The router instance.
+- `COMMAND` (warp-rpc-command): The command to match.
+
+Returns:
+- (warp-command-route or nil): The first matching route, or nil."
+  (let ((command-name (warp-rpc-command-name command)))
+    (cl-loop for route in (warp-command-router-routes router)
+             for pattern = (warp-command-route-pattern route)
+             when (pcase pattern
+                    ;; Match against a literal keyword.
+                    ((keywordp pattern) (eq pattern command-name))
+                    ;; Match against a wildcard string.
+                    ((stringp pattern) (s-match pattern
+                                                (symbol-name command-name)))
+                    ;; Match using a custom predicate function.
+                    ((functionp pattern) (funcall pattern command-name
+                                                  command)))
+             return route)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
+
+;;;---------------------------------------------------------------------
+;;; Command Definition & Execution
+;;;---------------------------------------------------------------------
+
+;;;###autoload
+(defmacro warp:defcommand (name &rest spec)
+  "Define a command with validation and execution logic.
+This macro creates a `warp-command` struct and defines a global variable
+to hold it. This object can then be registered as a route handler.
+
+Arguments:
+- `NAME` (symbol): The name of the command.
+- `SPEC` (plist): A property list containing the command's definition:
+  - `:args` (list): The argument list for the command's functions.
+  - `:validate` (form, optional): A Lisp form that evaluates to `t` if
+    the arguments are valid. This form is wrapped in a lambda.
+  - `:execute` (form): A Lisp form that performs the command's logic.
+  - `:undo` (form, optional): A Lisp form for rolling back the command."
+  (let ((command-var (intern (format "warp-command-%s" name))))
+    `(defvar ,command-var
+       (%%make-warp-command
+        :name ',name
+        :args ',(plist-get spec :args)
+        :validator ,(when-let (form (plist-get spec :validate))
+                      `(lambda ,(plist-get spec :args) ,form))
+        :executor ,(plist-get spec :execute)
+        :undo-fn ,(plist-get spec :undo)))))
+
+;;;###autoload
+(defun warp:execute-command (command &rest args)
+  "Execute a declarative `COMMAND` after validating its `ARGS`.
+This is the standard, safe way to run a `warp-command` object.
+
+Arguments:
+- `COMMAND` (warp-command): The command object to execute.
+- `ARGS` (list): The arguments to pass to the command.
+
+Returns:
+- (any): The result of the command's `:executor` function.
+
+Signals:
+- `warp-command-validation-failed`: If the validator returns nil."
+  (if (or (not (warp-command-validator command))
+          (apply (warp-command-validator command) args))
+      (apply (warp-command-executor command) args)
+    (signal 'warp-command-validation-failed
+            (format "Command '%s' failed validation for args: %S"
+                    (warp-command-name command) args))))
+
+;;;---------------------------------------------------------------------
+;;; Command Router Creation & Management
+;;;---------------------------------------------------------------------
 
 ;;;###autoload
 (cl-defun warp:command-router-create (&key (name "default-router")
                                       fallback-handler
                                       error-handler
                                       global-middleware
-                                      auth-policy)
+                                      auth-middleware-config)
   "Create and initialize a new `warp-command-router` instance.
-This is the factory function for creating a command router. It sets up the
-router with reasonable default fallback and error handlers if none are
-provided, promoting sensible out-of-the-box behavior. It now supports
-an optional `AUTH-POLICY` to automatically inject an authentication
-middleware at the beginning of the global chain.
 
 Arguments:
-- `:name` (string, optional): A unique name for the router, used in logs.
-- `:fallback-handler` (function, optional): A function
-  `(lambda (command context))` to execute if no route matches. Defaults
-  to a function that signals `warp-command-route-not-found`.
-- `:error-handler` (function, optional): A function
-  `(lambda (error command context))` to handle errors during dispatch.
-  Defaults to a function that logs the error.
-- `:global-middleware` (list, optional): A list of middleware functions
-  applied to all commands.
-- `:auth-policy` (warp-security-policy, optional): A security policy
-  instance used to create and inject an authentication middleware.
+- `NAME` (string, optional): A name for the router, used in logs.
+- `FALLBACK-HANDLER` (function, optional): A function to execute if no
+  route matches. Defaults to signaling `warp-command-route-not-found`.
+- `ERROR-HANDLER` (function, optional): A function to handle errors
+  during dispatch. Defaults to a function that logs the error.
+- `GLOBAL-MIDDLEWARE` (list, optional): Middleware for all commands.
+- `AUTH-MIDDLEWARE-CONFIG` (plist, optional): Plist like `'(:service SEC-SVC
+  :level :strict)` to create authentication middleware.
 
 Returns:
 - (warp-command-router): A new, initialized router instance."
-  (let* ((auth-middleware (when auth-policy
-                            (warp:security-policy-create-auth-middleware
-                             auth-policy)))
+  (let* ((auth-middleware
+          ;; If auth config is provided, create the middleware via the service.
+          (when auth-middleware-config
+            (let ((sec-svc (plist-get auth-middleware-config :service))
+                  (level (plist-get auth-middleware-config :level)))
+              (unless (and sec-svc level)
+                (error "auth-middleware-config requires :service and :level"))
+              (security-manager-service-create-auth-middleware sec-svc level))))
          (final-middleware (if auth-middleware
-                               (cons auth-middleware (or global-middleware nil))
+                               (cons auth-middleware (or global-middleware
+                                                         nil))
                              (or global-middleware nil)))
          (router (%%make-command-router
                   :name name
                   :global-middleware final-middleware)))
-    ;; Set default handlers if none are provided. This ensures the router
-    ;; always has a defined behavior for unhandled routes and errors.
+    ;; Set default handlers if none are provided by the user.
     (setf (warp-command-router-fallback-handler router)
           (or fallback-handler
               (lambda (command _context)
@@ -290,27 +312,26 @@ Returns:
     router))
 
 ;;;###autoload
-(cl-defun warp:command-router-add-route (router name &key pattern handler-fn
-                                        middleware schema)
+(cl-defun warp:command-router-add-route (router 
+                                         name 
+                                         &key pattern 
+                                              handler-fn
+                                              middleware 
+                                              schema)
   "Add a new route to the command router.
-Routes are matched in the order they are added. The first pattern to
-match an incoming command will be used.
+Routes are matched in the order they are added.
 
 Arguments:
 - `ROUTER` (warp-command-router): The router instance to modify.
 - `NAME` (keyword): A unique, symbolic name for the route.
-- `:pattern` (t, optional): The pattern to match command names. If `nil`,
-  it defaults to the route's `NAME`.
-- `:handler-fn` (function or warp-command): The handler, which can be a
-  standard Lisp function or a declarative `warp-command` object.
+- `:pattern` (t, optional): The pattern to match command names. Defaults
+  to `NAME`.
+- `:handler-fn` (function or warp-command): The handler to execute.
 - `:middleware` (list, optional): Middleware specific to this route.
 - `:schema` (t, optional): A schema for validating command arguments.
 
 Returns:
-- (warp-command-route): The newly created route object.
-
-Side Effects:
-- Modifies the router's list of routes. Uses `nconc` for efficiency."
+- (warp-command-route): The newly created route object."
   (let ((new-route (make-warp-command-route
                     :name name
                     :pattern (or pattern name)
@@ -321,38 +342,12 @@ Side Effects:
           (nconc (warp-command-router-routes router) (list new-route)))
     new-route))
 
-(defun warp:command-router-add-global-middleware (router name handler)
-  "Add a global middleware to the command router.
-Global middleware runs for every command that is dispatched through this
-router, before any route-specific middleware.
-
-Arguments:
-- `ROUTER` (warp-command-router): The command router instance.
-- `NAME` (symbol): A symbolic name for the middleware.
-- `HANDLER` (function): The middleware handler function. It should be a
-  lambda of the form `(lambda (command context next-handler) ...)`.
-
-Returns:
-- `nil`.
-
-Side Effects:
-- Modifies the global middleware list of the `ROUTER`."
-  (let ((middleware (make-warp-command-middleware :name name :handler handler)))
-    (setf (warp-command-router-global-middleware router)
-          (nconc (warp-command-router-global-middleware router)
-                 (list middleware)))))
-
 ;;;###autoload
 (defun warp:command-router-dispatch (router command context)
   "Dispatch a command through middleware to a handler.
-This is the main entry point for the router. It orchestrates the entire
-process:
-1. Finding a matching route.
-2. Validating arguments against a schema (if any).
-3. Running all global and route-specific middleware.
-4. Executing the final handler or a fallback.
-All errors are caught and passed to the router's configured error handler,
-ensuring a single point of failure management.
+This is the main entry point for the router. It orchestrates finding a
+route, validating arguments, running middleware, and executing the final
+handler, with centralized error handling.
 
 Arguments:
 - `ROUTER` (warp-command-router): The router instance.
@@ -363,44 +358,43 @@ Returns:
 - (loom-promise): A promise that resolves with the result of the command
   handler, or rejects with the result of the error handler."
   (braid!
-      (let ((route (warp-command-router--find-matching-route router command)))
-        (if route
-            (progn
-              ;; 1. Perform schema validation if a schema is defined.
-              (when-let (schema (warp-command-route-schema route))
-                (unless (warp:validate-schema schema
-                                              (warp-rpc-command-args command))
-                  (signal 'warp-command-validation-failed
-                          "Schema validation failed.")))
+    (let ((route (warp-command-router--find-matching-route router command)))
+      (if route
+          (progn
+            ;; 1. Perform schema validation if a schema is defined on the route.
+            (when-let (schema (warp-command-route-schema route))
+              (unless (warp:validate-schema schema (warp-rpc-command-args
+                                                    command))
+                (signal 'warp-command-validation-failed
+                        "Schema validation failed.")))
 
-              ;; 2. Combine global and route-specific middleware.
-              (let* ((handler (warp-command-route-handler-fn route))
-                     (all-middleware-list
-                      (append (warp-command-router-global-middleware router)
-                              (warp-command-route-middleware route)))
-                     ;; Create a pipeline from the combined middleware.
-                     (pipeline
-                      (warp:middleware-pipeline-create
-                       :name (format "command-pipeline-%s"
-                                     (warp-rpc-command-name command))
-                       :stages (append all-middleware-list
-                                       (list
-                                        (warp:defmiddleware-stage :final-handler
-                                          (if (warp-command-p handler)
-                                              (lambda (cmd-ctx next-fn)
-                                                (loom:await (warp-command-router--execute-declarative-command
-                                                             handler (plist-get cmd-ctx :command))))
-                                            (lambda (cmd-ctx next-fn)
-                                              (loom:await (funcall handler 
-                                                            (plist-get cmd-ctx :command) 
-                                                            (plist-get cmd-ctx :context)))))))))))
-                ;; 4. Execute the pipeline.
-                (warp:middleware-pipeline-run
-                 pipeline `(:command ,command :context ,context)))
-          ;; No route found: run the fallback handler.
-          (funcall (warp-command-router-fallback-handler router)
-                   command context)))
-    ;; Centralized error handling for the entire dispatch process.
+            ;; 2. Assemble the full middleware pipeline.
+            (let* ((all-middleware
+                    (append (warp-command-router-global-middleware router)
+                            (warp-command-route-middleware route)))
+                   (pipeline
+                    (warp:middleware-pipeline-create
+                     :name (format "command-pipeline-%s"
+                                   (warp-rpc-command-name command))
+                     ;; The final stage of any pipeline is to run the
+                     ;; actual handler for the route.
+                     :stages (append
+                              all-middleware
+                              (list (warp:defmiddleware-stage
+                                        :final-handler
+                                        #'warp-command-router--run-final-handler-middleware))))))
+
+              ;; 3. Execute the pipeline with the request context.
+              (warp:middleware-pipeline-run
+               pipeline `(:command ,command
+                         :route ,route
+                         :original-context ,context))))
+        ;; 4. If no route was found, execute the fallback handler.
+        (funcall (warp-command-router-fallback-handler router)
+                 command context)))
+
+    ;; 5. Catch any error from any stage (routing, validation, middleware,
+    ;; or handler) and pass it to the centralized error handler.
     (:catch (err)
       (funcall (warp-command-router-error-handler router)
                err command context))))

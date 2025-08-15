@@ -43,17 +43,20 @@
 (require 'warp-config)
 (require 'warp-marshal)
 (require 'warp-uuid)
+(require 'warp-component) 
+(require 'warp-plugin)    
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Global State
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Global State (Controlled Singleton)
 
 (defvar warp--active-ipc-system nil
   "The active `warp-ipc-system` singleton for this process.
 This is a bridge between the globally-scoped `loom-promise` hook
 and the component-scoped IPC system. The hook needs a way to find
-the currently running IPC instance.")
+the currently running IPC instance. This variable is managed by the
+`ipc-system` component's lifecycle hooks.")
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Configuration
 
 (warp:defconfig ipc-config
@@ -72,7 +75,7 @@ Fields:
   (listen-for-incoming nil :type boolean)
   (main-channel-address nil :type (or null string)))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definitions
 
 (cl-defstruct (warp-ipc-system (:constructor %%make-ipc-system))
@@ -93,20 +96,19 @@ Fields:
   (remote-addresses (make-hash-table :test 'equal) :type hash-table)
   (pending-requests (make-hash-table :test 'equal) :type hash-table))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Private Functions
 
 (defun warp-ipc--promise-dispatch-hook (payload metadata)
-  "A `loom-promise` async dispatch hook that uses the active IPC system.
-
+  "Private: A `loom-promise` async dispatch hook that uses the active IPC system.
 This is the core of the transparent IPC mechanism. It's registered with
 `loom-promise` and is executed for *every* promise settlement. It inspects
 promise metadata for `:ipc-dispatch-target` and, if found, intercepts and
 routes the settlement via the active IPC system to the correct remote process.
 
 Arguments:
-- `PAYLOAD` (plist): The serialized promise settlement data from Loom.
-- `METADATA` (plist): The promise's metadata plist.
+- `payload` (plist): The serialized promise settlement data from Loom.
+- `metadata` (plist): The promise's metadata plist.
 
 Returns:
 - `t` if the dispatch was handled by this hook, `nil` otherwise."
@@ -125,14 +127,13 @@ Returns:
                    t)))))))
 
 (defun warp-ipc--settle-promise-from-payload (payload)
-  "Settle a promise using data from a received IPC settlement payload.
-
+  "Private: Settle a promise using data from a received IPC settlement payload.
 This function is the end-point of a remote promise settlement. It is
 executed on the main thread of the target instance to find the original
 promise in Loom's registry and settle it with the received data.
 
 Arguments:
-- `PAYLOAD` (plist): A deserialized message payload containing a
+- `payload` (plist): A deserialized message payload containing a
   promise `:id` and either a `:value` or `:error` key.
 
 Returns: `nil`.
@@ -149,16 +150,16 @@ Side Effects:
             (loom:promise-resolve promise value)))
       (warp:log! :warn "ipc" "Received settlement for unknown/settled promise '%s'." id))))
 
-(defun warp-ipc--handle-incoming-message (system payload)
-  "The central dispatcher for all incoming IPC messages.
-
+(defun warp-ipc--handle-incoming-message (system payload on-request-fn)
+  "Private: The central dispatcher for all incoming IPC messages.
 This function inspects the `:type` of the incoming message and routes it
 to the appropriate handler, distinguishing between direct requests,
 responses, and transparent promise settlements.
 
 Arguments:
-- `SYSTEM` (warp-ipc-system): The active IPC system instance.
-- `PAYLOAD` (plist): The deserialized message payload.
+- `system` (warp-ipc-system): The active IPC system instance.
+- `payload` (plist): The deserialized message payload.
+- `on-request-fn` (function): The handler for direct requests.
 
 Returns: `nil`.
 
@@ -175,7 +176,7 @@ Side Effects:
       (_
        (warp:log! :warn "ipc" "Received unknown IPC message type: %S" payload)))))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;---------------------------------------------------------------------------
@@ -185,42 +186,32 @@ Side Effects:
 ;;;###autoload  
 (defun warp:ipc-system-stop (system)
   "Stops the IPC system component and cleans up all associated resources.
-
 This function performs a graceful shutdown of the IPC system. It is
 critical for preventing resource leaks and ensuring a clean process exit.
-It closes any active network channels, removes the global `loom-promise`
-hook to stop intercepting promise settlements, and clears all internal
-state, including the routing table and pending request queues.
 
 Arguments:
-- `SYSTEM` (warp-ipc-system): The IPC system instance to stop.
+- `system` (warp-ipc-system): The IPC system instance to stop.
 
 Returns:
 - `nil`.
 
 Side Effects:
-- Closes the main `warp-channel`, terminating any listening sockets.
-- Removes this system's dispatch hook from the global list, restoring
-  `loom-promise` to its default behavior.
-- Clears all internal data structures and resets the global singleton
-  `warp--active-ipc-system` to `nil`."
+- Closes the main `warp-channel`.
+- Removes this system's dispatch hook from the global list.
+- Clears all internal state and resets the global singleton."
   (let ((log-target (warp-event--event-system-log-target system)))
     (warp:log! :info log-target "Stopping IPC system...")
-    ;; Close the main listening channel if it exists.
     (when (warp-ipc-system-main-channel system)
       (loom:await (warp:channel-close (warp-ipc-system-main-channel system))))
 
-    ;; Remove the global hook to stop intercepting promise settlements.
     (setq loom-promise-async-dispatch-functions
           (cl-delete #'warp-ipc--promise-dispatch-hook
                      loom-promise-async-dispatch-functions))
 
-    ;; Clear all internal state to release memory and prevent leaks.
     (setf (warp-ipc-system-main-thread-queue system) nil)
     (clrhash (warp-ipc-system-remote-addresses system))
     (clrhash (warp-ipc-system-pending-requests system))
 
-    ;; Unset the global singleton to mark the system as inactive.
     (setq warp--active-ipc-system nil)
     (warp:log! :info log-target "IPC system stopped.")
     nil))
@@ -232,63 +223,46 @@ Side Effects:
 ;;;###autoload
 (defun warp:ipc-system-create (&rest config-options)
   "Create a new, unstarted `warp-ipc-system` component.
-
 This factory function constructs the stateful `warp-ipc-system` struct
-from a set of configuration options, which are merged with defaults. It
-creates an inactive instance; the system must be explicitly activated by
-calling `warp:ipc-system-start`.
+from a set of configuration options, which are merged with defaults.
 
 Arguments:
-- `&rest CONFIG-OPTIONS` (plist): Configuration keys that override the
-  defaults defined in `ipc-config`. For example, `:my-id` or
-  `:listen-for-incoming`.
+- `&rest config-options` (plist): Configuration keys that override the
+  defaults defined in `ipc-config`.
 
 Returns:
 - (warp-ipc-system): A new, initialized but inactive IPC system instance."
-  (let (;; First, create a validated configuration object from the provided options.
-        (config (apply #'make-ipc-config config-options)))
-    ;; Then, create the main system struct using that configuration.
+  (let ((config (apply #'make-ipc-config config-options)))
     (%%make-ipc-system :config config)))
 
 ;;;###autoload
 (cl-defun warp:ipc-system-start (system &key on-request-fn)
   "Starts the IPC system component, activating all communication channels.
-
-This function brings the IPC system to life. It is a critical part of the
-startup sequence for any process that needs to communicate with other
-processes or threads within the Warp framework. It performs three primary actions:
-
+This function brings the IPC system to life. It performs three primary actions:
 1.  **Initializes Queues**: Sets up the in-memory queue for safe
     communication between background threads and the main Emacs thread.
 2.  **Installs Global Hook**: Registers the core dispatch hook with the
-    `loom-promise` system. This is the key mechanism that enables
-    transparent remote promise settlement across process boundaries.
+    `loom-promise` system for transparent remote promise settlement.
 3.  **Starts Listener**: If configured, it creates and listens on the main
-    inter-process communication channel (e.g., a Unix domain socket),
-    allowing it to receive messages from other Warp processes.
+    inter-process communication channel.
 
 Arguments:
-- `SYSTEM` (warp-ipc-system): The IPC system instance to start.
+- `system` (warp-ipc-system): The IPC system instance to start.
 - `:on-request-fn` (function, optional): A handler function `(lambda (payload
   corr-id sender-id))` that will be called for incoming direct requests.
 
 Returns:
-- (warp-ipc-system): The `SYSTEM` instance.
+- (warp-ipc-system): The `system` instance.
 
 Side Effects:
-- Sets the global singleton `warp--active-ipc-system` to this `SYSTEM`.
-- Modifies the global `loom-promise-async-dispatch-functions` list, which
-  affects all promise settlements within the Emacs process.
-- May create a network socket or file handle and begin listening for
-  connections, spawning a background listener thread.
+- Sets the global singleton `warp--active-ipc-system` to this `system`.
+- Modifies the global `loom-promise-async-dispatch-functions` list.
+- May create a network socket and begin listening for connections.
 
 Signals:
-- `(error)`: If another IPC system is already active in this process.
+- `error`: If another IPC system is already active in this process.
 - `warp-ipc-uninitialized-error`: If listening is enabled but the
   system's `my-id` has not been configured."
-  ;; --- 1. Enforce Singleton Pattern ---
-  ;; The IPC system must be a singleton because the global `loom-promise`
-  ;; hook needs a single, unambiguous target for dispatching remote settlements.
   (when warp--active-ipc-system
     (error "Another `warp-ipc-system` is already active in this process."))
   (setq warp--active-ipc-system system)
@@ -297,69 +271,41 @@ Signals:
     (warp:log! :info "ipc" "Starting Warp IPC for instance '%s'."
                (ipc-config-my-id config))
 
-    ;; --- 2. Initialize Inter-Thread Communication Queue ---
-    ;; This `loom:queue` is inherently thread-safe and is used to safely pass
-    ;; messages from background threads (or the IPC listener thread) to the
-    ;; main Emacs thread for processing.
     (setf (warp-ipc-system-main-thread-queue system) (loom:queue))
-
-    ;; --- 3. Install the Global Promise Dispatch Hook ---
-    ;; This is the core of the transparent IPC mechanism. This hook will
-    ;; inspect every promise that settles in this Emacs instance. If a promise
-    ;; has `:ipc-dispatch-target` metadata, this hook intercepts it and
-    ;; routes the settlement payload to the correct remote process.
     (add-to-list 'loom-promise-async-dispatch-functions
                  #'warp-ipc--promise-dispatch-hook)
 
-    ;; --- 4. Start the Inter-Process Listener (if configured) ---
-    ;; This block is only executed if the system is configured to accept
-    ;; messages from other OS processes.
     (when (ipc-config-listen-for-incoming config)
       (let* ((my-id (ipc-config-my-id config))
              (addr (or (ipc-config-main-channel-address config)
                        (format "/tmp/warp-ipc-%s" my-id))))
-        ;; A unique ID is essential for other processes to know how to route
-        ;; messages back to this one.
         (unless my-id
           (error 'warp-ipc-uninitialized-error
                  "An `my-id` is required for an IPC listener."))
 
         (braid!
-            ;; `warp:channel-listen` starts a server (e.g., on a Unix socket)
-            ;; in a background thread. The provided lambda is the callback
-            ;; invoked for every message received on that channel.
             (warp:channel-listen
              addr
              (lambda (payload)
                (warp-ipc--handle-incoming-message system payload on-request-fn))
-             ;; Pass through any low-level transport options for flexibility.
              (ipc-config-main-channel-transport-options config))
-          (:then
-           (lambda (channel)
-             ;; Store the channel handle for later cleanup during shutdown.
-             (setf (warp-ipc-system-main-channel system) channel)))
-          (:catch
-           (lambda (err)
-             ;; If the listener fails to start, it's a critical failure.
-             (warp:log! :fatal "ipc" "Failed to start IPC listener: %S" err)
-             (loom:rejected! err))))))
+          (:then (lambda (channel)
+                   (setf (warp-ipc-system-main-channel system) channel)))
+          (:catch (lambda (err)
+                    (warp:log! :fatal "ipc" "Failed to start IPC listener: %S" err)
+                    (loom:rejected! err)))))))
   system)
 
 ;;;###autoload
 (cl-defun warp:ipc-client-send-request (client payload &key (timeout 30.0))
   "Sends a direct request to a server and returns a promise for the reply.
-
-This provides a lightweight, low-level request/response mechanism over IPC,
-perfect for simple interactions like those in the `executor-pool` where
-the full `warp-rpc` stack is unnecessary.
-
-This implementation now uses a promise-based timeout (`loom:any` with a
-`loom:delay!`) which is more idiomatic within the Loom ecosystem than
-using a native Emacs timer.
+This provides a lightweight, low-level request/response mechanism over IPC.
+It uses a promise-based timeout (`loom:any` with a `loom:delay!`) for
+robust asynchronous handling.
 
 Arguments:
-- `CLIENT` (warp-channel): A client channel connected to an IPC server.
-- `PAYLOAD` (any): The serializable Lisp object to send as the request body.
+- `client` (warp-channel): A client channel connected to an IPC server.
+- `payload` (any): The serializable Lisp object to send as the request body.
 - `:timeout` (float, optional): Time in seconds to wait for a response.
 
 Returns:
@@ -373,59 +319,43 @@ Returns:
                     :sender-id ,(ipc-config-my-id (warp-ipc-system-config system))
                     :payload ,payload)))
 
-    ;; Register the pending promise so the incoming response can be routed to it.
     (puthash corr-id response-promise (warp-ipc-system-pending-requests system))
 
-    ;; --- Asynchronous Timeout Implementation ---
-    ;; We create a "timeout promise" that will reject after the specified delay.
-    ;; We then race it against the actual response promise. The first one to
-    ;; settle determines the outcome.
     (let ((timeout-promise
            (braid! (loom:delay! timeout)
-             (:then
-              (lambda (_)
-                ;; If the delay completes, it means the response-promise never
-                ;; settled. We now reject with a timeout error.
-                (loom:rejected!
-                 (warp:error! :type 'warp-ipc-timeout
-                              :message "IPC request timed out."))))))
+             (:then (lambda (_)
+                      (loom:rejected!
+                       (warp:error! :type 'warp-ipc-timeout
+                                    :message "IPC request timed out."))))))
           (final-promise (loom:any (list response-promise timeout-promise))))
 
-      ;; When the race is over (either response or timeout), we must clean up
-      ;; the pending request from our registry to prevent memory leaks.
       (loom:finally
        final-promise
        (lambda () (remhash corr-id (warp-ipc-system-pending-requests system))))
 
-      ;; Send the request over the wire and return the final promise that is
-      ;; participating in the race.
       (braid! (warp:channel-send client request)
         (:then (lambda (_) final-promise))
         (:catch (lambda (err)
-                  ;; If the send itself fails, reject the final promise immediately.
                   (loom:promise-reject final-promise err)
                   (loom:rejected! err)))))))
 
 ;;;###autoload
 (defun warp:ipc-system-drain-queue (system on-request-fn)
   "Drain and process all pending messages from the main thread queue.
-
 This function is a critical part of a graceful shutdown or an event
 loop tick, ensuring all messages from background threads or remote
-processes are processed. It dispatches messages based on their type.
+processes are processed.
 
 Arguments:
-- `SYSTEM` (warp-ipc-system): The active IPC system instance.
-- `ON-REQUEST-FN` (function): A function `(lambda (req-payload corr-id sender-id))`
+- `system` (warp-ipc-system): The active IPC system instance.
+- `on-request-fn` (function): A function `(lambda (req-payload corr-id sender-id))`
   to handle direct requests.
 
 Returns: `nil`."
   (let ((messages (loom:queue-drain (warp-ipc-system-main-thread-queue system))))
     (dolist (msg messages)
       (pcase (plist-get msg :type)
-        ;; Settle a promise from a transparent remote settlement.
         (:settlement (warp-ipc--settle-promise-from-payload msg))
-        ;; Settle a promise from a direct request's response.
         (:response
          (let* ((corr-id (plist-get msg :correlation-id))
                 (promise (gethash corr-id (warp-ipc-system-pending-requests system))))
@@ -434,7 +364,6 @@ Returns: `nil`."
              (if-let (err (plist-get msg :error))
                  (loom:promise-reject promise err)
                (loom:promise-resolve promise (plist-get msg :payload))))))
-        ;; Handle a new incoming direct request.
         (:request
          (when on-request-fn
            (let ((corr-id (plist-get msg :correlation-id))
@@ -454,56 +383,62 @@ Returns: `nil`."
 ;;;###autoload
 (defun warp:ipc-system-register-remote-address (system remote-id address)
   "Registers the network address for a known remote IPC instance.
-
-This function populates the IPC system's internal routing table. The
-routing table is a simple hash map that associates a remote instance's
-unique ID (e.g., \"worker-123\") with its network address (e.g.,
-\"/tmp/warp-ipc-worker-123\").
-
-This registration is crucial for the `loom-promise` dispatch hook, as it
-provides the necessary information to send promise settlements to the
-correct remote process.
+This function populates the IPC system's internal routing table.
 
 Arguments:
-- `SYSTEM` (warp-ipc-system): The active IPC system instance.
-- `REMOTE-ID` (string): The unique ID of the remote Emacs instance.
-- `ADDRESS` (string): The fully qualified network address of the
+- `system` (warp-ipc-system): The active IPC system instance.
+- `remote-id` (string): The unique ID of the remote Emacs instance.
+- `address` (string): The fully qualified network address of the
   remote instance's main IPC inbox.
 
 Returns:
-- (string): The `ADDRESS` that was just registered.
+- (string): The `address` that was just registered.
 
 Side Effects:
-- Modifies the `remote-addresses` hash table within the `SYSTEM` struct."
+- Modifies the `remote-addresses` hash table within the `system` struct."
   (puthash remote-id address (warp-ipc-system-remote-addresses system)))
 
 ;;;###autoload
 (defun warp:ipc-system-send-settlement (system target-id payload)
   "Sends a promise settlement payload to a target remote instance.
-
 This is the core transport function used by the `loom-promise` dispatch
-hook to send a promise settlement (a resolution or rejection) to the
-process that originated the promise.
-
-It looks up the target's address in the routing table and sends the
-serialized payload over the underlying `warp-channel`.
+hook to send a promise settlement to the process that originated the promise.
 
 Arguments:
-- `SYSTEM` (warp-ipc-system): The active IPC system instance.
-- `TARGET-ID` (string): The ID of the remote instance to send to.
-- `PAYLOAD` (plist): The serialized promise settlement data from Loom.
+- `system` (warp-ipc-system): The active IPC system instance.
+- `target-id` (string): The ID of the remote instance to send to.
+- `payload` (plist): The serialized promise settlement data from Loom.
 
 Returns:
 - (loom-promise): A promise that resolves when the message is sent.
 
 Signals:
-- `warp-ipc-error`: If the `TARGET-ID` is not found in the routing table."
+- `warp-ipc-error`: If the `target-id` is not found in the routing table."
   (let ((addr (gethash target-id (warp-ipc-system-remote-addresses system))))
     (unless addr
       (error 'warp-ipc-error
              (format "Unknown remote IPC address for target '%s'."
                      target-id)))
     (warp:channel-send addr `(:type :settlement ,@payload))))
+
+;;;---------------------------------------------------------------------------
+;;; Plugin and Component Definitions
+;;;---------------------------------------------------------------------------
+
+(warp:defplugin :ipc
+  "Provides the core Inter-Process Communication system for Warp."
+  :version "1.0.0"
+  :dependencies '(warp-component warp-config warp-channel)
+  :components '(ipc-system))
+
+(warp:defcomponent ipc-system
+  :doc "The central component for managing all IPC state and operations."
+  :requires '(config-service)
+  :factory (lambda (config-svc)
+             (let ((config-options (warp:config-service-get config-svc :ipc)))
+               (apply #'warp:ipc-system-create config-options)))
+  :start (lambda (self ctx) (warp:ipc-system-start self))
+  :stop (lambda (self ctx) (warp:ipc-system-stop self)))
 
 (provide 'warp-ipc)
 ;;; warp-ipc.el ends here

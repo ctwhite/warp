@@ -3,27 +3,39 @@
 ;;; Commentary:
 ;;
 ;; This module implements the **Unified Gateway** for the Warp framework.
-;; It has a dual role, serving as the single, centralized entry point for
-;; both internal service-to-service communication and external, public-facing
-;; HTTP API requests.
+;; It serves as the single, centralized entry point for both internal
+;; service-to-service communication and external, public-facing HTTP API
+;; requests.
 ;;
-;; ## Architectural Role
+;; ## The "Why": The Need for a Centralized Entry Point
 ;;
-;; The Gateway is the linchpin of the service-oriented architecture, abstracting
-;; away the complexities of the internal network from all clients.
+;; In a microservices architecture, you don't want clients (whether they
+;; are other internal services or external web browsers) to know the
+;; network location of every single internal service. This would create a
+;; brittle, tightly-coupled system.
 ;;
-;; ### 1. As an Internal RPC Gateway:
-;; It exposes the `:invoke-service` RPC command, providing a consistent API for
-;; all service interactions across the cluster. It now delegates the complex
-;; task of discovering and connecting to services to the high-level
-;; `service-client` and `dialer-service`.
+;; The **API Gateway** pattern solves this by providing a single, stable
+;; entry point that acts as a facade or "front door" to the entire system.
+;; It simplifies the client experience and provides a critical, centralized
+;; point for enforcing cross-cutting concerns like authentication, rate
+;; limiting, and routing for all incoming traffic.
 ;;
-;; ### 2. As an External HTTP API Gateway:
-;; It leverages the native `warp-httpd` server to expose internal services
-;; to the outside world via a standard REST/JSON interface. It performs
-;; **protocol translation**, turning HTTP requests into internal RPC calls
-;; and vice-versa. A declarative macro, `warp:defroute`, is used to define the
-;; mapping from HTTP routes to internal services.
+;; ## The "How": A Dual-Role Gateway
+;;
+;; This module's gateway plays two distinct roles:
+;;
+;; 1.  **As an Internal RPC Gateway**: For internal traffic, it acts as a
+;;     "switchboard". A service wanting to call another service doesn't
+;;     connect directly; it asks the gateway service, which then uses the
+;;     `dialer-service` to find a healthy instance and forward the call. This
+;;     layer of indirection enables resilience and simplifies client logic.
+;;
+;; 2.  **As an External HTTP Gateway**: For external traffic, it acts as a
+;;     "translator". It takes a standard HTTP/JSON request from a web
+;;     browser or mobile app and translates it into a native, internal
+;;     Warp RPC call. It then takes the RPC response and translates it back
+;;     into an HTTP response. The mapping from HTTP endpoints to internal
+;;     services is defined declaratively with the `warp:defroute` macro.
 
 ;;; Code:
 
@@ -45,28 +57,20 @@
 (require 'warp-enum)
 (require 'warp-registry)
 (require 'warp-dialer)
+(require 'warp-plugin)
+(require 'warp-middleware)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
 
 (define-error 'warp-gateway-error
-  "A generic error related to the Warp Service Gateway."
-  'warp-error)
+  "A generic error related to the Warp Service Gateway." 'warp-error)
 
 (define-error 'warp-gateway-service-not-found
-  "The requested service was not found in the registry.
-This indicates that a client attempted to invoke a service name
-for which no active provider is registered."
-  'warp-gateway-error)
+  "The requested service was not found in the registry." 'warp-gateway-error)
 
 (define-error 'warp-gateway-no-healthy-instance
-  "No healthy instance of the requested service could be found.
-This implies that while the service name may exist, all registered
-instances are currently unhealthy or unavailable."
-  'warp-gateway-error)
-
-(define-error 'warp-gateway-async-mode-error
-  "Invalid or unsupported asynchronous mode for service invocation."
+  "No healthy instance of the requested service could be found."
   'warp-gateway-error)
 
 (define-error 'warp-gateway-route-not-found
@@ -76,88 +80,67 @@ instances are currently unhealthy or unavailable."
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Global State
 
-(defvar warp--api-route-registry nil
-  "A global registry for API route definitions. This is a `warp-registry` instance.")
+(defvar warp--api-route-definitions (make-hash-table :test 'equal)
+  "A global, load-time registry for API route definitions.
+Populated by `warp:defroute` and loaded by the `gateway` component.")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definitions
 
-(cl-defstruct (warp-gateway
-               (:constructor %%make-gateway)
-               (:copier nil))
+(cl-defstruct (warp-gateway (:constructor %%make-gateway))
   "The Unified Gateway component.
-This struct encapsulates the runtime state and dependencies required
-for the Gateway to perform both internal RPC routing and external
-HTTP API protocol translation.
 
 Fields:
 - `name` (string): A descriptive name for this gateway instance.
-- `service-client` (warp-service-client): The client used to discover
-  and call internal Warp services.
-- `job-queue-client` (job-queue-client): A dedicated client for the job queue.
-- `dialer` (warp-dialer-service): The dialer for establishing connections.
-- `rpc-system` (warp-rpc-system): The RPC system used by the Gateway
-  to send RPC commands to other services.
-- `tracer` (warp-tracer): The tracer for instrumenting requests.
-- `httpd-server` (warp-httpd-server): The native Warp HTTP server component
-  that this gateway uses to handle external traffic.
-- `routes` (warp-registry): The thread-safe registry for HTTP API routes."
-  (name           "default-gateway" :type string)
-  (service-client (cl-assert nil)   :type (or null t))
-  (job-queue-client nil              :type (or null t))
-  (dialer         (cl-assert nil)   :type (or null t))
-  (rpc-system     (cl-assert nil)   :type (or null t))
-  (tracer         nil               :type (or null t))
-  (httpd-server   nil               :type (or null t))
-  (routes         (cl-assert nil)   :type warp-registry))
+- `service-client` (t): The client for internal Warp service calls.
+- `job-queue-client` (t): A dedicated client for the job queue.
+- `tracer` (t): The tracer for instrumenting requests.
+- `httpd-server` (t): The native Warp HTTP server component.
+- `routes` (warp-registry): The registry for HTTP API routes.
+- `http-pipeline` (warp-middleware-pipeline): The pre-built pipeline for
+  processing all incoming HTTP requests."
+  (name "default-gateway" :type string)
+  (service-client (cl-assert nil) :type (or null t))
+  (job-queue-client nil :type (or null t))
+  (tracer nil :type (or null t))
+  (httpd-server nil :type (or null t))
+  (routes (warp:registry-create :name "api-routes" :event-system nil))
+  (http-pipeline nil :type (or null t)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Private Helpers
+;;; Private Functions
 
-(defun warp-gateway--dispatch-sync-invocation (gateway invoke-payload context)
-  "Dispatches a synchronous service invocation via the high-level service client.
-
-Why: This function no longer contains complex networking logic. It acts
-as a simple routing layer, delegating the entire RPC process to the
-`service-client`, which in turn uses the `dialer` for connection management.
+(defun warp-gateway--dispatch-sync-invocation (gateway invoke-payload)
+  "Dispatch a synchronous service invocation via the `service-client`.
 
 Arguments:
 - `GATEWAY` (warp-gateway): The gateway instance.
-- `INVOKE-PAYLOAD` (warp-service-invocation-payload): The invocation details.
-- `CONTEXT` (plist): The original RPC context from the client.
+- `INVOKE-PAYLOAD` (warp-service-invocation-payload): Invocation details.
 
 Returns:
-- (loom-promise): A promise that resolves with the service's response."
+- (loom-promise): A promise resolving with the service's response."
   (let* ((service-client (warp-gateway-service-client gateway))
-         (service-name (warp-service-invocation-payload-service-name invoke-payload))
-         (function-name (warp-service-invocation-payload-function-name invoke-payload))
-         (args (warp-service-invocation-payload-args invoke-payload)))
-    ;; A single, high-level call. All discovery, balancing, connection,
-    ;; and resilience logic is now hidden within the service client.
-    (warp:service-client-invoke service-client service-name function-name :args args)))
+         (service (plist-get invoke-payload :service-name))
+         (func (plist-get invoke-payload :function-name))
+         (args (plist-get invoke-payload :args)))
+    (service-client-invoke service-client service func :args args)))
 
-(defun warp-gateway--dispatch-async-invocation (gateway invoke-payload context)
-  "Dispatches an asynchronous service invocation to a job queue.
-
-Why: This function simplifies async dispatch by using the dedicated,
-declarative `job-queue-client`. It no longer needs to manually discover
-the job queue service; it just calls the client's high-level `submit` method.
+(defun warp-gateway--dispatch-async-invocation (gateway invoke-payload)
+  "Dispatch an asynchronous service invocation to a job queue.
 
 Arguments:
 - `GATEWAY` (warp-gateway): The gateway instance.
-- `INVOKE-PAYLOAD` (warp-service-invocation-payload): The invocation details.
-- `CONTEXT` (plist): The original RPC context.
+- `INVOKE-PAYLOAD` (warp-service-invocation-payload): Invocation details.
 
 Returns:
-- (loom-promise): A promise that resolves with the `job-id` (string)."
-  (let* ((job-queue-client (warp-gateway-job-queue-client gateway))
-         (service-name (warp-service-invocation-payload-service-name invoke-payload))
+- (loom-promise): A promise resolving with the `job-id`."
+  (let* ((job-client (warp-gateway-job-queue-client gateway))
+         (service-name (plist-get invoke-payload :service-name))
          (job-spec `(:payload ,invoke-payload
-                     ,@(warp-service-invocation-payload-job-options invoke-payload))))
-    (warp:log! :info "gateway"
-               "Dispatching async invocation for '%s' to job queue." service-name)
-    ;; A single, high-level, and intention-revealing call to the job queue client.
-    (warp:job-queue-service-submit job-queue-client job-spec)))
+                     ,@(plist-get invoke-payload :job-options))))
+    (warp:log! :info "gateway" "Dispatching async call for '%s' to job queue."
+               service-name)
+    (job-queue-service-submit job-client job-spec)))
 
 (defun warp-gateway--find-route (gateway method path)
   "Find a matching route in the registry.
@@ -168,84 +151,95 @@ Arguments:
 - `PATH` (string): The HTTP request path.
 
 Returns:
-- (plist): The matching route definition, or `nil` if not found."
+- (plist): The matching route definition, or `nil`."
   (let ((route-key (cons method path)))
     (warp:registry-get (warp-gateway-routes gateway) route-key)))
 
 (defun warp-gateway--http-handler (gateway request connection)
   "The core handler function for all incoming HTTP requests.
-
-Why: This function is the single entry point for every request that hits the
-gateway's web server. It performs the entire request lifecycle: tracing,
-routing, parsing, dispatching, and responding.
-
-How: It uses `warp:with-trace-span` to ensure observability. It finds a
-matching route, parses the JSON body, and then uses the internal
-`service-client` to invoke the correct Warp service. It handles both
-success and error cases, translating them into appropriate HTTP responses.
+This function creates the initial context for a request and runs it
+through the pre-built HTTP middleware pipeline.
 
 Arguments:
 - `GATEWAY` (warp-gateway): The gateway instance.
-- `REQUEST` (warp-http-request): The parsed request object from `warp-httpd`.
-- `CONNECTION` (t): The raw transport connection handle from `warp-httpd`.
+- `REQUEST` (warp-http-request): The parsed request object.
+- `CONNECTION` (t): The raw transport connection handle.
 
-Returns:
-- `nil`."
+Returns: `nil`."
   (let* ((tracer (warp-gateway-tracer gateway))
          (path (warp-http-request-path request))
-         (method (warp-http-request-method request)))
+         (method (warp-http-request-method request))
+         ;; 1. Create a distributed trace span for this request.
+         (span (warp:trace-start-span tracer (format "HTTP %S %s" method path)
+                                      :kind :server))
+         ;; 2. Create the initial context to pass to the pipeline.
+         (initial-context `(:gateway ,gateway
+                            :request ,request
+                            :connection ,connection
+                            :span ,span)))
+    ;; 3. Run the context through the pipeline.
+    (braid! (warp:middleware-pipeline-run
+             (warp-gateway-http-pipeline gateway) initial-context)
+      ;; 4. The pipeline is responsible for sending the response. We just
+      ;;    need to finalize the trace span when it's all done.
+      (:then (final-context)
+        (warp:trace-end-span span :status (plist-get final-context
+                                                     :http-status-code)))
+      (:catch (err)
+        (warp:trace-end-span span :error err)))))
 
-    ;; 1. Trace the incoming request. This creates a new span and adds
-    ;; essential tags for observability. The entire body is wrapped
-    ;; in this context, so any errors will be captured and reported
-    ;; by the tracing system automatically.
-    (warp:trace-with-span (span tracer (format "HTTP %S %s" method path)
-                                :kind :server)
-      (warp:trace-add-tag :http.method method)
-      (warp:trace-add-tag :http.path path)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; HTTP Gateway Middleware Stages
 
-      (if-let ((route (warp-gateway--find-route gateway method path)))
-          ;; 2. If a route is found, proceed with service invocation.
-          (let* ((body-string (warp-http-request-body request))
-                 ;; Parse the request body, assuming it's JSON.
-                 (body-params (if (s-blank? body-string)
-                                  nil
-                                (json-read-from-string body-string)))
-                 (service-client (warp-gateway-service-client gateway))
-                 (service-name (plist-get route :maps-to-service))
-                 (function-name (plist-get route :maps-to-function)))
+(warp:defmiddleware-stage :http-routing
+  "Find a matching route for the HTTP request. If no route is found,
+reject the promise to halt the pipeline."
+  (let* ((gateway (plist-get context :gateway))
+         (request (plist-get context :request))
+         (route (warp-gateway--find-route gateway (warp-http-request-method
+                                                   request)
+                                          (warp-http-request-path request))))
+    (if route
+        ;; If a route is found, add it to the context and continue.
+        (funcall next-fn (plist-put context :route route))
+      ;; If no route is found, reject the promise, triggering the
+      ;; pipeline's error handler.
+      (loom:rejected! (warp:error! :type 'warp-gateway-route-not-found)))))
 
-            ;; 3. Asynchronously invoke the downstream service using the
-            ;; service client, which handles discovery and resilience.
-            (braid!
-                (warp:service-client-invoke service-client service-name function-name
-                                            :args body-params)
-              ;; 4. On success, send a 200 OK response with the result.
-              (:then (result)
-                     (warp:trace-add-tag :http.status_code 200)
-                     (warp-httpd--send-response connection (warp:enum-get httpd-status ok)
-                                                (plist-to-hash-table
-                                                 '("Content-Type" "application/json"))
-                                                (json-encode result)))
-              ;; 5. On failure, handle the error gracefully.
-              (:catch (err)
-                      (let ((status-code (pcase (loom-error-type err)
-                                           ('warp-service-not-found (warp:enum-get httpd-status not-found))
-                                           (_ (warp:enum-get httpd-status internal-server-error)))))
-                        (warp:trace-add-tag :http.status_code status-code)
-                        (warp:trace-add-tag :error t)
-                        (warp-httpd--send-response
-                         connection status-code
-                         (plist-to-hash-table
-                          '("Content-Type" "application/json"))
-                         (json-encode `(:error ,(loom-error-message err))))))))
-        ;; 6. If no route is found, send a 404 Not Found response.
-        (progn
-          (warp:trace-add-tag :http.status_code 404)
-          (warp-httpd--send-response connection (warp:enum-get httpd-status not-found)
-                                     (plist-to-hash-table
-                                      '("Content-Type" "application/json"))
-                                     (json-encode '(:error "Not Found"))))))))
+(warp:defmiddleware-stage :http-body-parse
+  "Parse the JSON body of the HTTP request."
+  (let* ((request (plist-get context :request))
+         (body-string (warp-http-request-body request))
+         (params (if (s-blank? body-string) nil
+                   (json-read-from-string body-string))))
+    ;; Add the parsed params to the context and continue.
+    (funcall next-fn (plist-put context :params params))))
+
+(warp:defmiddleware-stage :http-invoke-service
+  "Invoke the downstream internal service via the service client."
+  (let* ((gateway (plist-get context :gateway))
+         (route (plist-get context :route))
+         (params (plist-get context :params))
+         (service-client (warp-gateway-service-client gateway))
+         (service-name (plist-get route :maps-to-service))
+         (function-name (plist-get route :maps-to-function)))
+    ;; The core of protocol translation: an HTTP request becomes an RPC.
+    (braid! (service-client-invoke service-client service-name function-name
+                                   :args params)
+      (:then (result)
+        ;; Add the result to the context and continue.
+        (funcall next-fn (plist-put context :result result))))))
+
+(warp:defmiddleware-stage :http-format-response
+  "Format a successful response and send it to the client."
+  (let ((connection (plist-get context :connection))
+        (result (plist-get context :result)))
+    (warp-httpd--send-response connection (warp:enum-get httpd-status ok)
+                               (plist-to-hash-table
+                                '("Content-Type" "application/json"))
+                               (json-encode result))
+    ;; Add the final status code to the context for tracing.
+    (funcall next-fn (plist-put context :http-status-code 200))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
@@ -254,98 +248,126 @@ Returns:
 (defmacro warp:defroute (name &rest body)
   "Defines a group of declarative HTTP to RPC route mappings.
 
-Why: This macro provides a clean, declarative DSL for defining your public
-API. It separates the API contract from the service implementation.
-
-How: It parses its body and stores a structured representation of the API
-routes in a global registry. The `:api-gateway` component then loads
-these definitions at startup.
-
 Arguments:
 - `NAME` (symbol): A unique name for this API group (e.g., `user-api`).
-- `BODY` (list): The definition, containing options and route blocks.
+- `BODY` (list): The definition, containing options and route blocks:
   - `:base-path` (string): A prefix applied to all routes in this group.
-  - `:route` (list): A form defining a single endpoint:
-    `(:route (METHOD PATH) &key doc maps-to request-schema ...)`
+  - `:route` (list): A form `(:route (METHOD PATH) &key ...)` that
+    defines a single endpoint.
 
-Returns:
-- The `NAME` of the defined API group."
+Side Effects:
+- Adds route definitions to the global `warp--api-route-definitions`."
   (let* ((base-path (plist-get body :base-path "/"))
-         (route-defs (cl-remove-if-not (lambda (x) (eq (car x) :route)) body)))
+         (route-defs (cl-remove-if-not (lambda (x) (eq (car x) :route))
+                                       body)))
     `(progn
-       (let ((registry warp--api-route-registry))
-         (dolist (route-def ',route-defs)
-           (let* ((_spec . options) = (cdr route-def)
-                  (method (car _spec))
-                  (path (cadr _spec))
-                  (route-key (cons method path))
-                  (route-value `(:method ,method
-                                 :path ,path
-                                 ,@options)))
-             (warp:registry-add registry route-key route-value :overwrite-p t))))
+       ;; At load time, iterate through all route definitions.
+       (dolist (route-def ',route-defs)
+         (let* ((_spec . options) = (cdr route-def)
+                (method (car _spec))
+                (path (concat ,base-path (cadr _spec)))
+                ;; Create a unique key for the registry (e.g., '(:GET . "/users"))
+                (route-key (cons method path))
+                (route-value `(:method ,method :path ,path ,@options)))
+           ;; Store the full route definition in the global hash table.
+           (puthash route-key route-value warp--api-route-definitions)))
        ',name)))
 
 ;;;###autoload
-(cl-defun warp:gateway-create (&key name
-                                    service-client
-                                    job-queue-client
-                                    dialer
-                                    rpc-system
-                                    tracer
-                                    httpd-server)
+(cl-defun warp:gateway-create (&key name service-client job-queue-client
+                                    tracer httpd-server)
   "Create a new `warp-gateway` component.
 
 Arguments:
-- `:name` (string, optional): A descriptive name for this gateway.
-- `:service-client` (t): A client for general service-to-service calls.
-- `:job-queue-client` (t): A dedicated client for the job queue service.
-- `:dialer` (warp-dialer-service): The dialer service for connections.
-- `:rpc-system` (warp-rpc-system): The RPC system for sending commands.
-- `:tracer` (warp-tracer, optional): The tracer for instrumenting requests.
-- `:httpd-server` (warp-httpd-server, optional): The HTTP server component.
+- `:NAME` (string, optional): A descriptive name for this gateway.
+- `:SERVICE-CLIENT` (t): A client for service-to-service calls.
+- `:JOB-QUEUE-CLIENT` (t): A dedicated client for the job queue.
+- `:TRACER` (t, optional): The tracer for instrumenting requests.
+- `:HTTPD-SERVER` (t, optional): The HTTP server component.
 
 Returns:
 - (warp-gateway): A new, configured gateway instance."
   (let ((gateway-name (or name "default-gateway")))
     (warp:log! :info gateway-name "Gateway created.")
-    (%%make-gateway
-     :name gateway-name
-     :service-client service-client
-     :job-queue-client job-queue-client
-     :dialer dialer
-     :rpc-system rpc-system
-     :tracer tracer
-     :httpd-server httpd-server)))
+    (%%make-gateway :name gateway-name :service-client service-client
+                    :job-queue-client job-queue-client
+                    :tracer tracer :httpd-server httpd-server)))
 
-;;;###autoload
-(defun warp:gateway-invoke-service (gateway command context)
-  "The main RPC handler for the Gateway. It orchestrates service calls
+;;;---------------------------------------------------------------------
+;;; Service Definitions & Plugin
+;;;---------------------------------------------------------------------
+
+(warp:defservice-interface :gateway-service
+  "The public service for invoking other services through the gateway."
+  :methods '((invoke (invocation-payload))))
+
+(warp:defservice-implementation :gateway-service :default-gateway
+  "The default implementation of the public-facing gateway service."
+  :requires '(gateway)
+  (invoke (self invocation-payload)
+    "The main RPC handler for the Gateway. It orchestrates service calls
 based on the `async-mode` specified in the payload.
 
 Arguments:
-- `GATEWAY` (warp-gateway): The gateway instance performing the invocation.
-- `COMMAND` (warp-rpc-command): The incoming `:invoke-service` command.
-- `CONTEXT` (plist): The original RPC context from the client.
+- `SELF` (plist): The injected service component instance.
+- `INVOCATION-PAYLOAD` (t): The `warp-service-invocation-payload`.
 
 Returns:
-- (loom-promise): If `:sync`, resolves with the service's response. If
-  `:async`, resolves with the `job-id`. Rejects on error."
-  (let* ((invoke-payload (warp-rpc-command-args command))
-         (async-mode (warp-service-invocation-payload-async-mode invoke-payload))
-         (log-target (warp-gateway-name gateway)))
-    (warp:log! :info log-target
-               "Received invoke-service (mode: %S) for service '%s'."
-               async-mode
-               (warp-service-invocation-payload-service-name invoke-payload))
-    (pcase async-mode
-      (:sync
-       (warp-gateway--dispatch-sync-invocation gateway invoke-payload context))
-      (:async
-       (warp-gateway--dispatch-async-invocation gateway invoke-payload context))
-      (_ (loom:rejected!
-          (warp:error! :type 'warp-gateway-async-mode-error
-                       :message (format "Unsupported async-mode: %S"
-                                        async-mode)))))))
+- (loom-promise): If `:sync`, resolves with the response. If `:async`,
+  resolves with the `job-id`."
+    (let* ((gateway (plist-get self :gateway))
+           (async-mode (plist-get invocation-payload :async-mode))
+           (log-target (warp-gateway-name gateway)))
+      (warp:log! :info log-target "Invoking service (mode: %S) for '%s'."
+                 async-mode (plist-get invocation-payload :service-name))
+      (pcase async-mode
+        (:sync (warp-gateway--dispatch-sync-invocation gateway
+                                                       invocation-payload))
+        (:async (warp-gateway--dispatch-async-invocation gateway
+                                                         invocation-payload))
+        (_ (loom:rejected! (warp:error! :type 'warp-gateway-async-mode-error
+                                        :message "Unsupported async-mode.")))))))
 
-(provide 'warp-gateway)
-;;; warp-gateway.el ends here
+(warp:defplugin :gateway
+  "Provides the unified API gateway for internal RPC and external HTTP."
+  :version "1.0.0"
+  :dependencies '(warp-component warp-service warp-job-queue warp-trace
+                  warp-httpd warp-dialer)
+  :components '(gateway default-gateway service-client))
+
+(warp:defcomponent gateway
+  :doc "The core gateway component that manages routing and state."
+  :requires '(service-client job-queue-client tracer httpd-server)
+  :factory (lambda (sc jqc tracer httpd)
+             (warp:gateway-create :service-client sc :job-queue-client jqc
+                                  :tracer tracer :httpd-server httpd))
+  :start (lambda (self _ctx)
+           "Loads all declarative routes and starts the HTTP server.
+Side Effects:
+- Populates the gateway's internal route registry.
+- Registers the main HTTP handler with the `httpd-server`."
+           (let ((route-reg (warp-gateway-routes self))
+                 (httpd (warp-gateway-httpd-server self)))
+             ;; Load all routes defined by `warp:defroute` into the registry.
+             (maphash (lambda (key val) (warp:registry-add route-reg key val))
+                      warp--api-route-definitions)
+             ;; Build the HTTP processing pipeline.
+             (setf (warp-gateway-http-pipeline self)
+                   (warp:middleware-pipeline-create
+                    :name "http-gateway-pipeline"
+                    :stages '(:http-routing
+                              :http-body-parse
+                              :http-invoke-service
+                              :http-format-response)))
+             ;; Register the main handler if an HTTP server is present.
+             (when httpd
+               (warp:httpd-server-register-handler
+                httpd (lambda (req conn)
+                        (warp-gateway--http-handler self req conn)))))))
+
+(warp:defcomponent service-client
+  :doc "A high-level client for invoking internal Warp services. This
+component abstracts the `dialer-service` to provide a simple, unified
+`invoke` method for all service-to-service communication."
+  :requires '(dialer-service)
+  :factory (lambda (dialer) `(:dialer ,dialer)))

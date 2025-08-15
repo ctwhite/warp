@@ -1,459 +1,1115 @@
-;;; warp-httpd.el --- A Warp-native HTTP Server Component -*- lexical-binding: t; -*-
+;;; warp-service.el --- Unified Service Definition, Registry, and RPC Generation -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
-;; This module provides a native HTTP server for the Warp framework, built
-;; directly upon the `warp-transport` abstraction. It replaces external
-;; libraries with a fully integrated component that respects the framework's
-;; component model, lifecycle, and asynchronous nature.
+;; This module is the foundation for a Service-Oriented Architecture (SOA)
+;; within the Warp framework. It provides the core machinery for defining,
+;; implementing, discovering, and consuming services, effectively acting as
+;; the central nervous system for distributed communication.
 ;;
-;; ## Architectural Role & HTTP Primer
+;; ## Architectural Goal: A "Service Mesh in a Box"
 ;;
-;; At its core, the Hypertext Transfer Protocol (HTTP) is a text-based,
-;; stateless, request-response protocol. A client opens a connection, sends
-;; a multi-line text request, and the server sends a multi-line text response.
+;; This module provides the tools to build a "service mesh in a box"
+;; directly within the Warp framework, turning a collection of workers
+;; into a cohesive, resilient, and observable system. It achieves this
+;; by providing both a "control plane" (the service registry) and a
+;; "data plane" (the smart client middleware).
 ;;
-;; This module implements that fundamental flow. It provides a `:httpd-server`
-;; component that listens for incoming data streams via `warp-transport`. It
-;; then parses these streams according to the HTTP/1.1 specification, turning
-;; raw bytes into structured `warp-http-request` objects. A top-level handler
-;; function processes these requests and uses this module's helpers to construct
-;; and send back a valid HTTP response.
+;; ### How This File Implements Service Mesh Concepts
 ;;
-;; By building on `warp-transport`, this server is transport-agnostic and
-;; integrates seamlessly into the Warp ecosystem, serving as the foundational
-;; engine for the `:api-gateway`.
+;; - **API Contract (The Source of Truth)**:
+;;   The `warp:defservice-interface` macro defines a language-agnostic
+;;   contract for a service, ensuring all parties agree on the API.
+;;
+;; - **Code Generation (Automating the Boilerplate)**:
+;;   The `warp:defservice-implementation` macro is the engine that brings
+;;   the contract to life. At compile time, it reads the contract and
+;;   auto-generates the entire RPC stack, including data schemas, a
+;;   smart client, and server-side routing logic.
+;;
+;; - **Policy Registry**:
+;;   `warp:defpolicy` and `warp:defpolicy-set` allow operators to define
+;;   named, reusable resilience policies (e.g., for retries, timeouts)
+;;   that can be declaratively applied to service clients.
+;;
+;; - **Smart Client & Middleware (The Data Plane)**:
+;;   The `warp-service-client` and its middleware pipeline act as the
+;;   data plane. When a client method is called, it executes a series of
+;;   steps: discovery, load balancing, resilience, and connection
+;;   management, offloading all complex network logic from the developer.
+;;
+;; ## Enhancement: Pluggable Discovery Resolvers
+;;
+;; This version of the module is refactored to support multiple, pluggable
+;; service discovery sources. Instead of having hard-coded logic for the
+;; internal registry and service mesh, it now uses a central registry for
+;; "resolvers." This allows components like `warp-dns-plugin.el` to
+;; register themselves as a valid discovery source, enabling a multi-source,
+;; consensus-based discovery model. This significantly enhances the
+;; resilience and consistency of the entire discovery process.
 
 ;;; Code:
 
 (require 'cl-lib)
-(require 'json)
 (require 's)
 (require 'loom)
+(require 'braid)
+(require 'json)
 
 (require 'warp-log)
 (require 'warp-error)
+(require 'warp-event)
+(require 'warp-balancer)
+(require 'warp-registry)
+(require 'warp-rpc)
 (require 'warp-component)
-(require 'warp-config)
-(require 'warp-transport)
-(require 'warp-marshal)
-(require 'warp-enum)
+(require 'warp-plugin)
+(require 'warp-protocol)
+(require 'warp-middleware)
+(require 'warp-circuit-breaker)
+(require 'warp-httpd)
+(require 'dns)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Constants and Global State
+;; Forward declarations for core types.
+(cl-deftype warp-service-registry () t)
+(cl-deftype warp-service-endpoint () t)
+(cl-deftype warp-service-info () t)
 
-(warp:defenum httpd-status
-  (continue 100 "Continue")
-  (switching-protocols 101 "Switching Protocols")
-  (processing 102 "Processing")
-  (ok 200 "OK")
-  (created 201 "Created")
-  (accepted 202 "Accepted")
-  (non-authoritative-information 203 "Non-authoritative Information")
-  (no-content 204 "No Content")
-  (reset-content 205 "Reset Content")
-  (partial-content 206 "Partial Content")
-  (multi-status 207 "Multi-Status")
-  (already-reported 208 "Already Reported")
-  (im-used 226 "IM Used")
-  (multiple-choices 300 "Multiple Choices")
-  (moved-permanently 301 "Moved Permanently")
-  (found 302 "Found")
-  (see-other 303 "See Other")
-  (not-modified 304 "Not Modified")
-  (use-proxy 305 "Use Proxy")
-  (temporary-redirect 307 "Temporary Redirect")
-  (permanent-redirect 308 "Permanent Redirect")
-  (bad-request 400 "Bad Request")
-  (unauthorized 401 "Unauthorized")
-  (payment-required 402 "Payment Required")
-  (forbidden 403 "Forbidden")
-  (not-found 404 "Not Found")
-  (method-not-allowed 405 "Method Not Allowed")
-  (not-acceptable 406 "Not Acceptable")
-  (proxy-authentication-required 407 "Proxy Authentication Required")
-  (request-timeout 408 "Request Timeout")
-  (conflict 409 "Conflict")
-  (gone 410 "Gone")
-  (length-required 411 "Length Required")
-  (precondition-failed 412 "Precondition Failed")
-  (payload-too-large 413 "Payload Too Large")
-  (request-uri-too-long 414 "Request-URI Too Long")
-  (unsupported-media-type 415 "Unsupported Media Type")
-  (requested-range-not-satisfiable 416 "Requested Range Not Satisfiable")
-  (expectation-failed 417 "Expectation Failed")
-  (im-a-teapot 418 "I'm a teapot")
-  (misdirected-request 421 "Misdirected Request")
-  (unprocessable-entity 422 "Unprocessable Entity")
-  (locked 423 "Locked")
-  (failed-dependency 424 "Failed Dependency")
-  (upgrade-required 426 "Upgrade Required")
-  (precondition-required 428 "Precondition Required")
-  (too-many-requests 429 "Too Many Requests")
-  (request-header-fields-too-large 431 "Request Header Fields Too Large")
-  (connection-closed-without-response 444 "Connection Closed Without Response")
-  (unavailable-for-legal-reasons 451 "Unavailable For Legal Reasons")
-  (client-closed-request 499 "Client Closed Request")
-  (internal-server-error 500 "Internal Server Error")
-  (not-implemented 501 "Not Implemented")
-  (bad-gateway 502 "Bad Gateway")
-  (service-unavailable 503 "Service Unavailable")
-  (gateway-timeout 504 "Gateway Timeout")
-  (http-version-not-supported 505 "HTTP Version Not Supported")
-  (variant-also-negotiates 506 "Variant Also Negotiates")
-  (insufficient-storage 507 "Insufficient Storage")
-  (loop-detected 508 "Loop Detected")
-  (not-extended 510 "Not Extended")
-  (network-authentication-required 511 "Network Authentication Required")
-  (network-connect-timeout-error 599 "Network Connect Timeout Error"))
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Error Definitions
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Schema Definitions
+(define-error 'warp-service-error
+  "Base error for all service-related operations."
+  'warp-error)
 
-(warp:defschema warp-http-request
-  ((:constructor make-warp-http-request))
-  "Represents a parsed HTTP request.
+(define-error 'warp-service-not-found
+  "The requested service could not be found or no healthy endpoints
+were available."
+  'warp-service-error)
 
-This struct is the standard data object representing a single, complete
-HTTP request received and parsed by the server. It turns the raw text
-of the protocol into a structured, easily accessible Lisp object.
+(define-error 'warp-service-contract-violation
+  "A service implementation does not fulfill its interface contract."
+  'warp-error)
+
+(define-error 'warp-service-rpc-config-error
+  "An invalid configuration was provided for RPC generation."
+  'warp-service-error)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Global State
+
+(defvar warp--service-interface-registry (make-hash-table :test 'eq)
+  "Global registry for all service interface contracts, populated by
+`warp:defservice-interface`.")
+
+(defvar warp--service-implementations-registry (make-hash-table :test 'eq)
+  "Global registry mapping interface names to their
+implementations.")
+
+(defvar warp--service-initializers '()
+  "A list of service initializer functions, generated by
+`warp:defservice-implementation` and run at startup.")
+
+(defvar warp--policy-registry (make-hash-table :test 'eq)
+  "A global registry for all named, reusable service policies,
+populated by the `warp:defpolicy` macro.")
+
+(defvar warp--service-resolver-registry
+  (warp:registry-create :name "service-resolver-registry")
+  "A central registry for all pluggable service discovery resolvers.")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Configuration
+
+(warp:defconfig service-config
+  "Defines service-wide configuration settings for the Warp framework,
+particularly for service mesh integration.
 
 Fields:
-- `method` (keyword): The HTTP method (e.g., `:GET`, `:POST`). This is the
-  'verb' of the request, indicating the desired action.
-- `path` (string): The request path, excluding the query string (e.g.,
-  \"/users/123\").
-- `version` (string): The HTTP version string (e.g., \"HTTP/1.1\").
-- `headers` (hash-table): A hash table of request headers. Header names
-  are normalized to lowercase strings for consistent access.
-- `body` (string): The request body as a raw string. This is empty for
-  methods like GET."
-  (method nil :type keyword)
-  (path nil :type string)
-  (version nil :type string)
-  (headers (make-hash-table :test 'equal) :type hash-table)
-  (body "" :type string))
+- `service-mesh-enabled-p`: If non-nil, service discovery is delegated
+  to a local service mesh sidecar. This bypasses the internal registry.
+- `service-mesh-proxy-address`: The HTTP address of the local service
+  mesh sidecar proxy's discovery API."
+  (service-mesh-enabled-p nil :type boolean
+                          :doc "If non-nil, service discovery is delegated
+to a local service mesh sidecar, bypassing the internal registry.")
+  (service-mesh-proxy-address "http://localhost:15020" :type string
+                              :doc "The HTTP address of the local service
+mesh sidecar proxy's discovery API."))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Struct Definitions
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Policy Schemas and Generic Dispatch
 
-(cl-defstruct (warp-httpd-server
-               (:constructor %%make-httpd-server))
-  "The state object for a Warp HTTP server instance.
-
-This struct holds the runtime state for a single HTTP server, including its
-dependencies and the handle to the underlying network listener.
+(cl-defstruct (warp-retry-policy
+               (:constructor make-warp-retry-policy))
+  "A policy for handling failed requests via retries.
 
 Fields:
-- `id` (string): A unique ID for this server instance (used in logging).
-- `transport` (t): The `warp-transport` component used for networking.
-- `listener` (t): The handle for the active transport listener, returned by
-  `warp:transport-listen`.
-- `handler-fn` (function): The top-level application function to call with
-  each complete `warp-http-request`."
-  (id "default-httpd" :type string)
-  transport
-  listener
-  handler-fn)
+- `retries`: The number of times to retry a failed request.
+- `delay-strategy`: The strategy for delays between retries.
+- `delay-options`: Options for the delay strategy."
+  (retries (cl-assert nil) :type integer)
+  (delay-strategy (cl-assert nil) :type keyword)
+  (delay-options (cl-assert nil) :type plist))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Private Helper Functions
+(cl-defstruct (warp-timeout-policy
+               (:constructor make-warp-timeout-policy))
+  "A policy for enforcing a timeout on a request.
 
-(defun warp-httpd--parse-headers (buffer)
-  "Parses HTTP headers from a buffer.
+Fields:
+- `timeout`: The timeout duration in seconds."
+  (timeout (cl-assert nil) :type float))
 
-Why: An HTTP request consists of a request line followed by zero or more
-header lines. This function isolates the logic for parsing these headers.
+(cl-defstruct (warp-load-balancer-policy
+               (:constructor make-warp-load-balancer-policy))
+  "A policy for selecting a service endpoint.
 
-How: It iteratively matches lines against a regex for the `Name: Value`
-format. It stops when it finds the blank line (`CRLF`) that terminates
-the header section. Header names are normalized to lowercase for case-insensitive
-lookups, as recommended by the HTTP specification.
+Fields:
+- `type`: The load balancing algorithm to use.
+- `options`: Options for the algorithm."
+  (type (cl-assert nil) :type keyword)
+  (options (cl-assert nil) :type plist))
 
-:Arguments:
-- `BUFFER` (buffer): A buffer containing the start of an HTTP request.
-  The buffer's point is expected to be at the start of the headers.
+(cl-defgeneric warp:apply-retry-policy (policy callable)
+  "Applies the retry policy to a callable function.
+This is the core of the retry policy strategy.
 
-:Returns:
-- `(hash-table)`: A hash table of header names (lowercase strings) to
-  their string values, or `nil` if parsing fails to find the terminating CRLF."
-  (let ((headers (make-hash-table :test 'equal)))
-    ;; Each header is a line of the form "Header-Name: header-value\r\n".
-    (while (looking-at "\\([-!#-'*+.0-9A-Z^_`a-z|~]+\\): *\\([^\r]+\\)\r\n")
-      (let ((name (s-downcase (match-string 1)))
-            (value (match-string 2)))
-        (puthash name value headers))
-      (goto-char (match-end 0)))
-    ;; A blank line (CRLF) signifies the end of the header section.
-    (if (looking-at "\r\n")
-        (progn (goto-char (match-end 0)) headers)
-      nil)))
+Arguments:
+- `policy` (warp-retry-policy): The policy to apply.
+- `callable` (function): The function to execute and potentially retry.
 
-(defun warp-httpd--parse-request (buffer)
-  "Attempt to parse a complete HTTP request from a buffer.
+Returns:
+- (loom-promise): A promise that resolves with the result of the
+  callable."
+  (:method ((policy warp-retry-policy) callable)
+    (let ((retries (warp-retry-policy-retries policy)))
+      (loom:retry (funcall callable) :retries retries))))
 
-Why: Network data arrives in chunks. This function acts as a stateful
-stream parser, safely processing data as it arrives and only returning a
-request object once a complete message (request-line, headers, and full
-body) has been buffered.
+(cl-defgeneric warp:apply-load-balancer-policy (policy endpoints)
+  "Applies the load balancing policy to a list of endpoints.
 
-How: It first looks for the request line (e.g., `GET /path HTTP/1.1`).
-If found, it parses the headers. If headers are successfully parsed
-(including a `Content-Length`), it checks if the entire body has been
-received by comparing the content length to the size of the remaining
-buffer. Only then does it construct and return the request object.
+Arguments:
+- `policy` (warp-load-balancer-policy): The load balancing policy.
+- `endpoints` (list): The list of available service endpoints.
 
-:Arguments:
-- `BUFFER` (buffer): The buffer containing raw request data for a single connection.
+Returns:
+- (t): The selected endpoint from the list."
+  (:method ((policy warp-load-balancer-policy) endpoints)
+    (let ((load-balancer-type (warp-load-balancer-policy-type policy)))
+      (warp:balance endpoints
+                    (warp:balancer-strategy-create :type load-balancer-type)))))
 
-:Returns:
-- `(warp-http-request)`: A complete request object if one was successfully parsed.
-- `nil`: If the buffer does not yet contain a full HTTP request."
-  (with-current-buffer buffer
-    (goto-char (point-min))
-    ;; 1. Look for the Request-Line: Method SP Request-URI SP HTTP-Version CRLF
-    (when (looking-at "\\([A-Z]+\\) +\\([^ ]+\\) +\\(HTTP/[0-9.]+\\)\r\n")
-      (let ((method (intern (concat ":" (match-string 1))))
-            (path (match-string 2))
-            (version (match-string 3)))
-        (goto-char (match-end 0))
-        
-        ;; 2. If the request-line is valid, attempt to parse the header fields.
-        (when-let ((headers (warp-httpd--parse-headers (current-buffer))))
-          (let* ((body-start (point))
-                 ;; Determine expected body size from the Content-Length header.
-                 (content-length (or (gethash "content-length" headers) "0"))
-                 (body-size (string-to-number content-length))
-                 (buffer-remaining (- (point-max) body-start)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Public API for Policies
+
+(defmacro warp:defpolicy (name type docstring &rest options)
+  "Defines and registers a named, reusable service policy.
+This macro registers a policy blueprint in a global registry.
+
+Arguments:
+- `name` (keyword): The unique name for this policy (e.g., `:aggressive-retry`).
+- `type` (keyword): The type of policy (e.g., `:retry`, `:timeout`).
+- `docstring` (string): Documentation for the policy.
+- `options` (plist): A property list of policy-specific options.
+
+Returns:
+- `name` (symbol)."
+  (let ((policy-constructor (intern (format "make-warp-%s-policy" type))))
+    `(progn
+       (puthash ',name (list :type ',type :constructor ',policy-constructor
+                             :options ',options)
+                warp--policy-registry)
+       ',name)))
+
+;;;###autoload
+(defmacro warp:defpolicy-set (name docstring &rest policy-names)
+  "Defines a reusable collection of named policies.
+This macro bundles a list of policy names into a single, named unit.
+
+Arguments:
+- `name` (keyword): The name for the policy set.
+- `docstring` (string): Documentation for the policy set.
+- `policy-names` (list): A list of policy names to include in the set."
+  `(defconst ,name ',policy-names ,docstring))
+  
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Private Middleware & Pipeline Logic
+
+(defun warp-service--rpc-call-middleware-function (context next-function)
+  "Private: Middleware to execute the RPC call on the server side.
+
+Arguments:
+- `context` (plist): The context containing `:command` and `:impl-instance`.
+- `next-function` (function): The next function in the pipeline.
+
+Returns:
+- (loom-promise): A promise that resolves with the updated context."
+  (let ((command (plist-get context :command))
+        (implementation (plist-get context :impl-instance)))
+    (braid! (apply (warp-command-executor command)
+                   (list implementation command context))
+      (:then (result)
+             (funcall next-function (plist-put context :result result))))))
+
+(defun warp-service--dial-endpoint-middleware (context next-function)
+  "Private: Middleware to discover, balance, and connect to a service.
+This delegates the entire connection process to the `warp-dialer`.
+
+Arguments:
+- `context` (plist): The context containing `:service-client` and `:service-name`.
+- `next-function` (function): The next function in the pipeline.
+
+Returns:
+- (loom-promise): A promise that resolves after `next-function` completes."
+  (let* ((client (plist-get context :service-client))
+         (service-name (plist-get context :service-name))
+         (dialer (warp-service-client-dialer client)))
+    (braid! (warp:dialer-dial dialer service-name)
+      (:then (connection)
+             (funcall next-function (plist-put context
+                                               :connection connection))))))
+
+(defun warp-service--apply-resilience-middleware (context next-function)
+  "Private: Middleware to wrap the downstream call in resilience policies.
+
+Arguments:
+- `context` (plist): Context with `:service-client` and `:service-name`.
+- `next-function` (function): The rest of the pipeline to call.
+
+Returns:
+- (loom-promise): Promise for the resiliently executed pipeline result."
+  (let* ((client (plist-get context :service-client))
+         (service-name (plist-get context :service-name))
+         (policies (gethash service-name
+                            (warp-service-client-policies client)))
+         (retry-policy (gethash :retry-policy policies))
+         (timeout-policy (gethash :timeout-policy policies))
+         (cb-config (plist-get policies :circuit-breaker))
+         (callable (lambda () (funcall next-function context)))
+         final-callable)
+    ;; Wrap the core `callable` with resilience patterns, inside-out.
+    (setq final-callable callable)
+    (when timeout-policy
+      (setq final-callable
+            (lambda () (loom:with-timeout
+                           (warp-timeout-policy-timeout timeout-policy)
+                         (funcall final-callable)))))
+    (when cb-config
+      (let ((breaker (apply #'warp:circuit-breaker-get-or-create
+                            (symbol-name service-name) cb-config)))
+        (setq final-callable
+              (lambda () (warp:circuit-breaker-execute
+                             breaker final-callable)))))
+    (when retry-policy
+      (setq final-callable (lambda () (warp:apply-retry-policy
+                                        retry-policy final-callable))))
+    (funcall final-callable)))
+
+(defun warp-service--rpc-client-send-middleware (context next-function)
+  "Private: Middleware to send the RPC command over the wire.
+
+Arguments:
+- `context` (plist): The full context for the RPC call.
+- `next-function` (function): The next function in the pipeline.
+
+Returns:
+- (loom-promise): A promise that resolves with the updated context."
+  (let* ((client (plist-get context :service-client))
+         (rpc (warp-service-client-rpc-system client))
+         (connection (plist-get context :connection))
+         (endpoint (plist-get context :selected-endpoint))
+         (command (plist-get context :command))
+         (options (plist-get context :options)))
+    (braid! (warp:rpc-send
+             rpc connection
+             :recipient-id (warp-service-endpoint-worker-id endpoint)
+             :command command
+             :stream (plist-get options :stream)
+             :expect-response (not (plist-get options :fire-and-forget)))
+      (:then (result) (funcall next-function
+                                (plist-put context :result result)))
+      (:catch (error)
+              (error (plist-get options :service-error-type)
+                     (format "RPC to '%s' failed"
+                             (plist-get options :method-name))
+                     error)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Private Functions
+
+;;;---------------------------------------------------------------------------
+;;; RPC Generation Helpers (Internal)
+;;;---------------------------------------------------------------------------
+
+(defun warp-service--generate-client-struct (client-class protocol-name)
+  "Private: Generate the `cl-defstruct` form for a protocol's client.
+This function creates the client-side state object. This object holds
+a reference to the underlying `warp-service-client` that handles all
+network-level concerns (discovery, load balancing, resilience),
+decoupling the high-level API from the low-level transport details.
+
+Arguments:
+- `client-class` (symbol): The symbol name for the client struct.
+- `protocol-name` (symbol): The name of the service protocol.
+
+Returns:
+- (list): A complete `(cl-defstruct ...)` S-expression."
+  `(cl-defstruct (,client-class
+                  (:constructor ,(intern (format "make-%s" client-class))))
+     ,(format "Client for the %s protocol." protocol-name)
+     (service-client (cl-assert nil) :type (or null t))))
+
+(defun warp-service--generate-auto-schema-form (protocol method args)
+  "Private: Generate a `warp:defschema` form for an RPC method's arguments.
+This function creates a data schema for the RPC method's arguments. This
+schema is used for type-safe serialization and deserialization,
+ensuring a consistent contract for data exchange between services. It
+automatically filters out Lisp lambda-list keywords from the
+argument list.
+
+Arguments:
+- `protocol` (symbol): The protocol namespace.
+- `method` (symbol): The specific method name.
+- `args` (list): The raw argument list from the method's definition.
+
+Returns:
+- (list): A complete `(warp:defschema ...)` S-expression."
+  (let* ((schema-name (intern (format "warp-%s-%s-request" protocol method)))
+         (fields (cl-loop for arg in args
+                          unless (memq arg '(&key &optional &rest))
+                          collect `(,arg nil :serializable-p t))))
+    `(warp:defschema ,schema-name (:generate-protobuf t) ,@fields)))
+
+(defun warp-service--generate-client-method (client-class protocol rpc-def specs
+                                                          global-opts client-middleware)
+  "Private: Generate a client-side stub function for an RPC method.
+This function is the core of the client-side code generation. It
+produces a Lisp function that hides all RPC complexity from the user.
+The generated function wraps the RPC call in a middleware pipeline
+that handles:
+1. Packaging arguments into a command object.
+2. Building the full execution context.
+3. Running the middleware stages (resilience, discovery, transport).
+
+Arguments:
+- `client-class` (symbol): The name of the client struct.
+- `protocol` (symbol): The name of the protocol namespace.
+- `rpc-def` (list): The base definition of the RPC method.
+- `specs` (list): The full list of method specs from the interface.
+- `global-opts` (plist): RPC options that apply to all methods.
+- `client-middleware` (list): User-provided middleware stages.
+
+Returns:
+- (list): A complete `(cl-defun ...)` S-expression."
+  (let* ((method (car rpc-def)) (arguments (cadr rpc-def))
+         (spec (cl-find method specs :key #'car))
+         (options (append (plist-get (cdddr spec) :rpc-options) global-opts))
+         (schema (plist-get options :request-schema))
+         (fn-name (intern (format "%s-%s" client-class method)))
+         (command (intern (format ":%s/%s" protocol method)))
+         (service-name (intern (symbol-name protocol) :keyword))
+         (err-type (intern (format "%s-RPC-ERROR" protocol)))
+         (payload (cl-loop for arg in arguments
+                           unless (memq arg '(&key &optional &rest))
+                           collect `(,(intern (symbol-name arg) :keyword)
+                                     ,arg)))
+         (opts-plist `(:method-name ',method
+                       :service-error-type ',err-type
+                       :stream ,(plist-get options :stream)
+                       :fire-and-forget ,(plist-get options :fire-and-forget)))
+         (pipeline-name (intern (format "client-pipeline-%s/%s"
+                                        protocol method))))
+    `(cl-defun ,fn-name (client ,@arguments)
+       ,(format "Sends a %S RPC with discovery and resilience." command)
+       (let* ((svc-client (,(intern (format "%s-service-client" client-class))
+                           client))
+              ;; Package args into a structured RPC command object.
+              (cmd-obj (make-warp-rpc-command
+                        :name ',command
+                        :arguments (,(intern (format "make-%s" schema))
+                                    ,@payload)))
+              ;; Prepare the initial context for the pipeline.
+              (context `(:service-client ,svc-client
+                         :service-name ,service-name
+                         :command ,cmd-obj
+                         :options ,opts-plist))
+              ;; Define the full execution pipeline with all stages.
+              (pipeline (warp:middleware-pipeline-create
+                         :name ',pipeline-name
+                         :stages
+                         (append
+                          ,client-middleware
+                          (list (warp:defmiddleware-stage
+                                 :apply-resilience
+                                 #'warp-service--apply-resilience-middleware)
+                                (warp:defmiddleware-stage
+                                 :dial-endpoint
+                                 #'warp-service--dial-endpoint-middleware)
+                                (warp:defmiddleware-stage
+                                 :send-rpc-command
+                                 #'warp-service--rpc-client-send-middleware))))))
+         (braid! (warp:middleware-pipeline-run pipeline context)
+           ;; Extract the final result from the pipeline's context.
+           (:then (final-ctx) (plist-get final-ctx :result)))))))
+
+(defun warp-service--generate-command-definition (protocol rpc-def)
+  "Private: Generate a `warp:defcommand` for a single RPC method.
+This function creates the server-side command definition, which
+links an incoming RPC command to a concrete handler function.
+
+Arguments:
+- `protocol` (symbol): The protocol namespace for the command.
+- `rpc-def` (list): The full definition of a single RPC method.
+
+Returns:
+- (list): A complete `(warp:defcommand ...)` S-expression."
+  (let* ((method (car rpc-def))
+         (handler (plist-get (cdddr rpc-def) :handler))
+         (command (intern (format ":%s/%s" protocol method)))
+         (doc (cadr handler)) (args (caddr handler)) (body (cdddr handler)))
+    `(warp:defcommand ,command ,doc :arguments ',args :execute (lambda ,args ,@body))))
+
+(defun warp-service--generate-handler-registration
+    (router protocol rpc-def impl-key server-middleware)
+  "Private: Generate the Lisp form to add a command handler to a router.
+This function creates the logic for the RPC router to dispatch an
+incoming command to the correct server-side middleware pipeline. It
+dynamically injects the service implementation via the component
+system.
+
+Arguments:
+- `router` (symbol): The variable name holding the router instance.
+- `protocol` (symbol): The protocol namespace.
+- `rpc-def` (list): The definition of a single RPC method.
+- `impl-key` (keyword): The DI key for the service component.
+- `server-middleware` (list): User-provided server-side middleware.
+
+Returns:
+- (list): A complete `(warp:command-router-add-route ...)` S-expression."
+  (let* ((method (car rpc-def))
+         (command (intern (format ":%s/%s" protocol method)))
+         (pipeline-name (intern (format "pipeline-%s" command))))
+    `(warp:command-router-add-route ,router ',command
+       :handler-function
+       (lambda (cmd-obj context)
+         (let* ((system (plist-get context :host-system))
+                ;; Resolve the concrete service implementation via DI.
+                (impl (warp:component-system-get system ,impl-key))
+                (plugin-system (warp:component-system-get system :plugin-system))
+                (contribs (when plugin-system
+                            (warp:get-plugin-contributions
+                             plugin-system :service-rpc-middleware)))
+                ;; Assemble the final server-side pipeline.
+                (pipeline
+                 (warp:middleware-pipeline-create
+                  :name ',pipeline-name
+                  :stages (append ,server-middleware (car contribs)
+                                  (list (warp:defmiddleware-stage
+                                         :rpc-call
+                                         #'warp-service--rpc-call-middleware-function))))))
+           (warp:middleware-pipeline-run pipeline `(:command ,cmd-obj
+                                                    :context ,context
+                                                    :impl-instance ,impl)))))))
+
+(defun warp-service--generate-protocol-forms (protocol iface-name impl-name rpc-opts)
+  "Private: Orchestrate the entire code generation for a service's RPC.
+This function is the master entry point for the code-generation macro.
+It iterates over all methods in the service interface and generates
+the necessary structs, schemas, and functions for both the client and
+the server.
+
+Arguments:
+- `protocol` (symbol): The unique name for the generated protocol.
+- `iface-name` (symbol): The service interface being implemented.
+- `impl-name` (symbol): The name of the component with the implementation.
+- `rpc-opts` (plist): Configuration options for the RPC layer.
+
+Returns:
+- (list): A `(progn ...)` S-expression containing all generated code.
+
+Signals:
+- `warp-service-contract-violation`: If `iface-name` is not known."
+  (let* ((client-class (plist-get rpc-opts :client-class))
+         (auto-schema (plist-get rpc-opts :auto-schema))
+         (server-middleware (plist-get rpc-opts :server-middleware))
+         (client-middleware (plist-get rpc-opts :client-middleware))
+         (impl-key (intern (format ":%s" impl-name)))
+         (iface-def (gethash iface-name warp--service-interface-registry))
+         (methods (plist-get iface-def :methods))
+         (reg-fn (intern (format "%%register-%s-handlers" protocol)))
+         (err-type (when client-class
+                     (intern (format "%s-RPC-ERROR" protocol)))))
+
+    ;; Pre-condition check: Ensure the macro is implementing a valid interface
+    ;; that has been registered. This is a critical meta-programming sanity check.
+    (unless iface-def
+      (error 'warp-service-contract-violation
+             (format "Service interface '%s' not found" iface-name)))
+
+    (let ((schema-forms) (client-forms) (cmd-defs) (handler-regs))
+      (dolist (spec methods)
+        (cl-destructuring-bind (method args &key doc rpc-options) spec
+          (let* ((impl-fn (intern (format "%s-%s" impl-name method)))
+                 (handler-args (remove-if #'keywordp args))
+                 (schema (when auto-schema
+                           (intern (format "warp-%s-%s-request"
+                                           protocol method))))
+                 ;; Define a structured representation of the RPC for
+                 ;; internal use by the generation functions.
+                 (rpc-def `(,method ,args
+                            ,@(when auto-schema `(:request-schema ,schema))
+                            :handler
+                            (lambda (,impl-name cmd-obj _ctx)
+                              ,(or doc "Proxy handler")
+                              ;; The handler uses `apply` to dynamically call the
+                              ;; user's function with arguments extracted from the
+                              ;; incoming command object.
+                              (apply #',impl-fn ,impl-name
+                                     (mapcar (lambda (a)
+                                               `(plist-get
+                                                 (warp-rpc-command-arguments
+                                                  cmd-obj)
+                                                 ',(intern (symbol-name a)
+                                                           :keyword)))
+                                             handler-args))))))
+
+            ;; Generate the schema for the RPC arguments.
+            (when auto-schema
+              (push (warp-service--generate-auto-schema-form
+                     protocol method args) schema-forms))
             
-            ;; 3. Check if we have received the complete message body.
-            (when (>= buffer-remaining body-size)
-              (let ((body (buffer-substring body-start (+ body-start body-size))))
-                ;; A complete request has been received. Consume it from the buffer.
-                (delete-region (point-min) (+ body-start body-size))
-                ;; Return the final, structured request object.
-                (make-warp-http-request
-                 :method method :path path :version version
-                 :headers headers :body body)))))))))
-
-(defun warp-httpd--send-response (connection status-code headers body)
-  "Constructs and sends a complete HTTP response over a transport connection.
-
-Why: This helper function ensures all outgoing responses are correctly
-formatted according to the HTTP/1.1 specification.
-
-How: It builds the response string in a temporary buffer, starting with the
-Status-Line, followed by standard headers (`Date`, `Content-Length`,
-`Connection`), any custom headers, and finally the message body.
-
-:Arguments:
-- `CONNECTION` (t): A `warp-transport` connection handle.
-- `STATUS-CODE` (integer): The HTTP status code (e.g., 200, 404).
-- `HEADERS` (hash-table): A hash table of response headers.
-- `BODY` (string or vector): The response body.
-
-:Returns:
-- `(loom-promise)`: A promise that resolves to `t` on successful send.
-
-:Side Effects: Sends data over the network via `warp:transport-send`.
-:Signals: None."
-  (let* ((status-text (or (warp:enum-get httpd-status status-code) "Unknown Status"))
-         (body-bytes (if (stringp body)
-                         (string-to-utf8 body)
-                       body))
-         (response-string
-          (with-temp-buffer
-            ;; 1. Write the Status-Line: HTTP-Version SP Status-Code SP Reason-Phrase CRLF
-            (insert (format "HTTP/1.1 %d %s\r\n" status-code status-text))
+            ;; Generate the client-side stub function that users will call.
+            (when client-class
+              (push (warp-service--generate-client-method
+                     client-class protocol rpc-def specs rpc-opts
+                     client-middleware) client-forms))
             
-            ;; 2. Write standard, required headers.
-            (insert (format "Date: %s\r\n" (format-time-string "%a, %d %b %Y %T GMT" nil t)))
-            (insert (format "Content-Length: %d\r\n" (length body-bytes)))
-            ;; Using "Connection: close" is the simplest strategy for connection
-            ;; management; the server will close the connection after this response.
-            (insert "Connection: close\r\n")
+            ;; Generate the server-side command definition.
+            (push (warp-service--generate-command-definition
+                   protocol rpc-def) cmd-defs)
             
-            ;; 3. Write any user-provided headers (e.g., Content-Type).
-            (maphash (lambda (k v) 
-                      (insert (format "%s: %s\r\n" (s-capitalize k) v))) headers)
-            
-            ;; 4. Terminate the header section with a blank line.
-            (insert "\r\n")
-            (buffer-string))))
+            ;; Generate the registration call to wire the handler to the router.
+            (push (warp-service--generate-handler-registration
+                   'router protocol rpc-def impl-key server-middleware)
+                  handler-regs))))
+      
+      ;; The final return form is a `progn` that assembles all
+      ;; the generated code into a single block to be executed.
+      `(progn
+         ,@(when err-type
+             `((define-error ',err-type "RPC error" 'warp-service-error)))
+         ,@(nreverse schema-forms)
+         ,@(when client-class
+             `(,(warp-service--generate-client-struct client-class protocol)))
+         ,@(nreverse client-forms)
+         ,@(nreverse cmd-defs)
+         ;; The registration function is a separate utility to allow
+         ;; deferred or dynamic registration of handlers at runtime.
+         (defun ,reg-fn (router)
+           ,(format "Register all handlers for the %s protocol." protocol)
+           ,@(nreverse handler-regs))))))
+
+;;;---------------------------------------------------------------------------
+;;; Service Registry & Client Functions
+;;;---------------------------------------------------------------------------
+
+(defun warp:service-registry-create (&key id event-system rpc-system
+                                          load-balancer endpoint-pool)
+  "Public: Create and initialize a new `warp-service-registry` component.
+This is the central factory for the service registry. It sets up the
+endpoint registry with proper indexing and wires it to the cluster's
+event system to react to worker lifecycle changes. It also exposes
+itself via RPC so other nodes can query it for service endpoints.
+
+Arguments:
+- `:id` (string): A unique identifier for this registry instance.
+- `:event-system` (warp-event-system): The cluster's central event bus.
+- `:rpc-system` (warp-rpc-system): The master's RPC system.
+- `:load-balancer` (warp-balancer-strategy): The cluster's load balancer.
+- `:endpoint-pool` (warp-resource-pool): The pool for endpoint objects.
+
+Returns:
+- (warp-service-registry): A new, initialized registry instance."
+  (let* ((reg-name (format "service-catalog-%s" id))
+         (endpoint-reg (warp:registry-create
+                        :name reg-name :event-system event-system
+                        :indices `((:service-name
+                                    . ,#'warp-service-endpoint-service-name)
+                                   (:worker-id
+                                    . ,#'warp-service-endpoint-worker-id))))
+         (registry (%%make-service-registry
+                    :id (format "service-registry-%s" id)
+                    :endpoint-registry endpoint-reg
+                    :event-system event-system
+                    :load-balancer load-balancer
+                    :endpoint-pool endpoint-pool)))
+    (dolist (event-type '(:worker-registered
+                          :worker-deregistered
+                          :worker-health-status-changed))
+      (warp:subscribe event-system event-type
+                      (lambda (event)
+                        (warp-service-registry--on-worker-event
+                         registry event-type event))))
+    (when rpc-system
+      (let ((router (warp:rpc-system-command-router rpc-system)))
+        (warp:defrpc-handlers router
+          (:service-select-endpoint
+           (lambda (cmd _)
+             (let ((args (warp-rpc-command-args cmd)))
+               (warp:service-registry-select-endpoint
+                registry (plist-get args :service-name)))))
+          (:service-list-all
+           (lambda (_c _x) (warp:service-registry-list-all registry))))))
     
-    ;; 5. Send the headers and then the body over the transport.
-    (loom:await (warp:transport-send connection (string-to-utf8 response-string)))
-    (loom:await (warp:transport-send connection body-bytes))))
+    ;; Register the default internal resolver.
+    (warp:register-service-resolver :internal
+                                    (lambda (service-name)
+                                      (warp-service--internal-resolve registry service-name)))
 
-(defun warp-httpd--connection-close-p (request)
-  "Return non-nil if the client requested \"connection: close\" or HTTP/1.0.
+    ;; Register the service mesh resolver.
+    (when (warp:service-mesh-enabled-p)
+      (warp:register-service-resolver :service-mesh
+                                      #'warp:service-mesh-resolve))
+    
+    registry))
 
-:Arguments:
-- `REQUEST` (warp-http-request): The parsed request object.
 
-:Returns:
-- `(boolean)`: `t` if the connection should be closed, otherwise `nil`."
-  (let ((headers (warp-http-request-headers request)))
-    (or (string-equal "close" (gethash "connection" headers))
-        (string-equal "HTTP/1.0" (warp-http-request-version request)))))
+(cl-defun warp:service-registry-list-endpoints (registry service-name)
+  "Public: Orchestrates multi-source service discovery for an endpoint.
 
-(defun warp-httpd--normalize-address (address &optional default-port)
-  "Normalize an HTTP-style address string to a `tcp://` address.
+This function serves as the core of the enhanced discovery system. It looks
+up all available resolvers in the central resolver registry, runs them
+in parallel, and applies a consensus algorithm to the results to
+determine a final, authoritative list of endpoints.
 
-This function strips the `http://` or `https://` scheme and appends
-a default port if none is specified, making the address compatible with
-the underlying `warp-tcp-plugin`.
+Arguments:
+- `registry` (warp-service-registry): The internal service registry.
+- `service-name` (keyword): The logical name of the service to find.
 
-:Arguments:
-- `ADDRESS` (string): The user-provided address string.
-- `DEFAULT-PORT` (integer): The default port to use if not specified.
+Returns:
+- (loom-promise): A promise that resolves with a list of `warp-service-endpoint`
+  objects that passed the consensus check, or rejects if no consensus is
+  reached or if a severe error occurs during resolution."
+  (let ((resolvers (hash-table-values warp--service-resolver-registry)))
+    (braid! (loom:all-settled (cl-loop for resolver in resolvers
+                                       collect (funcall resolver service-name)))
+      (:then (results)
+        (let ((valid-endpoints
+               (cl-loop for res in results
+                        when (eq (plist-get res :status) 'fulfilled)
+                        collect (plist-get res :value))))
+          (if valid-endpoints
+              (warp-service--consensus-select valid-endpoints)
+            (loom:rejected!
+             (warp:error! :type 'warp-service-not-found
+                          :message "No service discovery sources were successful."))))))))
 
-:Returns:
-- `(string)`: A normalized `tcp://` address string."
-  (let* ((host-port-str (cond
-                          ((string-prefix-p "http://" address) (substring address (length "http://")))
-                          ((string-prefix-p "https://" address) (substring address (length "https://")))
-                          (t address)))
-         (parts (s-split ":" host-port-str t))
-         (host (s-join ":" (butlast parts)))
-         (port-str (car (last parts)))
-         (port (if (s-number-p port-str)
-                   port-str
-                 (if default-port (number-to-string default-port) "80"))))
-    (format "tcp://%s:%s" host port)))
+(cl-defun warp:service-client-create (&key rpc-system dialer policy-set-name)
+  "Public: Create a new client-side service component with a named policy set.
+This factory assembles a 'smart client' that bundles the RPC system,
+dialer, and resilience policies. The policies are loaded from a
+pre-defined policy set to enforce consistent behavior.
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Public API
+Arguments:
+- `:rpc-system` (warp-rpc-system): The RPC system for sending requests.
+- `:dialer` (warp-dialer-service): The dialer for connecting to endpoints.
+- `:policy-set-name` (keyword): The name of a `warp:defpolicy` set.
 
-;;;###autoload
-(cl-defun warp:httpd-create (&key id transport handler-fn)
-  "Creates a new `warp-httpd-server` instance.
+Returns:
+- (warp-service-client): A new client instance configured with policies.
 
-:Arguments:
-- `:id` (string): A unique name for the server.
-- `:transport` (t): The `warp-transport` component instance to use.
-- `:handler-fn` (function): The top-level handler function to process requests.
-  It must accept two arguments: a `warp-http-request` object and the
-  `warp-transport-connection` handle.
+Signals:
+- `error`: If `policy-set-name` is not found."
+  (let* ((policy-set (gethash policy-set-name warp--policy-registry))
+         (policies (make-hash-table :test 'eq)))
+    ;; Ensure the requested policy set exists.
+    (unless policy-set
+      (error "Policy set '%s' not found in registry." policy-set-name))
+    ;; Iterate over the policy set and create policy objects.
+    (dolist (policy-spec policy-set)
+      (let* ((policy-name (car policy-spec))
+             (policy-type (getf policy-spec :type))
+             (policy-opts (getf policy-spec :options)))
+        (puthash policy-name (apply (getf policy-spec :constructor)
+                                    policy-opts) policies)))
+    ;; Return the fully assembled client instance.
+    (%%make-service-client
+     :rpc-system rpc-system
+     :dialer dialer
+     :policies policies)))
 
-:Returns:
-- `(warp-httpd-server)`: A new, configured server instance (not yet started)."
-  (%%make-httpd-server
-   :id (or id "default-httpd")
-   :transport transport
-   :handler-fn handler-fn))
+;;;---------------------------------------------------------------------------
+;;; Pluggable Resolvers and Consensus
+;;;---------------------------------------------------------------------------
 
-;;;###autoload
-(defun warp:httpd-start (server port)
-  "Starts the HTTP server by creating a transport listener.
+(defun warp-service--internal-resolve (registry service-name)
+  "Private: The internal resolver function.
+This function wraps the standard registry lookup.
 
-:Arguments:
-- `SERVER` (warp-httpd-server): The server instance to start.
-- `PORT` (integer): The TCP port to listen on.
+Arguments:
+- `registry` (warp-service-registry): The internal registry instance.
+- `service-name` (keyword): The logical name of the service.
 
-:Returns: `t`.
-:Side Effects: Starts a network listener via `warp-transport`."
-  (let* ((address (format "http://0.0.0.0:%d" port))
-         (normalized-address (warp-httpd--normalize-address address port)))
-    (warp:log! :info (warp-httpd-server-id server) "Starting HTTP server on %s" address)
-    (let ((listener
-           (warp:transport-listen
-            (warp-httpd-server-transport server)
-            normalized-address
-            ;; The :on-connect callback is triggered when a new client connects.
-            ;; We create a dedicated buffer for this connection to accumulate
-            ;; incoming request data. This is crucial for handling HTTP
-            ;; requests that arrive in fragmented packets.
-            :on-connect (lambda (conn)
-                          (warp:transport-connection-set-metadata
-                           conn :http-buffer (generate-new-buffer "*http-request*")))
-            ;; The :on-receive callback is the core of the request processing loop.
-            :on-receive (lambda (conn data)
-                          (let ((buffer (warp:transport-connection-get-metadata conn :http-buffer)))
-                            (with-current-buffer buffer
-                              ;; Append the new data to the end of the buffer.
-                              (goto-char (point-max))
-                              (insert data)
-                              ;; Repeatedly try to parse a full request from the buffer.
-                              ;; This loop handles the case where a single network packet
-                              ;; contains multiple requests or a partial request.
-                              (while-let ((request (warp-httpd--parse-request buffer)))
-                                ;; Once a full request is parsed, asynchronously
-                                ;; dispatch it to the user-provided handler function.
-                                (loom:await 
-                                 (funcall (warp-httpd-server-handler-fn server) request conn))
-                                ;; Check if the client requested a connection close
-                                ;; (e.g., `Connection: close` header).
-                                (when (warp-httpd--connection-close-p request)
-                                  (warp:log! :info "httpd-server" "Client requested connection close. Closing.")
-                                  (loom:await (warp:transport-close conn)))))))
-            ;; The :on-disconnect callback is triggered when a connection is closed.
-            ;; This is the cleanup hook to ensure we kill the buffer associated
-            ;; with the connection, preventing a memory leak.
-            :on-disconnect (lambda (conn)
-                             (let ((buffer (warp:transport-connection-get-metadata conn :http-buffer)))
-                               (when (buffer-live-p buffer)
-                                 (kill-buffer buffer)))))))
-      (setf (warp-httpd-server-listener server) listener))
-    t))
+Returns:
+- (loom-promise): A promise that resolves to a list of endpoints."
+  (warp:service-registry-select-endpoints registry service-name))
 
-;;;###autoload
-(defun warp:httpd-stop (server)
-  "Stops the HTTP server by closing its transport listener.
 
-:Arguments:
-- `SERVER` (warp-httpd-server): The server instance to stop.
+(defun warp-service--send-http-request (conn method path &key headers body)
+  "Private: Sends a simple HTTP request over a raw transport connection.
+This function manually constructs and sends an HTTP/1.1 request string
+over a `warp-transport` connection. It then waits for and returns the
+raw response body.
 
-:Returns: A promise that resolves when the listener is closed.
-:Side Effects: Stops the network listener."
-  ;; Log the intent to stop the server for operational visibility.
-  (warp:log! :info (warp-httpd-server-id server) "Stopping HTTP server.")
-  ;; Safely retrieve the listener from the server instance.
-  (when-let ((listener (warp-httpd-server-listener server)))
-    ;; Asynchronously close the listener. The `loom:await` ensures that
-    ;; the function waits for the listener to be fully closed before
-    ;; returning, guaranteeing a graceful shutdown.
-    (loom:await (warp:transport-close listener))))
+Arguments:
+- `conn` (warp-transport-connection): The raw transport connection to use.
+- `method` (string): The HTTP method (e.g., \"GET\").
+- `path` (string): The request path (e.g., \"/api/v1/status\").
+- `:headers` (hash-table, optional): A hash table of custom headers.
+- `:body` (string or vector, optional): The request body.
 
-;;;###autoload
-(warp:defcomponent httpd-server
-  "A Warp-native HTTP server built on `warp-transport`.
+Returns:
+- (loom-promise): A promise that resolves with the response body as a string.
 
-This component encapsulates the entire lifecycle of a production-ready
-HTTP server, allowing it to be seamlessly managed by the `warp-component-system`.
-It handles configuration, startup, and graceful shutdown, freeing the
-developer from boilerplate."
-  :requires '(config-service transport)
-  :factory (lambda (cfg transport)
-             ;; The factory function is responsible for creating the server
-             ;; instance and wiring up its dependencies.
-             (warp:httpd-create
-              :id "httpd-server"
-              :transport transport
-              ;; This is the core application logic. The `handler-fn`
-              ;; is a simple example that logs an incoming request and
-              ;; returns a static JSON response.
-              :handler-fn (lambda (req conn)
-                            (warp:log! :info "httpd-server" "Received request: %S %s"
-                                       (warp-http-request-method req)
-                                       (warp-httpd-request-path req))
-                            (warp-httpd--send-response
-                             conn (warp:enum-get httpd-status ok)
-                             (plist-to-hash-table
-                              '("Content-Type" "application/json"))
-                             (json-encode `(:message "Hello from Warp HTTPD"
-                                            :path ,(warp-httpd-request-path req)))))))
-  :start (lambda (server system)
-           ;; The `:start` hook is called by the component system when
-           ;; the server should become active.
-           (let* ((cfg (warp:component-system-get system :config-service))
-                  ;; The server's port is dynamically loaded from the config.
-                  (port (warp:config-service-get cfg :http-port 8080)))
-             ;; Start the HTTP server on the configured port.
-             (warp:httpd-start server port)))
-  :stop (lambda (server)
-          ;; The `:stop` hook is called to gracefully shut down the server.
-          (warp:httpd-stop server)))    
+Signals:
+- Rejects if the request fails or if the response is malformed."
+  (let* ((http-request-string
+          (with-temp-buffer
+            (insert (format "%s %s HTTP/1.1\r\n" method path))
+            (maphash (lambda (k v) (insert (format "%s: %s\r\n"
+                                                   (s-capitalize k) v)))
+                     headers)
+            (insert "\r\n")
+            (buffer-string)))
+         (body-bytes (if body (string-to-utf8 body) "")))
+    (braid! (warp:transport-send conn (string-to-utf8 http-request-string))
+      (:then (_send-result)
+        (warp:transport-send conn body-bytes))
+      (:then (_send-result)
+        (warp:transport-receive conn 5.0)) ;; Use a 5s timeout
+      (:then (raw-response-bytes)
+        (let* ((response-string (string-decode-utf8 raw-response-bytes))
+               (sep (s-index-of "\r\n\r\n" response-string))
+               (body-string (if sep (substring response-string (+ sep 4)))))
+          (if body-string
+              (loom:resolved! body-string)
+            (loom:rejected!
+             (warp:error! :type 'warp-service-error
+                          :message "Empty response from mesh proxy."))))))))
 
-(provide 'warp-httpd)
-;;; warp-httpd.el ends here
+(defun warp:service-mesh-resolve (service-name)
+  "Public: Resolve a service address through a local service mesh proxy.
+This function is the primary interface for a service mesh-aware dialer.
+It communicates with the local sidecar to get a valid address for the
+requested service, using the core `warp-transport` layer.
+
+Arguments:
+- `SERVICE-NAME` (keyword): The logical name of the service.
+
+Returns:
+- (loom-promise): A promise that resolves with a `warp-service-endpoint`
+  struct containing the resolved address.
+
+Signals:
+- Rejects if the mesh proxy is unavailable or cannot resolve the service."
+  (let* ((mesh-config (warp:get-config :service-config))
+         (proxy-addr (plist-get mesh-config :service-mesh-proxy-address))
+         (service-host (s-replace "-" "." (symbol-name service-name)))
+         (transport-addr (warp-httpd--normalize-address proxy-addr 15020)))
+
+    (warp:log! :debug "warp-service"
+               "Resolving service '%s' via mesh at %s."
+               service-name transport-addr)
+
+    (braid! (warp:transport-connect transport-addr)
+      (:then (connection)
+        (unwind-protect
+            (warp-service--send-http-request
+             connection "GET" (format "/%s" service-host))
+          (loom:await (warp:transport-close connection))))
+      (:then (response-body-string)
+        ;; Assume the response body is JSON containing the resolved address.
+        (let ((resolved-addr (json-read-from-string response-body-string)))
+          (warp:log! :info "warp-service" "Mesh resolved '%s' to '%s'."
+                     service-name resolved-addr)
+          (make-warp-service-endpoint
+           :name service-name
+           :address resolved-addr
+           :protocol :tcp)))
+      (:catch (err)
+        (warp:log! :error "warp-service"
+                   "Mesh resolution failed for '%s': %S"
+                   service-name err)
+        (loom:rejected! err)))))
+
+(defun warp-service--consensus-select (endpoint-lists)
+  "Private: Select endpoints using a consensus from multiple sources.
+
+This function takes a list of endpoint lists (one from each successful
+discovery source). It scores each endpoint based on how many sources
+it appeared in and returns only those that meet a majority threshold.
+
+Arguments:
+- `endpoint-lists` (list): A list of lists of `warp-service-endpoint`s.
+
+Returns:
+- (loom-promise): A promise that resolves with a filtered list of
+  `warp-service-endpoint`s that passed the consensus check, or rejects
+  if no consensus is reached."
+  (let ((endpoint-scores (make-hash-table :test 'equal))
+        (all-endpoints (cl-mapcar #'car endpoint-lists)))
+
+    (dolist (endpoints endpoint-lists)
+      (dolist (endpoint endpoints)
+        (let ((key (warp-service-endpoint-address endpoint)))
+          (incf (gethash key endpoint-scores 0)))))
+
+    (let* ((threshold (ceiling (/ (length endpoint-lists) 2.0)))
+           (consensual-endpoints
+            (cl-remove-if-not
+             (lambda (ep)
+               (>= (gethash (warp-service-endpoint-address ep)
+                            endpoint-scores 0)
+                   threshold))
+             (car all-endpoints))))
+      (if consensual-endpoints
+          (loom:resolved! consensual-endpoints)
+        (loom:rejected!
+         (warp:error! :type 'warp-service-not-found
+                      :message "No consensus reached on service endpoints."))))))
+
+(defun warp:service-mesh-enabled-p ()
+  "Public: Check if the service mesh integration is enabled.
+
+Returns:
+- (boolean): `t` if the service mesh is enabled, `nil` otherwise."
+  (let ((config (warp:get-config :service-config)))
+    (plist-get config :service-mesh-enabled-p)))
+
+;;;---------------------------------------------------------------------------
+;;; Individual Policy Definitions
+;;;---------------------------------------------------------------------------
+
+(warp:defpolicy :default-retry
+  "A standard, defensive retry policy for transient network failures.
+Applies 3 retries with an exponential backoff delay to give services
+time to recover."
+  :type :retry
+  :retries 3
+  :delay-strategy :exponential-backoff
+  :delay-options '((:max-delay 5.0)))
+
+(warp:defpolicy :aggressive-retry
+  "An aggressive retry policy for critical operations that must succeed.
+Applies 5 retries with a shorter delay."
+  :type :retry
+  :retries 5
+  :delay-strategy :exponential-backoff
+  :delay-options '((:max-delay 2.0)))
+
+(warp:defpolicy :no-retry
+  "A policy that explicitly disables automatic retries."
+  :type :retry
+  :retries 0)
+
+(warp:defpolicy :short-timeout
+  "A short timeout policy for fast, idempotent operations."
+  :type :timeout
+  :timeout 2.0)
+
+(warp:defpolicy :long-timeout
+  "A long timeout policy for potentially slow, long-running operations
+like complex queries or deployments."
+  :type :timeout
+  :timeout 300.0)
+
+(warp:defpolicy :round-robin-lb
+  "The default load balancing policy, distributing requests sequentially."
+  :type :load-balancer
+  :strategy :round-robin)
+
+(warp:defpolicy :least-connections-lb
+  "A load balancing policy that favors the least-loaded worker, ideal
+for routing to workers with varying capacities or workloads."
+  :type :load-balancer
+  :strategy :least-connections)
+
+;;;---------------------------------------------------------------------------
+;;; Policy Set Definitions
+;;;---------------------------------------------------------------------------
+
+(warp:defpolicy-set default-resilient-policy
+  "The standard, balanced policy set for most client communication."
+  :default-retry
+  :short-timeout
+  :round-robin-lb)
+
+(warp:defpolicy-set high-availability-policy
+  "A policy set optimized for critical services requiring high uptime.
+It uses more aggressive retries to handle transient faults."
+  :aggressive-retry
+  :short-timeout
+  :least-connections-lb)
+
+(warp:defpolicy-set long-timeout-policy
+  "A policy set for operations that are expected to take a long time,
+such as deployments or batch jobs. It disables retries by default."
+  :no-retry
+  :long-timeout
+  :round-robin-lb)
+
+;;;---------------------------------------------------------------------------
+;;; Service Plugin Definition
+;;;---------------------------------------------------------------------------
+
+(warp:defplugin :service-discovery
+  "Provides the core service discovery and gateway infrastructure.
+This plugin installs the service mesh infrastructure into the runtime.
+
+It uses a profile-based approach to provide different capabilities:
+- For a `:worker`, it provides the ability to host and announce services.
+- For a `:cluster-worker`, it provides the centralized control plane
+for service registration, discovery, and routing."
+  :version "1.4.0"
+  :dependencies '(warp-component warp-event warp-balancer warp-registry
+                  warp-rpc warp-protocol warp-plugin warp-config
+                  warp-state-manager warp-managed-worker
+                  warp-dialer)
+  :profiles
+  `((:worker
+     :doc "Enables the service loader, allowing a worker to host services."
+     :components
+     `((service-loader
+        :doc "Dynamically discovers and initializes all defined services."
+        :requires '(runtime-instance)
+        :priority 90 ; Run late to ensure dependencies are ready.
+        :start (lambda (_instance ctx runtime)
+                 ;; When the component starts, it runs all the service
+                 ;; initializer functions that were registered by
+                 ;; `warp:defservice-implementation` macros at load time.
+                 (warp:service-run-initializers runtime)))))
+
+    (:cluster-worker
+     :doc "Enables the full service discovery stack for a cluster leader."
+     :components
+     `(;; The dialer is now a core component of the service mesh. It
+       ;; provides a high-level abstraction for connecting to services.
+       (dialer-service
+        :doc "The unified dialer service for the cluster."
+        :requires '(config-service service-registry load-balancer)
+        :factory (lambda (cfg-svc registry balancer)
+                   (let* ((dialer (%%make-dialer-service
+                                   :service-registry registry
+                                   :load-balancer balancer))
+                          ;; Read the pool settings from the central config.
+                          (pool-config (warp:config-service-get
+                                        cfg-svc :connection-pool))
+                          (pool (warp:resource-pool-create
+                                 :name (intern
+                                        (format "%s-conn-pool"
+                                                (warp-dialer-service-id dialer)))
+                                 ;; Define how to create a new connection.
+                                 :factory-fn (lambda (address)
+                                               (warp-dialer--connection-factory
+                                                dialer address))
+                                 ;; Define how to destroy a connection.
+                                 :destructor-fn #'warp-dialer--connection-destructor
+                                 ;; Define how to check a connection's health.
+                                 :health-check-fn #'warp-dialer--connection-health-check
+                                 ;; Apply the loaded configuration.
+                                 :idle-timeout (plist-get pool-config
+                                                          :idle-timeout 300)
+                                 :max-size (plist-get pool-config
+                                                      :max-size 50)
+                                 :min-size (plist-get pool-config
+                                                      :min-size 1)
+                                 :max-wait-time (plist-get pool-config
+                                                           :max-wait-time 5.0))))
+                     ;; Set the created pool back into the dialer struct.
+                     (setf (warp-dialer-service-connection-pool dialer) pool)
+                     dialer))
+        :start (lambda (self ctx) (warp:dialer-start self))
+        :stop (lambda (self ctx) (warp:dialer-shutdown self)))
+
+       (load-balancer
+        :doc "The routing brain of the service mesh. Selects the best
+worker using a configurable, metrics-aware strategy."
+        :requires '(config state-manager)
+        :factory
+        (lambda (cfg state-mgr)
+          (warp:balancer-strategy-create
+           ;; The specific balancing algorithm is read from config.
+           :type (warp:config-service-get cfg :load-balance-strategy)
+           ;; Filter out any unhealthy workers from selection.
+           :health-check-fn
+           #'(lambda (w) (eq (warp-managed-worker-health-status w) :healthy))
+           ;; Provides the balancer the full list of potential worker targets.
+           :get-all-workers-fn
+           (lambda (&key pool-name)
+             (let ((workers (hash-table-values
+                             (warp:state-manager-get state-mgr '(:workers)))))
+               (if pool-name
+                   (cl-remove-if-not
+                    #'(lambda (w) (string= (warp-managed-worker-pool-name w)
+                                           pool-name))
+                    workers)
+                 workers)))
+           ;; Calculates a 'load score', heavily penalizing degraded workers
+           ;; to route traffic away from them.
+           :connection-load-fn
+           (lambda (m-worker)
+             (let* ((metrics (warp-managed-worker-last-reported-metrics
+                              m-worker))
+                    (base-load (if metrics (gethash :active-request-count
+                                                    metrics 0) 0)))
+               (if (eq (warp-managed-worker-health-status m-worker) :degraded)
+                   (+ base-load
+                      (cluster-config-resource-degraded-load-penalty cfg))
+                 base-load)))
+           ;; Enables adaptive, weighted load balancing by calculating a
+           ;; worker's 'effective weight' in real-time.
+           :dynamic-effective-weight-fn
+           (lambda (m-worker)
+             (let* ((health (warp-managed-worker-health-status m-worker))
+                    (weight (warp-managed-worker-initial-weight m-worker))
+                    (metrics (warp-managed-worker-last-reported-metrics
+                              m-worker))
+                    (cpu (if metrics (gethash :cpu-utilization
+                                              metrics 0.0) 0.0))
+                    (reqs (if metrics (gethash :active-request-count
+                                               metrics 0) 0)))
+               (pcase health
+                 (:unhealthy 0.0) ; A weight of 0 receives no traffic.
+                 (:degraded (* weight 0.25)) ; Receives 25% of normal traffic.
+                 ;; For healthy workers, apply penalties based on load.
+                 (_ (let ((cpu-penalty (cond ((> cpu 80.0) 0.1)
+                                              ((> cpu 50.0) 0.5)
+                                              (t 1.0)))
+                          (req-penalty (cond ((> reqs 50) 0.1)
+                                             ((> reqs 20) 0.5)
+                                             (t 1.0))))
+                      (max 0.001 (* weight cpu-penalty req-penalty))))))))))
+        :metadata `(:leader-only t))
+
+       (service-registry
+        :doc "The authoritative, reactive catalog for all cluster services."
+        :requires '(cluster-orchestrator event-system rpc-system load-balancer)
+        :factory (lambda (cluster es rpc lb)
+                   (warp:service-registry-create
+                    :id (warp-cluster-id cluster) :event-system es
+                    :rpc-system rpc :load-balancer lb))
+        :metadata `(:leader-only t))
+
+       (service-gateway
+        :doc "The central entry point for routing service requests."
+        :requires '(cluster-orchestrator service-client rpc-system)
+        :factory (lambda (cluster client rpc)
+                   (warp:gateway-create
+                    :name (format "%s-gateway" (warp-cluster-id cluster))
+                    :service-client client :rpc-system rpc))
+        :metadata `(:leader-only t)))
+     )))
+
+(provide 'warp-service)
+;;; warp-service.el ends here

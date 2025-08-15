@@ -2,37 +2,98 @@
 
 ;;; Commentary:
 ;;
-;; This module provides sophisticated functionality for defining and applying
-;; auto-scaling strategies to Warp distributed clusters. It enables dynamic
-;; adjustment of worker counts based on various metrics, schedules, and
-;; composite conditions.
+;; This module provides a robust and flexible framework for implementing
+;; auto-scaling in a distributed system. It allows a cluster of resources
+;; (e.g., worker processes, containers) to dynamically expand or contract in
+;; response to real-time conditions, ensuring a balance between performance and
+;; cost-efficiency.
 ;;
-;; This version has been refactored to be a thin layer on top of `warp-allocator.el`
-;; and `warp-resource-pool.el`, affirming a strict separation of concerns. The
-;; autoscaler itself is a pure policy engine: it consumes metrics, makes a
-;; scaling decision, and issues a command to the allocator. It has no direct
-;; knowledge of how to create or destroy resources.
+;; ## The "Why": The Need for Elasticity
 ;;
-;; Before use, this module must be initialized by calling
-;; `warp:autoscaler-initialize` with a valid `warp-event-system` instance.
+;; In any distributed system, workload is rarely constant. It fluctuates with
+;; user traffic, background job queues, and time-of-day patterns. Provisioning
+;; resources for peak load is expensive and wasteful, as those resources sit
+;; idle most of the time. Conversely, under-provisioning leads to poor
+;; performance, high latency, and potential service outages.
 ;;
-;; ## Architectural Role: Policy Engine for Scaling
+;; **Autoscaling** solves this problem by automating the process of resource
+;; management. It continuously monitors the system and adjusts the number of
+;; active workers to precisely match the current demand. This ensures:
 ;;
-;; The autoscaler acts as an intelligent **client** to the `allocator-service`. It
-;; is responsible for deciding *when* and *by how much* to scale. The `allocator`
-;; is responsible for executing that decision. This design allows for different
-;; scaling policies to be hot-swapped without changing the core allocation logic.
+;; - **Performance and Reliability**: There are always enough resources to
+;;   handle the current load, maintaining responsiveness and availability.
+;; - **Cost Optimization**: Resources are automatically de-provisioned during
+;;   quiet periods, eliminating spending on idle capacity.
+;; - **Operational Efficiency**: It removes the need for manual intervention to
+;;   handle predictable (or unpredictable) load changes.
 ;;
-;; ## Key Features:
+;; ## The "How": A Pure Policy Engine
 ;;
-;; - **Declarative Strategies**: Use `warp:defautoscaler-strategy` to define
-;;   reusable scaling policies based on metrics, schedules, or composite rules.
-;; - **Composable Design**: The `warp-autoscaler-monitor` is a composite object that
-;;   contains the strategy, metrics history, and a link to the `allocator-service`.
-;; - **Resilient Evaluation**: Scaling decisions are protected by circuit breakers
-;;   to prevent instability if a metric source becomes unreliable.
-;; - **Observability**: Detailed status and metrics for each monitor are available,
-;;   providing transparency into scaling decisions.
+;; This module is designed with a strict separation of concerns. It acts as a
+;; pure **policy engine**, whose sole responsibility is to decide *when* and
+;; *by how much* to scale a resource pool. It has no knowledge of the
+;; underlying infrastructure or how to provision/de-provision resources.
+;;
+;; The architectural flow is as follows:
+;;
+;; 1.  **Monitor**: A `warp-autoscaler-monitor` is the active agent. It is
+;;     configured with a specific `strategy` to watch over a resource `pool`.
+;; 2.  **Observe**: At regular intervals, the monitor queries the
+;;     `warp-telemetry` service to collect relevant metrics (e.g., CPU
+;;     utilization, request queue depth).
+;; 3.  **Decide**: It evaluates these metrics against the rules defined in its
+;;     `strategy`. This evaluation results in a scaling decision: scale up,
+;;     scale down, or do nothing.
+;; 4.  **Command**: If a scaling action is needed, the autoscaler issues a
+;;     simple command (e.g., "set pool size to 10") to the
+;;     `warp-allocator` service.
+;; 5.  **Execute**: The `warp-allocator` is the **mechanism engine**. It
+;;     receives the command and handles the concrete infrastructure logic of
+;;     creating or destroying worker instances.
+;;
+;; This "policy vs. mechanism" separation makes the system highly modular.
+;; Different scaling strategies can be developed and hot-swapped without
+;; altering the core resource allocation logic.
+;;
+;; ## Core Concepts and Components
+;;
+;; The system is built around a few key abstractions:
+;;
+;; - **`warp-autoscaler-strategy`**: An immutable configuration object that
+;;   serves as the blueprint for scaling logic. It defines the rules,
+;;   thresholds, cooldown periods, and scaling algorithm (e.g., metric-based,
+;;   scheduled, predictive). These are typically defined declaratively using
+;;   `warp:defautoscaler-strategy`.
+;;
+;; - **`warp-autoscaler-monitor`**: The stateful, runtime object that executes a
+;;   strategy. It ties together a specific resource pool, a telemetry source,
+;;   and the scaling policy. It runs in the background, continuously performing
+;;   the observe-decide-command loop.
+;;
+;; ## Features for Production Stability
+;;
+;; Making automated scaling decisions requires safeguards to prevent
+;; instability. This module includes several critical features:
+;;
+;; - **Cooldown Periods**: After a scaling event (up or down), a cooldown
+;;   period is enforced. This prevents "thrashing," a situation where the
+;;   system rapidly scales up and down in response to noisy metrics, causing
+;;   instability.
+;;
+;; - **Min/Max Boundaries**: Every strategy defines absolute minimum and
+;;   maximum resource counts. These act as safety rails, preventing the system
+;;   from scaling to zero or growing uncontrollably due to a configuration
+;;   error or metric anomaly.
+;;
+;; - **Circuit Breakers**: Scaling decisions depend on reliable metric data. If
+;;   the telemetry source becomes unavailable or faulty, the associated circuit
+;;   breaker will "trip," temporarily halting scaling decisions. This prevents
+;;   the autoscaler from taking action based on stale or incorrect data.
+;;
+;; - **Observability**: The state of every active monitor can be inspected via
+;;   `warp:autoscaler-status`, providing clear insight into why scaling
+;;   decisions are being made. This includes current status, scaling counters,
+;;   and timestamps of last actions.
 
 ;;; Code:
 
@@ -49,36 +110,55 @@
 (require 'warp-registry)
 (require 'warp-allocator)
 (require 'warp-uuid)
+(require 'warp-telemetry)
+(require 'warp-health)
+(require 'warp-plugin)
+(require 'warp-state-machine)
+(require 'warp-service)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
 
 (define-error 'warp-autoscaler-error
-  "A generic error related to the Warp auto-scaler."
+  "A generic error related to the Warp auto-scaler subsystem."
   'warp-error)
 
 (define-error 'warp-autoscaler-not-initialized
-  "The auto-scaler was used before being initialized."
+  "Error signaled when an autoscaler function is used before initialization.
+This is a programming error; `warp:autoscaler-initialize` must be called."
   'warp-autoscaler-error)
 
 (define-error 'warp-autoscaler-invalid-strategy
-  "The provided auto-scaling strategy configuration is invalid."
+  "Error for a malformed or incoherent auto-scaling strategy.
+This is signaled if a strategy's parameters are missing, have incorrect
+types, or are logically inconsistent (e.g., `max-resources` < `min-resources`)."
   'warp-autoscaler-error)
 
 (define-error 'warp-autoscaler-metric-collection-failed
-  "The auto-scaler failed to collect the required metrics."
+  "Error indicating failure to collect required metrics for a decision.
+This might happen if the `warp-telemetry-pipeline` is unavailable
+or returns an error, preventing a valid scaling evaluation."
   'warp-autoscaler-error)
 
 (define-error 'warp-autoscaler-unsupported-metric
-  "The auto-scaler strategy uses an unsupported metric type."
+  "Error for a strategy that references an unsupported metric type.
+This is a configuration error, indicating a mismatch between the policy
+and the available telemetry data."
   'warp-autoscaler-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Global State
 
 (defvar warp-autoscaler--registry nil
-  "The central registry for all active autoscaler monitors.
-  This variable is `nil` until `warp:autoscaler-initialize` is called.")
+  "The central registry for all *active* auto-scaler monitor instances.
+This is the runtime store for monitors that are currently polling and making
+scaling decisions. It is initialized by `warp:autoscaler-initialize`.")
+
+(defvar-local warp--autoscaler-monitor-registry
+  (warp:registry-create :name "autoscaler-monitors")
+  "A central registry for *declarative* autoscaler monitor definitions.
+This registry is intended for storing pre-defined monitor configurations that
+can be instantiated at runtime. (Currently used for future extension).")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definitions
@@ -87,29 +167,31 @@
                (:constructor %%make-autoscaler-strategy)
                (:copier nil))
   "Defines an immutable, comprehensive auto-scaling strategy configuration.
+This struct encapsulates all parameters that define *how* and *when* an
+auto-scaler should make a scaling decision. It serves as a blueprint for
+a `warp-autoscaler-monitor`.
 
-  This struct holds all parameters that define *how* and *when* an
-  auto-scaler should make a scaling decision.
-
-  Fields:
-  - `type` (keyword): The primary scaling algorithm (e.g., `:cpu-utilization`).
-  - `min-resources` (integer): The absolute minimum number of resources for the pool.
-  - `max-resources` (integer): The absolute maximum number of resources for the pool.
-  - `scale-up-threshold` (number): Metric value to trigger a scale-up.
-  - `scale-down-threshold` (number): Metric value to trigger a scale-down.
-  - `scale-up-cooldown` (number): Minimum seconds to wait after a scale-up.
-  - `scale-down-cooldown` (number): Minimum seconds to wait after a scale-down.
-  - `metric-value-extractor-fn` (function): A function `(lambda (metrics-plist))` to
-    extract the relevant metric value from the collected metrics.
-  - `schedule` (list): A list of scheduled scaling events for `:scheduled`
-    strategies.
-  - `evaluation-interval` (number): How often, in seconds, to evaluate the strategy.
-  - `scale-step-size` (integer): The number of resources to add/remove per action.
-  - `composite-rules` (list): A list of rules for `:composite` strategies.
-  - `predictive-window` (integer): Number of data points for trend analysis.
-  - `predictive-sensitivity` (float): Aggressiveness factor for predictive scaling.
-  - `circuit-breaker-config` (plist): Plist to configure an optional circuit
-    breaker."
+Fields:
+- `type` (keyword): Primary scaling algorithm (e.g., `:cpu-utilization`).
+- `min-resources` (integer): Absolute minimum number of resources for the pool.
+- `max-resources` (integer): Absolute maximum number of resources for the pool.
+- `scale-up-threshold` (number): Metric value that triggers a scale-up.
+- `scale-down-threshold` (number): Metric value that triggers a scale-down.
+- `scale-up-cooldown` (number): Seconds to wait after a scale-up before
+   another scale-up can occur. Prevents thrashing.
+- `scale-down-cooldown` (number): Seconds to wait after a scale-down.
+   Prevents instability from scaling down too quickly.
+- `metric-value-extractor-fn` (function): A function `(lambda (metrics-plist))`
+   to extract the relevant numeric value from collected metrics.
+- `schedule` (list): List of scheduled scaling events for `:scheduled` strategies.
+- `evaluation-interval` (number): How often, in seconds, the monitor should
+   wake up to evaluate this strategy.
+- `scale-step-size` (integer): Number of resources to add/remove per action.
+- `composite-rules` (list): List of rules for `:composite` strategies.
+- `predictive-window` (integer): Data points for trend analysis.
+- `predictive-sensitivity` (float): Aggressiveness factor for predictive scaling.
+- `circuit-breaker-config` (plist): Plist to configure an optional circuit
+   breaker for scaling operations."
   (type nil :type keyword)
   (min-resources 1 :type integer)
   (max-resources 1 :type integer)
@@ -129,13 +211,14 @@
 (cl-defstruct (warp-autoscaler-metrics-history
                (:constructor %%make-metrics-history)
                (:copier nil))
-  "Maintains a rolling window of historical metrics data for a pool.
+  "Maintains a rolling window of historical metrics for a monitored pool.
+This data is primarily used by `:predictive` strategies to analyze trends.
 
-  Fields:
-  - `data-points` (list): A list of historical metric data points, from most
-    recent to oldest. Each point is a plist with `:timestamp` and `:metrics`.
-  - `max-history-size` (integer): The maximum number of data points to retain.
-  - `last-updated` (float): The timestamp of the last update."
+Fields:
+- `data-points` (list): Historical metric data points, from most recent to
+   oldest. Each point is a plist `(:timestamp FLOAT :metrics PLIST)`.
+- `max-history-size` (integer): The max number of data points to retain.
+- `last-updated` (float): The `float-time` timestamp of the last update."
   (data-points nil :type list)
   (max-history-size 100 :type integer)
   (last-updated nil :type (or null float)))
@@ -143,29 +226,34 @@
 (cl-defstruct (warp-autoscaler-monitor
                (:constructor %%make-autoscaler-monitor)
                (:copier nil))
-  "Represents an active auto-scaling monitor for a single pool.
+  "Represents an active, stateful auto-scaling monitor for a single pool.
+This is the main runtime object that connects a scaling strategy to a live pool.
 
-  Fields:
-  - `id` (string): A unique identifier for this monitor instance.
-  - `allocator` (allocator-client): The allocator client to send commands to.
-  - `pool-name` (string): The name of the pool to monitor and scale.
-  - `metrics-provider-fn` (function): A function that returns a promise resolving to a
-    plist of current metrics for the pool.
-  - `strategy` (warp-autoscaler-strategy): The configuration object defining the scaling rules.
-  - `last-scale-up-time` (float): Timestamp of the last successful scale-up.
-  - `last-scale-down-time` (float): Timestamp of the last successful scale-down.
-  - `poll-instance` (loom-poll): The `loom-poll` instance running the evaluation task.
-  - `status` (keyword): The current status (`:active`, `:stopped`, `:error`).
-  - `circuit-breaker` (warp-circuit-breaker): The circuit breaker to prevent scaling instability.
-  - `metrics-history` (warp-autoscaler-metrics-history): The historical metrics data for this monitor's pool.
-  - `total-scale-ups` (integer): Total count of successful scale-up operations.
-  - `total-scale-downs` (integer): Total count of successful scale-down operations.
-  - `total-errors` (integer): Total errors encountered during evaluation.
-  - `created-at` (float): Timestamp when the monitor was created."
+Fields:
+- `id` (string): A unique UUID for this monitor instance.
+- `allocator` (allocator-client): The client stub for the `allocator-service`,
+   used to issue scaling commands.
+- `pool-name` (string): The name of the resource pool this monitor manages.
+- `telemetry-pipeline` (warp-telemetry-pipeline): The telemetry pipeline used
+   to source metrics for scaling decisions.
+- `strategy` (warp-autoscaler-strategy): The immutable configuration object
+   defining the scaling rules.
+- `last-scale-up-time` (float): Timestamp of the last scale-up, for cooldown.
+- `last-scale-down-time` (float): Timestamp of the last scale-down, for cooldown.
+- `poll-instance` (loom-poll): The `loom-poll` instance that drives the
+   periodic evaluation of the strategy.
+- `status` (keyword): Current status (`:active`, `:stopped`, `:error`).
+- `circuit-breaker` (warp-circuit-breaker): An optional circuit breaker to
+   prevent instability if metric collection or scaling actions fail.
+- `metrics-history` (warp-autoscaler-metrics-history): Historical metrics data.
+- `total-scale-ups` (integer): Lifetime counter of successful scale-ups.
+- `total-scale-downs` (integer): Lifetime counter of successful scale-downs.
+- `total-errors` (integer): Lifetime counter of evaluation errors.
+- `created-at` (float): The `float-time` timestamp of monitor creation."
   (id nil :type string)
-  (allocator nil :type (or null t))
+  (allocator nil :type (or null allocator-client)) ; Should be `allocator-client`
   (pool-name nil :type string)
-  (metrics-provider-fn nil :type function)
+  (telemetry-pipeline nil :type (or null warp-telemetry-pipeline))
   (strategy nil :type warp-autoscaler-strategy)
   (last-scale-up-time nil :type (or null float))
   (last-scale-down-time nil :type (or null float))
@@ -182,45 +270,39 @@
 ;;; Private Functions
 
 (defmacro warp-autoscaler--ensure-initialized ()
-  "Ensures the autoscaler registry has been initialized.
-  This macro should be called at the beginning of every public function
-  that relies on the registry being available.
+  "Ensures the autoscaler registry has been initialized before proceeding.
+This guard macro should be the first call in public functions that depend on
+the global registry.
 
-  Arguments: None.
-
-  Returns: None.
-
-  Signals:
-  - `warp-autoscaler-not-initialized`: If `warp-autoscaler--registry` is
-    `nil`."
+Signals:
+- `warp-autoscaler-not-initialized`: If `warp-autoscaler--registry` is `nil`."
   '(unless warp-autoscaler--registry
-     (error 'warp-autoscaler-not-initialized
-            "Warp autoscaler not initialized. Call `warp:autoscaler-initialize` \
-             first.")))
+     (signal (warp:error! 
+              :type 'warp-autoscaler-not-initialized
+              :message "Warp autoscaler not initialized. 
+                        Call `warp:autoscaler-initialize`."))))
 
 (defun warp-autoscaler--add-metrics-to-history (history metrics)
-  "Adds a new metrics data point to the historical record.
-  This maintains a rolling window of recent metrics for trend analysis.
-  This function is expected to be called by a single thread per monitor,
-  ensuring sequential access to `data-points`.
+  "Adds a new metrics data point to the history, maintaining a rolling window.
+This function is called sequentially by the monitor's polling task,
+ensuring that `data-points` is not modified concurrently.
 
-  Arguments:
-  - `history` (warp-autoscaler-metrics-history): The history object to update.
-  - `metrics` (plist): A plist of current metrics to record.
+Arguments:
+- `history` (warp-autoscaler-metrics-history): The history object to update.
+- `metrics` (plist): A plist of the latest metrics to record.
 
-  Returns: `nil`.
-
-  Side Effects:
-  - Modifies the `data-points` and `last-updated` slots in `history`."
+Side Effects:
+- Prepends a new data point to `data-points`.
+- Trims the oldest data point if `max-history-size` is exceeded.
+- Updates `last-updated` timestamp."
   (let* ((timestamp (float-time))
          (data-point `(:timestamp ,timestamp :metrics ,metrics))
          (current-data (warp-autoscaler-metrics-history-data-points history))
          (max-size (warp-autoscaler-metrics-history-max-history-size history)))
-    ;; Prepend the new data point to the list (most recent first).
+    ;; Prepend the new data point (most recent first).
     (setf (warp-autoscaler-metrics-history-data-points history)
           (cons data-point current-data))
-    ;; If the history is now too large, remove the oldest data point
-    ;; from the end.
+    ;; Trim the oldest data point if the history exceeds the max size.
     (when (> (length (warp-autoscaler-metrics-history-data-points history))
              max-size)
       (setf (warp-autoscaler-metrics-history-data-points history)
@@ -229,648 +311,428 @@
     (setf (warp-autoscaler-metrics-history-last-updated history)
           timestamp)))
 
-(defun warp-autoscaler--calculate-trend (history metric-extractor-fn)
-  "Calculates the trend for a specific metric using simple linear regression.
-  This provides a slope and confidence for predictive scaling.
+(defun warp-autoscaler--handle-scaling-decision (monitor action target-size reason)
+  "Executes a scaling decision after applying all safety checks.
+This function is the final gateway before a command is sent to the allocator.
+It enforces min/max bounds, cooldown periods, and circuit breaker state.
 
-  Arguments:
-  - `history` (warp-autoscaler-metrics-history): The historical data.
-  - `metric-extractor-fn` (function): A function to extract the numeric
-    metric value from a metrics plist.
+Arguments:
+- `monitor` (warp-autoscaler-monitor): The active monitor making the decision.
+- `action` (keyword): Proposed action, e.g., `:scale-up`, `:scale-to`.
+- `target-size` (integer): The desired final number of resources.
+- `reason` (string): A human-readable reason for the scaling decision.
 
-  Returns:
-  - (plist): A plist containing `:slope` (float), `:direction` (keyword:
-    `:up`, `:down`, `:stable`), and `:confidence` (float between 0.0 and 1.0,
-    indicating reliability of the trend based on data points)."
-  (let* ((data-points (nreverse ; Oldest to newest for regression.
-                       (copy-list
-                        (warp-autoscaler-metrics-history-data-points
-                         history))))
-         (values (cl-loop for point in data-points
-                          for metrics = (plist-get point :metrics)
-                          for value = (funcall metric-extractor-fn metrics)
-                          when (numberp value) collect value))
-         (n (length values)))
-    ;; A meaningful trend requires at least 3 data points.
-    (if (< n 3)
-        `(:slope 0.0 :direction :stable :confidence 0.0)
-      (let* (;; Standard linear regression formula components (y = mx + b).
-             ;; We are calculating 'm' (the slope).
-             (sum-x (/ (* n (1- n)) 2.0))
-             (sum-y (apply #'+ values))
-             (sum-xy (cl-loop for i from 0 for val in values sum (* i val)))
-             (sum-x2 (cl-loop for i from 0 below n sum (* i i)))
-             (denom (- (* n sum-x2) (* sum-x sum-y)))
-             ;; Calculate the slope.
-             (slope (if (= denom 0.0) 0.0
-                      (/ (- (* n sum-xy) (* sum-x sum-y)) denom)))
-             ;; Classify the trend direction based on the slope.
-             (direction (cond ((> slope 0.1) :up)
-                              ((< slope -0.1) :down)
-                              (t :stable)))
-             ;; Simple confidence score based on data size (max 20 data points).
-             (confidence (min 1.0 (/ (float n) 20.0))))
-        `(:slope ,slope :direction ,direction :confidence ,confidence)))))
+Returns:
+- (loom-promise): A promise resolving with the outcome, e.g.,
+`(:action :scale-up :size 5)` or `(:action :no-action)`.
 
-(defun warp-autoscaler--handle-scaling-decision
-    (monitor action target-size reason)
-  "Applies a scaling decision to the pool with safety checks.
-  This function ensures scaling actions respect min/max bounds and cooldowns,
-  and interacts with the circuit breaker.
-
-  Arguments:
-  - `monitor` (warp-autoscaler-monitor): The active monitor.
-  - `action` (keyword): The proposed action (`:scale-up`, `:scale-down`,
-    `:scale-to`).
-  - `target-size` (integer): The desired number of resources.
-  - `reason` (string): A descriptive reason for the scaling decision.
-
-  Returns:
-  - (loom-promise): A promise resolving with the result of the scaling
-    operation (e.g., `(:action :scale-up :size 5)`) or `(:action :no-action)`,
-    or rejecting on failure.
-
-  Side Effects:
-  - Calls `allocator-service-scale-pool`, which modifies the pool.
-  - Updates `last-scale-up-time`, `last-scale-down-time`, `total-scale-ups`,
-    `total-scale-downs`, and `total-errors` in `monitor`.
-  - Interacts with the `warp-circuit-breaker` if configured."
+Side Effects:
+- Asynchronously calls `allocator-service-scale-pool`.
+- Updates the monitor's state (`last-scale-*`, `total-scale-*`).
+- Interacts with `warp-circuit-breaker`, recording success or failure."
   (let* ((allocator-client (warp-autoscaler-monitor-allocator monitor))
          (pool-name (warp-autoscaler-monitor-pool-name monitor))
          (strategy (warp-autoscaler-monitor-strategy monitor))
          (cb (warp-autoscaler-monitor-circuit-breaker monitor))
          (min (warp-autoscaler-strategy-min-resources strategy))
          (max (warp-autoscaler-strategy-max-resources strategy))
-         ;; Use the allocator's service to get the current capacity.
-         (current-size (plist-get
-                        (loom:await (allocator-service-get-pool-status
-                                     allocator-client pool-name))
-                        :current-capacity))
-         ;; Clamp the target size to be within the allowed min/max bounds.
+         ;; Get the current size from the allocator service.
+         (current-size
+           (plist-get (loom:await (allocator-service-get-pool-status
+                                   allocator-client pool-name))
+                      :current-capacity))
+         ;; Clamp the target size to respect the hard min/max limits.
          (final-size (max min (min max target-size))))
     (cond
-     ;; Check 1: Is the circuit breaker open? If so, block the action.
-     ((and cb (not (warp:circuit-breaker-can-execute-p cb)))
-      (let ((msg (format "Scaling for pool '%s' blocked by open circuit breaker."
-                         pool-name)))
-        (warp:log! :warn "autoscaler" msg)
-        (loom:rejected! (warp:error! :type :warp-circuit-breaker-open-error
-                                     :message msg))))
+      ;; Check 1: Is the circuit breaker open? If so, prevent the action.
+      ((and cb (not (warp:circuit-breaker-can-execute-p cb)))
+       (let ((msg (format "Scaling for '%s' blocked by open circuit breaker."
+                          pool-name)))
+         (warp:log! :warn "autoscaler" msg)
+         (loom:rejected! (warp:error! :type :warp-circuit-breaker-open-error
+                                      :message msg))))
 
-     ;; Check 2: Is this a no-op? (Target size is same as current).
-     ((= final-size current-size)
-      (let ((msg (format "No scaling for pool '%s': target %d = current %d. %s"
-                         pool-name final-size
-                         current-size reason)))
-        (warp:log! :debug "autoscaler" msg)
-        (loom:resolved! `(:action :no-action :size ,current-size
-                                  :reason ,reason))))
+      ;; Check 2: Is the desired state already met? This is a no-op.
+      ((= final-size current-size)
+       (warp:log! :debug "autoscaler" "No scaling for '%s': target %d = current %d. %s"
+                  pool-name final-size current-size reason)
+       (loom:resolved! `(:action :no-action :size ,current-size :reason ,reason)))
 
-     ;; Check 3: Cooldown period active for this action type?
-     ((and (eq action :scale-up)
-           (warp-autoscaler-monitor-last-scale-up-time monitor)
-           (< (- (float-time) (warp-autoscaler-monitor-last-scale-up-time
-                                monitor))
-              (warp-autoscaler-strategy-scale-up-cooldown strategy)))
-      (let ((msg (format "Scale up for pool '%s' in cooldown."
-                         pool-name)))
-        (warp:log! :debug "autoscaler" msg)
-        (loom:resolved! `(:action :no-action :reason ,msg))))
-     ((and (eq action :scale-down)
-           (warp-autoscaler-monitor-last-scale-down-time monitor)
-           (< (- (float-time) (warp-autoscaler-monitor-last-scale-down-time
-                                monitor))
-              (warp-autoscaler-strategy-scale-down-cooldown strategy)))
-      (let ((msg (format "Scale down for pool '%s' in cooldown."
-                         pool-name)))
-        (warp:log! :debug "autoscaler" msg)
-        (loom:resolved! `(:action :no-action :reason ,msg))))
+      ;; Check 3: Is the proposed action in its cooldown period? (REFACTORED)
+      ((warp-autoscaler--is-in-cooldown-p monitor action)
+       (let ((msg (format "Scaling action for pool '%s' is in cooldown." pool-name)))
+         (warp:log! :debug "autoscaler" msg)
+         (loom:resolved! `(:action :no-action :reason ,msg))))
 
-     ;; If all checks pass, proceed with the scaling operation.
-     (t
-      (warp:log! :info "autoscaler" "Scaling %s for pool '%s': %d -> %d. %s"
-                 (if (> final-size current-size) "up" "down")
-                 pool-name current-size final-size
-                 (format "Reason: %s" reason))
-      ;; The actual resizing is asynchronous, so use `braid!` to handle the
-      ;; promise.
-      (braid! (allocator-service-scale-pool allocator-client
-                                            pool-name final-size)
-        (:then (lambda (result)
-                 ;; On success, update the monitor's state.
-                 (warp:log! :info "autoscaler"
-                            "Scaled pool '%s' to %d resources."
-                            pool-name final-size)
-                 (if (> final-size current-size)
-                     (progn
-                       (cl-incf
-                        (warp-autoscaler-monitor-total-scale-ups monitor))
-                       (setf (warp-autoscaler-monitor-last-scale-up-time
-                              monitor)
-                             (float-time)))
-                   (progn
-                     (cl-incf
-                      (warp-autoscaler-monitor-total-scale-downs monitor))
-                     (setf (warp-autoscaler-monitor-last-scale-down-time
-                            monitor)
-                           (float-time))))
-                 (when cb (warp:circuit-breaker-record-success cb))
-                 result))
-        (:catch (lambda (err)
-                  ;; On failure, log the error and update state.
-                  (warp:log! :error "autoscaler"
-                             "Failed to scale pool '%s' to %d: %S"
-                             pool-name final-size err)
-                  (cl-incf (warp-autoscaler-monitor-total-errors monitor))
-                  (when cb (warp:circuit-breaker-record-failure cb))
-                  (loom:rejected! err))))))))
+      ;; All checks passed. Proceed with the scaling operation.
+      (t
+       (warp:log! :info "autoscaler" "Scaling %s for '%s': %d -> %d. Reason: %s"
+                  (if (> final-size current-size) "up" "down")
+                  pool-name current-size final-size reason)
+       ;; Use braid! to handle the asynchronous scaling call.
+       (braid! (allocator-service-scale-pool allocator-client pool-name final-size)
+         (:then (lambda (result)
+                  ;; On success, update monitor state and record success with CB.
+                  (warp:log! :info "autoscaler" "Scaled '%s' to %d." pool-name final-size)
+                  (if (> final-size current-size)
+                      (progn
+                        (cl-incf (warp-autoscaler-monitor-total-scale-ups monitor))
+                        (setf (warp-autoscaler-monitor-last-scale-up-time monitor) (float-time)))
+                    (progn
+                      (cl-incf (warp-autoscaler-monitor-total-scale-downs monitor))
+                      (setf (warp-autoscaler-monitor-last-scale-down-time monitor) (float-time))))
+                  (when cb (warp:circuit-breaker-record-success cb))
+                  result))
+         (:catch (lambda (err)
+                   ;; On failure, update error stats and record failure with CB.
+                   (warp:log! :error "autoscaler" "Failed to scale '%s' to %d: %S"
+                              pool-name final-size err)
+                   (cl-incf (warp-autoscaler-monitor-total-errors monitor))
+                   (when cb (warp:circuit-breaker-record-failure cb))
+                   (loom:rejected! err))))))))
 
 (defun warp-autoscaler--validate-strategy (strategy)
   "Performs a comprehensive validation of a strategy object.
-  Ensures that the strategy configuration is complete and coherent
-  for its defined type, preventing runtime errors.
+This acts as a precondition check, catching configuration errors early
+before a monitor is started, preventing difficult runtime failures.
 
-  Arguments:
-  - `strategy` (warp-autoscaler-strategy): The strategy object to validate.
+Arguments:
+- `strategy` (warp-autoscaler-strategy): The strategy object to validate.
 
-  Returns: `t` if the strategy is valid.
+Returns: `t` if the strategy is valid.
 
-  Signals:
-  - `warp-autoscaler-invalid-strategy`: If the strategy is malformed
-    or missing required fields for its type."
-  (unless (warp-autoscaler-strategy-p strategy)
-    (error 'warp-autoscaler-invalid-strategy "Invalid strategy object."))
-  (let* ((type (warp-autoscaler-strategy-type strategy))
-         (min (warp-autoscaler-strategy-min-resources strategy))
-         (max (warp-autoscaler-strategy-max-resources strategy))
-         (eval-interval
-          (warp-autoscaler-strategy-evaluation-interval strategy))
-         (step-size (warp-autoscaler-strategy-scale-step-size strategy)))
-    ;; Basic sanity checks applicable to all strategies.
-    (unless (and (integerp min) (>= min 0))
-      (error 'warp-autoscaler-invalid-strategy "min-resources must be >= 0"))
-    (unless (and (integerp max) (>= max min))
-      (error 'warp-autoscaler-invalid-strategy
-             "max-resources must be >= min-resources"))
-    (unless (and (numberp eval-interval) (> eval-interval 0))
-      (error 'warp-autoscaler-invalid-strategy
-             "evaluation-interval must be a positive number"))
-    (unless (and (integerp step-size) (> step-size 0))
-      (error 'warp-autoscaler-invalid-strategy
-             "scale-step-size must be a positive integer"))
-    ;; Strategy-specific validation.
-    (pcase type
-      ((or :cpu-utilization :request-rate :response-time
-           :healthy-resources :active-resources :memory-utilization)
-       (unless (functionp
-                (warp-autoscaler-strategy-metric-value-extractor-fn
-                 strategy))
-         (error 'warp-autoscaler-invalid-strategy
-                "Metric strategies require a :metric-value-extractor-fn."))
-       (unless (numberp (warp-autoscaler-strategy-scale-up-threshold
-                         strategy))
-         (error 'warp-autoscaler-invalid-strategy
-                "Metric strategies require numeric :scale-up-threshold."))
-       (unless (numberp (warp-autoscaler-strategy-scale-down-threshold
-                         strategy))
-         (error 'warp-autoscaler-invalid-strategy
-                "Metric strategies require numeric :scale-down-threshold.")))
-      (:scheduled
-       (unless (listp (warp-autoscaler-strategy-schedule strategy))
-         (error 'warp-autoscaler-invalid-strategy
-                "Scheduled strategy requires a :schedule list")))
-      (:composite
-       (unless (listp (warp-autoscaler-strategy-composite-rules strategy))
-         (error 'warp-autoscaler-invalid-strategy
-                "Composite strategy requires a :composite-rules list")))
-      (:predictive
-       (unless (functionp
-                (warp-autoscaler-strategy-metric-value-extractor-fn
-                 strategy))
-         (error 'warp-autoscaler-invalid-strategy
-                "Predictive strategy requires a :metric-value-extractor-fn."))
-       (let ((win (warp-autoscaler-strategy-predictive-window strategy))
-             (sens (warp-autoscaler-strategy-predictive-sensitivity
-                    strategy)))
-         (unless (and (integerp win) (> win 2))
-           (error 'warp-autoscaler-invalid-strategy
-                  "Predictive window must be an integer > 2."))
-         (unless (and (numberp sens) (> sens 0))
-           (error 'warp-autoscaler-invalid-strategy
-                  "Predictive sensitivity must be a positive number."))))
-      (_ (error 'warp-autoscaler-invalid-strategy
-                "Unknown strategy type: %S" type))))
-  t)
+Signals:
+- `warp-autoscaler-invalid-strategy`: If any part of the strategy is malformed."
+  ;; Use a local macro to streamline the repetitive validation checks. It
+  ;; takes a condition and a formatted error message, signaling a structured
+  ;; error if the condition is false.
+  (cl-macrolet ((validate (condition message &rest args)
+               `(unless ,condition
+                  (signal (warp:error! :type 'warp-autoscaler-invalid-strategy
+                                       :message (format ,message ,@args))))))
 
-(defun warp-autoscaler--evaluate-metric-strategy (monitor metrics current-size)
-  "Evaluates a common metric-based scaling strategy.
-  Checks if a given metric (e.g., CPU utilization) is above a scale-up
-  threshold or below a scale-down threshold.
+    ;; First, ensure we have a valid strategy struct.
+    (validate (warp-autoscaler-strategy-p strategy) "Invalid strategy object provided.")
 
-  Arguments:
-  - `monitor` (warp-autoscaler-monitor): The active monitor.
-  - `metrics` (plist): The current metrics collected from the pool.
-  - `current-size` (integer): The current size of the resource pool.
-
-  Returns:
-  - (loom-promise): A promise that resolves with the scaling decision
-    (e.g., `(:action :scale-up :size 5)`) or `(:action :no-action)`).
-
-  Side Effects:
-  - May call `warp-autoscaler--handle-scaling-decision`.
-
-  Signals:
-  - `warp-autoscaler-metric-collection-failed`: If the extracted metric
-    is not a number, indicating a problem with the metric provider."
-  (let* ((strategy (warp-autoscaler-monitor-strategy monitor))
-         (metric-fn
-          (warp-autoscaler-strategy-metric-value-extractor-fn strategy))
-         (metric-val (funcall metric-fn metrics))
-         (up-thresh (warp-autoscaler-strategy-scale-up-threshold strategy))
-         (down-thresh
-          (warp-autoscaler-strategy-scale-down-threshold strategy))
-         (step (warp-autoscaler-strategy-scale-step-size strategy)))
-    ;; Ensure the metric extractor returned a valid number.
-    (unless (numberp metric-val)
-      (let ((msg (format "Extracted metric value (%S) is not numeric."
-                         metric-val)))
-        (warp:log! :warn "autoscaler" (concat msg " Cannot make decision."))
-        (signal 'warp-autoscaler-metric-collection-failed `(:message ,msg))))
-    (cond
-     ;; If metric exceeds the upper threshold, trigger a scale-up.
-     ((>= metric-val up-thresh)
-      (warp-autoscaler--handle-scaling-decision
-       monitor :scale-up (+ current-size step)
-       (format "Metric %.2f >= %.2f" metric-val up-thresh)))
-     ;; If metric is below the lower threshold, trigger a scale-down.
-     ((<= metric-val down-thresh)
-      (warp-autoscaler--handle-scaling-decision
-       monitor :scale-down (- current-size step)
-       (format "Metric %.2f <= %.2f" metric-val down-thresh)))
-     ;; Otherwise, the metric is within the desired range; do nothing.
-     (t (loom:resolved! `(:action :no-action
-                           :reason ,(format "Metric %.2f is within thresholds"
-                                            metric-val)))))))
-
-(defun warp-autoscaler--evaluate-predictive-strategy (monitor metrics current-size)
-  "Evaluates a predictive scaling strategy based on historical metric trends.
-  This strategy uses linear regression to anticipate future load.
-
-  Arguments:
-  - `monitor` (warp-autoscaler-monitor): The active monitor.
-  - `metrics` (plist): The current metrics collected from the pool.
-  - `current-size` (integer): The current size of the resource pool.
-
-  Returns:
-  - (loom-promise): A promise that resolves with the scaling decision
-    (e.g., `(:action :scale-up :size 5)`) or `(:action :no-action)`).
-
-  Side Effects:
-  - May call `warp-autoscaler--handle-scaling-decision`."
-  (let* ((history (warp-autoscaler-monitor-metrics-history monitor))
-         (strategy (warp-autoscaler-monitor-strategy monitor))
-         (metric-fn
-          (warp-autoscaler-strategy-metric-value-extractor-fn strategy))
-         (sensitivity
-          (warp-autoscaler-strategy-predictive-sensitivity strategy))
-         (step (warp-autoscaler-strategy-scale-step-size strategy))
-         ;; Calculate the trend from historical data.
-         (trend (warp-autoscaler--calculate-trend history metric-fn)))
-    (warp:log! :debug "autoscaler" "Predictive trend for pool: %S" trend)
-    (cond
-     ;; Scale up if we detect a significant upward trend with enough confidence.
-     ((and (eq (plist-get trend :direction) :up)
-           (>= (plist-get trend :confidence) 0.5)
-           (> (* (plist-get trend :slope) sensitivity) 0.1))
-      (warp-autoscaler--handle-scaling-decision
-       monitor :scale-up (+ current-size step)
-       (format "Predictive scale-up (slope: %.2f)"
-               (plist-get trend :slope))))
-     ;; Scale down if we detect a significant downward trend with enough
-     ;; confidence.
-     ((and (eq (plist-get trend :direction) :down)
-           (>= (plist-get trend :confidence) 0.5)
-           (< (* (plist-get trend :slope) sensitivity) -0.1))
-      (warp-autoscaler--handle-scaling-decision
-       monitor :scale-down (- current-size step)
-       (format "Predictive scale-down (slope: %.2f)"
-               (plist-get trend :slope))))
-     ;; If no significant trend is detected, do nothing.
-     (t
-      (loom:resolved! `(:action :no-action
-                         :reason "No significant predictive trend"))))))
-
-(defun warp-autoscaler--evaluate-composite-strategy (monitor metrics current-size)
-  "Evaluates a composite scaling strategy based on multiple rules.
-  This strategy allows defining a set of conditions (rules) that
-  collectively determine whether to scale up or down.
-
-  Arguments:
-  - `monitor` (warp-autoscaler-monitor): The active monitor.
-  - `metrics` (plist): The current metrics collected from the pool.
-  - `current-size` (integer): The current size of the resource pool.
-
-  Returns:
-  - (loom-promise): A promise that resolves with the scaling decision
-    (e.g., `(:action :scale-up :size 5)`) or `(:action :no-action)`).
-
-  Side Effects:
-  - May call `warp-autoscaler--handle-scaling-decision`."
-  (let* ((strategy (warp-autoscaler-monitor-strategy monitor))
-         (rules (warp-autoscaler-strategy-composite-rules strategy))
-         (step (warp-autoscaler-strategy-scale-step-size strategy))
-         ;; Flags to track scaling signals from rules.
-         (should-scale-up nil)
-         (should-scale-down nil)
-         (up-reasons '())
-         (down-reasons '()))
-    ;; Evaluate each rule in the list.
-    (dolist (rule rules)
-      (let* ((metric-fn (plist-get rule :metric-extractor-fn))
-             (metric-val (funcall metric-fn metrics))
-             (op (plist-get rule :operator))
-             (thresh (plist-get rule :threshold)))
-        (when (and metric-fn op thresh (numberp metric-val))
-          (let ((condition-met (pcase op
-                                 (:gt (> metric-val thresh))
-                                 (:gte (>= metric-val thresh))
-                                 (:lt (< metric-val thresh))
-                                 (:lte (<= metric-val thresh))
-                                 (_ nil))))
-            (when condition-met
-              (let ((reason (format "Rule: Metric %.2f %S %.2f"
-                                    metric-val op thresh)))
-                (pcase (plist-get rule :action)
-                  (:scale-up   (setq should-scale-up t)
-                               (push reason up-reasons))
-                  (:scale-down (setq should-scale-down t)
-                               (push reason down-reasons)))))))))
-    ;; Make a final decision based on the collected signals.
-    (cond
-     ;; If signals conflict, prioritize scale-up for availability.
-     ((and should-scale-up should-scale-down)
-      (warp:log! :warn "autoscaler"
-                 "Composite strategy conflict for pool '%s'. Prioritizing UP."
-                 (warp-autoscaler-monitor-pool-name monitor))
-      (warp-autoscaler--handle-scaling-decision
-       monitor :scale-up (+ current-size step)
-       (format "Composite (up prioritized): %S" (nreverse up-reasons))))
-     (should-scale-up
-      (warp-autoscaler--handle-scaling-decision
-       monitor :scale-up (+ current-size step)
-       (format "Composite scale-up: %S" (nreverse up-reasons))))
-     (should-scale-down
-      (warp-autoscaler--handle-scaling-decision
-       monitor :scale-down (- current-size step)
-       (format "Composite scale-down: %S" (nreverse down-reasons))))
-     (t
-      (loom:resolved! `(:action :no-action
-                         :reason "Composite rules not met"))))))
-
-(defun warp-autoscaler--evaluate-scheduled-strategy (monitor)
-  "Evaluates a scheduled scaling strategy.
-  Scales the pool to a predefined size at specific times or days.
-
-  Arguments:
-  - `monitor` (warp-autoscaler-monitor): The active monitor.
-
-  Returns:
-  - (loom-promise): A promise that resolves with the scaling decision
-    (e.g., `(:action :scale-to :size 5)`) or `(:action :no-action)`).
-
-  Side Effects:
-  - May call `warp-autoscaler--handle-scaling-decision`."
-  (cl-block warp-autoscaler--evaluate-scheduled-strategy
-    (let* ((strategy (warp-autoscaler-monitor-strategy monitor))
+    (let* ((type (warp-autoscaler-strategy-type strategy))
+           (min (warp-autoscaler-strategy-min-resources strategy))
+           (max (warp-autoscaler-strategy-max-resources strategy))
+           (eval-interval (warp-autoscaler-strategy-evaluation-interval strategy))
+           (step-size (warp-autoscaler-strategy-scale-step-size strategy))
+           (metric-extractor-fn (warp-autoscaler-strategy-metric-value-extractor-fn strategy))
+           (scale-up-threshold (warp-autoscaler-strategy-scale-up-threshold strategy))
+           (scale-down-threshold (warp-autoscaler-strategy-scale-down-threshold strategy))
            (schedule (warp-autoscaler-strategy-schedule strategy))
-           (now (decode-time (float-time))))
-      ;; Check each rule in the schedule.
-      (cl-loop for rule in schedule do
-               (let* ((hour (plist-get rule :hour))
-                      (min (plist-get rule :minute))
-                      (dow (plist-get rule :day-of-week))
-                      (target-size (plist-get rule :target-size))
-                      (met t))
-                 ;; A rule only matches if all its time components match.
-                 ;; `nth` indices for `decode-time`: 1:minute, 2:hour,
-                 ;; 6:day-of-week.
-                 (when (and hour (not (= (nth 2 now) hour))) (setq met nil))
-                 (when (and min (not (= (nth 1 now) min))) (setq met nil))
-                 (when (and dow (not (= (nth 6 now) dow))) (setq met nil))
-                 ;; If a rule is met, trigger scaling and exit.
-                 (when met
-                   (cl-return-from
-                       warp-autoscaler--evaluate-scheduled-strategy
-                     (warp-autoscaler--handle-scaling-decision
-                      monitor :scale-to target-size
-                      (format "Scheduled scale to %d" target-size))))))
-      ;; If no rules were met, do nothing.
-      (loom:resolved! `(:action :no-action
-                         :reason "No scheduled rule met")))))
+           (composite-rules (warp-autoscaler-strategy-composite-rules strategy))
+           (win (warp-autoscaler-strategy-predictive-window strategy))
+           (sens (warp-autoscaler-strategy-predictive-sensitivity strategy)))
 
-(defun warp-autoscaler--evaluate-strategy (monitor)
-  "Evaluates the auto-scaling strategy for a given monitor.
-This is the main dispatch function for the periodic evaluation task,
-handling cooldowns, metric fetching, history updates, and delegating
-to specific strategy evaluators.
+      ;; --- Sanity checks applicable to all strategies ---
+      (validate (and (integerp min) (>= min 0))
+                     "`min-resources` must be an integer >= 0.")
+      (validate (and (integerp max) (>= max min))
+                     "`max-resources` must be an integer >= `min-resources`.")
+      (validate (and (numberp eval-interval) (> eval-interval 0))
+                     "`evaluation-interval` must be a positive number.")
+      (validate (and (integerp step-size) (> step-size 0))
+                     "`scale-step-size` must be a positive integer.")
+
+      ;; --- Strategy-specific validation logic ---
+      (pcase type
+        ;; Metric-based strategies share common requirements.
+        ((or :cpu-utilization 
+             :request-rate 
+             :response-time 
+             :healthy-resources 
+             :active-resources 
+             :memory-utilization)
+         (validate (functionp metric-extractor-fn)
+                        "Metric-based strategies require a `:metric-value-extractor-fn` function.")
+         (validate (numberp scale-up-threshold)
+                        "Metric-based strategies require a numeric `:scale-up-threshold`.")
+         (validate (numberp scale-down-threshold)
+                        "Metric-based strategies require a numeric `:scale-down-threshold`."))
+
+        (:scheduled
+         (validate (listp schedule)
+                        "Scheduled strategies require a `:schedule` list."))
+
+        (:composite
+         (validate (listp composite-rules)
+                        "Composite strategies require a `:composite-rules` list."))
+
+        (:predictive
+         (validate (functionp metric-extractor-fn)
+                        "Predictive strategies require a `:metric-value-extractor-fn` function.")
+         (validate (and (integerp win) (> win 2))
+                        "Predictive `:predictive-window` must be an integer > 2.")
+         (validate (and (numberp sens) (> sens 0))
+                        "Predictive `:predictive-sensitivity` must be a positive number."))
+
+        ;; Handle unknown or unsupported strategy types.
+        (_ (signal (warp:error! :type 'warp-autoscaler-invalid-strategy
+                                :message (format "Unknown strategy type: %S" type)))))))
+  ;; If all checks pass without signaling an error, the strategy is valid.
+  t)
+  
+(cl-defgeneric warp:autoscaler-evaluate-strategy (monitor current-size)
+  "Evaluates an autoscaling strategy by dispatching on its type.
+This provides an extensible mechanism for adding new scaling algorithms
+without modifying the core evaluation loop.
 
 Arguments:
 - `monitor` (warp-autoscaler-monitor): The monitor instance to evaluate.
+- `current-size` (integer): The current size of the monitored pool.
 
 Returns:
-- (loom-promise): A promise that resolves with the evaluation outcome
-  (e.g., `(:action :scale-up :size 5)`) or `(:action :no-action)`) or
-  rejects if metric collection fails or the pool becomes inactive.
+- (loom-promise): A promise resolving with the evaluation outcome."
+  (:documentation "Evaluates an autoscaling strategy based on its type."))
 
-Side Effects:
-- May stop the monitor if the target pool is inactive.
-- Fetches metrics and updates history."
-  (cl-block warp-autoscaler--evaluate-strategy
-    (let* ((allocator-client (warp-autoscaler-monitor-allocator monitor))
-           (pool-name (warp-autoscaler-monitor-pool-name monitor))
-           (provider (warp-autoscaler-monitor-metrics-provider-fn monitor))
-           (strategy (warp-autoscaler-monitor-strategy monitor))
-           (now (float-time)))
-      ;; Step 1: Fetch status ONCE.
-      (braid! (allocator-service-get-pool-status allocator-client pool-name)
-        (:then (lambda (status)
-                 (unless (eq (plist-get status :status) :active)
-                   (warp:log! :warn "autoscaler" "Pool '%s' not active; stopping monitor." pool-name)
-                   (loom:await (warp:autoscaler-stop (warp-autoscaler-monitor-id monitor)))
-                   (cl-return-from warp-autoscaler--evaluate-strategy
-                     (loom:rejected! (warp:error! :type 'warp-autoscaler-error
-                                                  :message "Target pool not active"))))
-                 
-                 (let ((current-size (plist-get status :current-capacity)))
-                   ;; Step 2: Cooldown check to prevent scaling too frequently ("thrashing").
-                   (let* ((up-cd (warp-autoscaler-strategy-scale-up-cooldown strategy))
-                          (down-cd (warp-autoscaler-strategy-scale-down-cooldown strategy))
-                          (last-up (warp-autoscaler-monitor-last-scale-up-time monitor))
-                          (last-down
-                           (warp-autoscaler-monitor-last-scale-down-time monitor)))
-                     (when (or (and last-up (< (- now last-up) up-cd))
-                               (and last-down (< (- now last-down) down-cd)))
-                       (warp:log! :debug "autoscaler"
-                                  "Scaling for pool '%s' in cooldown."
-                                  pool-name)
-                       (cl-return-from warp-autoscaler--evaluate-strategy
-                         (loom:resolved! `(:action :no-action :reason "Cooldown")))))
+(cl-defmethod warp:autoscaler-evaluate-strategy
+  ((monitor warp-autoscaler-monitor) current-size)
+  "Evaluates an autoscaling strategy. This is the default method for
+the generic function `warp:autoscaler-evaluate-strategy`. It is
+invoked when no more specific method is applicable.
 
-                   ;; Step 3: Fetch metrics asynchronously using the provider function.
-                   (braid! (funcall provider)
-                     (:then (lambda (metrics)
-                              ;; Step 4: Record the new metrics for trend analysis.
-                              (warp-autoscaler--add-metrics-to-history
-                               (warp-autoscaler-monitor-metrics-history monitor) metrics)
-                              ;; Step 5: Dispatch to the appropriate evaluation function.
-                              (pcase (warp-autoscaler-strategy-type strategy)
-                                ((or :cpu-utilization :request-rate :response-time
-                                     :healthy-resources :active-resources
-                                     :memory-utilization)
-                                 (warp-autoscaler--evaluate-metric-strategy monitor metrics current-size))
-                                (:predictive
-                                 (warp-autoscaler--evaluate-predictive-strategy
-                                  monitor metrics current-size))
-                                (:composite
-                                 (warp-autoscaler--evaluate-composite-strategy
-                                  monitor metrics current-size))
-                                (:scheduled
-                                 ;; Scheduled strategies don't use real-time metrics for
-                                 ;; decision.
-                                 (warp-autoscaler--evaluate-scheduled-strategy monitor))
-                                (_ (loom:resolved! `(:action :no-action
-                                                      :reason "Unknown strategy"))))))
-                     (:catch (lambda (err)
-                               ;; Handle failures in metric collection.
-                               (loom:rejected!
-                                (warp:error! :type 'warp-autoscaler-metric-collection-failed
-                                             :cause err))))))))
-        (:catch (err)
-          (warp:log! :warn "autoscaler"
-                     "Failed to get pool status for '%s': %S"
-                     pool-name err)
-          (cl-return-from warp-autoscaler--evaluate-strategy
-            (loom:resolved! `(:action :no-action :reason "Status check failed"))))))))
+Arguments:
+- (monitor warp-autoscaler-monitor): The autoscaler monitor instance.
+- (current-size number): The current size of the monitored resource.
+
+Returns:
+- (loom-promise): A promise resolving to a no-action decision."
+  (loom:resolved! `(:action :no-action
+                    :reason "No specific evaluation method found.")))
+
+(cl-defmethod warp:autoscaler-evaluate-strategy
+  ((monitor (warp-autoscaler-monitor-strategy-type-is :scheduled)) current-size)
+  "Specialization of `warp:autoscaler-evaluate-strategy` for scheduled
+strategies. This method evaluates the strategy by checking the current time
+against a predefined schedule of rules.
+
+Arguments:
+- (monitor warp-autoscaler-monitor): The autoscaler monitor with a scheduled strategy.
+- (current-size number): The current size of the monitored resource.
+
+Returns:
+- (loom-promise): A promise resolving with a scaling decision if a rule
+  matches, or a no-action decision otherwise."
+  (let* ((strategy (warp-autoscaler-monitor-strategy monitor))
+         (schedule (warp-autoscaler-strategy-schedule strategy))
+         (now (decode-time (float-time))))
+    (cl-block evaluation-block
+      ;; Iterate through each rule in the schedule to find a match.
+      (dolist (rule schedule)
+        (let* ((hour (plist-get rule :hour))
+               (min (plist-get rule :minute))
+               (dow (plist-get rule :day-of-week))
+               (target-size (plist-get rule :target-size))
+               (matches t))
+          ;; Check if the current hour matches the rule's hour (if specified).
+          (when (and hour (not (= (nth 2 now) hour))) (setq matches nil))
+          ;; Check if the current minute matches the rule's minute (if specified).
+          (when (and min (not (= (nth 1 now) min))) (setq matches nil))
+          ;; Check if the current day of the week matches the rule's day (if specified).
+          (when (and dow (not (= (nth 6 now) dow))) (setq matches nil))
+          ;; If all specified time components match, a scaling decision is made.
+          (when matches
+            (cl-return-from evaluation-block
+              (loom:await (warp-autoscaler--handle-scaling-decision
+                           monitor :scale-to target-size
+                           (format "Scheduled scale to %d" target-size)))))))
+      ;; If the loop completes without finding a matching rule, no action is taken.
+      (loom:resolved! `(:action :no-action
+                        :reason "No scheduled rule met at current time.")))))
+
+(cl-defmethod warp:autoscaler-evaluate-strategy
+  ((monitor (warp-autoscaler-monitor-strategy-type-is :predictive)) current-size)
+  "Specialization of `warp:autoscaler-evaluate-strategy` for predictive
+strategies. It uses trend analysis on historical metrics to predict future
+load and make a scaling decision.
+
+Arguments:
+- (monitor warp-autoscaler-monitor): The autoscaler monitor with a predictive strategy.
+- (current-size number): The current size of the monitored resource.
+
+Returns:
+- (loom-promise): A promise resolving with a scaling decision based on the
+  predicted trend."
+  (let* ((strategy (warp-autoscaler-monitor-strategy monitor))
+         (pipeline (warp-autoscaler-monitor-telemetry-pipeline monitor))
+         (metric-name (warp-autoscaler-strategy-metric-name strategy))
+         (predictive-window (warp-autoscaler-strategy-predictive-window strategy)))
+    ;; Fetch historical metric data from the telemetry pipeline asynchronously.
+    (braid! (warp:telemetry-pipeline-get-metric-history
+             pipeline metric-name predictive-window)
+      (:then (history)
+        (let* ((trend-analyzer (make-wma-trend-analyzer))
+               (trend-slope (warp:trend-analyzer-predict trend-analyzer history))
+               (sensitivity (warp-autoscaler-strategy-predictive-sensitivity strategy)))
+          (cond
+            ;; If there is a sharp positive trend, scale up. The sensitivity
+            ;; value controls how "sharp" the trend needs to be.
+            ((and trend-slope (> trend-slope (* 0.1 sensitivity)))
+             (loom:await (warp-autoscaler--handle-scaling-decision
+                          monitor :scale-up (+ current-size 1)
+                          (format "Predictive up. Slope: %.2f" trend-slope))))
+            ;; If there is a sharp negative trend, scale down.
+            ((and trend-slope (< trend-slope (* -0.1 sensitivity)))
+             (loom:await (warp-autoscaler--handle-scaling-decision
+                          monitor :scale-down (- current-size 1)
+                          (format "Predictive down. Slope: %.2f" trend-slope))))
+            ;; If no significant trend is detected, no action is taken.
+            (t (loom:resolved! `(:action :no-action
+                                 :reason "No significant predictive trend.")))))))))
+
+(defun warp-autoscaler--create-monitor-instance
+    (monitor-id allocator pool-name telemetry-pipeline strategy event-system)
+  "Internal factory to construct and initialize a `warp-autoscaler-monitor`.
+This function wires together all the runtime components for a monitor,
+including its polling task and optional circuit breaker.
+
+Arguments:
+- `monitor-id` (string): A unique ID for the new monitor.
+- `allocator` (allocator-client): The allocator client instance.
+- `pool-name` (string): The name of the pool to be monitored.
+- `telemetry-pipeline` (warp-telemetry-pipeline): The telemetry source.
+- `strategy` (warp-autoscaler-strategy): The scaling configuration.
+- `event-system` (warp-event-system): The event system for notifications.
+
+Returns:
+- (warp-autoscaler-monitor): The fully constructed monitor instance."
+  (let* ((cb-config (warp-autoscaler-strategy-circuit-breaker-config strategy))
+         (monitor (%%make-autoscaler-monitor
+                   :id monitor-id
+                   :allocator allocator
+                   :pool-name pool-name
+                   :telemetry-pipeline telemetry-pipeline
+                   :strategy strategy
+                   :status :active
+                   :created-at (float-time)
+                   :metrics-history
+                   (when (eq (warp-autoscaler-strategy-type strategy) :predictive)
+                     (%%make-metrics-history
+                      :max-history-size
+                      (warp-autoscaler-strategy-predictive-window strategy)))
+                   :circuit-breaker
+                   (when cb-config
+                     (apply #'warp:circuit-breaker-get
+                            (format "autoscaler-%s" pool-name) cb-config)))))
+    ;; Register a periodic task for evaluation.
+    (let ((poll (loom:poll-create
+                 :name (format "autoscaler-poll-%s" monitor-id)
+                 :interval (warp-autoscaler-strategy-evaluation-interval strategy)
+                 :task (lambda () 
+                        (warp:autoscaler-evaluate-strategy 
+                          monitor (warp-autoscaler--get-pool-size 
+                          monitor))))))
+      (setf (warp-autoscaler-monitor-poll-instance monitor) poll)
+      (loom:poll-start poll)
+      ;; Subscribe to the health-degraded event.
+      ;; This ensures the autoscaler reacts immediately to a critical failure,
+      ;; rather than waiting for its next periodic poll.
+      (warp:subscribe event-system :health-degraded
+                      (lambda (event)
+                        (when (string= (plist-get (warp-event-data event) :worker-id)
+                                       (warp-autoscaler-monitor-pool-name monitor))
+                          (loom:await (warp:autoscaler-evaluate-strategy 
+                                        monitor 
+                                        (warp-autoscaler--get-pool-size monitor))))))
+      monitor)))
+
+(defun warp-autoscaler--get-pool-size (monitor)
+  "Retrieves the current capacity of the monitored pool from the allocator.
+
+Arguments:
+- `monitor` (warp-autoscaler-monitor): The monitor instance.
+
+Returns:
+- (integer): The current number of resources in the pool."
+  (let* ((allocator-client (warp-autoscaler-monitor-allocator monitor))
+         (pool-name (warp-autoscaler-monitor-pool-name monitor)))
+    (plist-get (loom:await (allocator-service-get-pool-status
+                            allocator-client pool-name))
+               :current-capacity)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;###autoload
 (defun warp:autoscaler-initialize (event-system)
-  "Initializes the autoscaler subsystem with an EVENT-SYSTEM.
-  This function **must be called once** before any other autoscaler functions
-  are used. It sets up the central registry required for managing monitors.
+  "Initializes the autoscaler subsystem. **Must be called once before use.**
+This function sets up the central registry required for managing all active
+auto-scaling monitors.
 
-  Arguments:
-  - `EVENT-SYSTEM` (warp-event-system): The event system instance to use
-    for broadcasting monitor-related events (e.g., monitor added/removed).
+Arguments:
+- `EVENT-SYSTEM` (warp-event-system): The global event system, used for
+broadcasting monitor-related events (e.g., monitor added/removed).
 
-  Returns: `t`.
+Returns: `t` on successful initialization.
 
-  Side Effects:
-  - Creates and configures the internal `warp-autoscaler--registry`."
+Side Effects:
+- Creates and configures the `warp-autoscaler--registry`."
   (setq warp-autoscaler--registry
         (warp:registry-create
          :name "warp-autoscaler-registry"
          :event-system event-system
          :indices `((:by-pool-name .
-                      ,(lambda (id item _m)
-                         (declare (ignore id _m))
-                         (warp-autoscaler-monitor-pool-name item))))))
+                     ,(lambda (id item _m)
+                        (declare (ignore id _m))
+                        (warp-autoscaler-monitor-pool-name item))))))
   t)
 
 ;;;###autoload
-(defun warp:autoscaler-create (allocator pool-name metrics-provider-fn strategy)
-  "Creates and starts a new auto-scaling monitor for a resource pool.
-This function initializes a monitor, validates its strategy, registers it
-globally, and starts a background task to evaluate scaling decisions
-periodically.
+(defun warp:autoscaler-create (allocator pool-name telemetry-pipeline strategy)
+  "Creates, validates, and starts a new auto-scaling monitor.
+This is the main entry point for activating an autoscaling policy on a pool. It
+starts a background task that periodically evaluates the strategy.
 
 Arguments:
-- `ALLOCATOR` (allocator-client): The allocator client component.
-- `POOL-NAME` (string): The name of the pool to monitor and scale.
-- `METRICS-PROVIDER-FN` (function): A nullary function `(lambda ())` that
-  returns a promise resolving to a `plist` of current metrics for the pool.
-  Example: `(lambda () (warp:cluster-metrics my-cluster :pool-name \"my-pool\"))`.
-- `STRATEGY` (warp-autoscaler-strategy): The configuration object that
-  defines how the pool should scale (e.g., thresholds, cooldowns, type).
+- `ALLOCATOR` (allocator-client): The allocator client to issue commands.
+- `POOL-NAME` (string): The name of the target pool to monitor and scale.
+- `TELEMETRY-PIPELINE` (warp-telemetry-pipeline): The pipeline that provides metrics.
+- `STRATEGY` (warp-autoscaler-strategy): The configuration for scaling rules.
 
 Returns:
-- (string): The unique ID of the newly created and started monitor.
+- (string): The unique ID of the newly created and running monitor.
 
 Side Effects:
-- Adds the new monitor to the central `warp-autoscaler--registry`.
-- Emits an `:item-added` event from the registry.
-- Starts a background polling task that runs until explicitly stopped.
+- Validates strategy, adds monitor to registry, emits `:item-added` event,
+and starts a background polling task for the monitor.
 
 Signals:
-- `warp-autoscaler-not-initialized`: If the subsystem is not initialized.
-- `warp-autoscaler-invalid-strategy`: If the `strategy` is malformed.
-- `warp-autoscaler-error`: If `allocator` is invalid or `pool-name` is not found."
+- `warp-autoscaler-not-initialized`: If subsystem is not initialized.
+- `warp-autoscaler-invalid-strategy`: If `strategy` is malformed.
+- `warp-autoscaler-error`: If `allocator` is invalid."
   (warp-autoscaler--ensure-initialized)
-  ;; Add a validation step at the beginning of warp:autoscaler-create
   (warp-autoscaler--validate-strategy strategy)
   (unless (and (fboundp 'allocator-client-p) (allocator-client-p allocator))
-    (error 'warp-autoscaler-error "Invalid allocator client object."))
+    (error 'warp-autoscaler-error "Invalid allocator client object provided."))
 
-  (let* ((monitor-id (warp:uuid-string (warp:uuid4))) ;; Use UUID for ID generation
-         (cb-config (warp-autoscaler-strategy-circuit-breaker-config strategy))
-         (monitor (%%make-autoscaler-monitor
-                   :id monitor-id :allocator allocator :pool-name pool-name
-                   :metrics-provider-fn metrics-provider-fn
-                   :strategy strategy
-                   :status :active :created-at (float-time)
-                   :metrics-history
-                   (%%make-metrics-history
-                    :max-history-size
-                    (warp-autoscaler-strategy-predictive-window strategy))
-                   :circuit-breaker
-                   (when cb-config
-                     (apply #'warp:circuit-breaker-get
-                            (format "autoscaler-%s" pool-name)
-                            cb-config)))))
-    ;; Create the periodic polling instance that drives the evaluation.
-    (let ((poll (loom:poll
-                 :name (format "autoscaler-poll-%s" monitor-id)
-                 :interval (warp-autoscaler-strategy-evaluation-interval
-                            strategy)
-                 ;; The polling task itself is an asynchronous braid.
-                 :task (braid! (warp-autoscaler--evaluate-strategy monitor)
-                         (:then (lambda (res) (warp:log! :trace "autoscaler"
-                                                         "Eval complete: %S" res)))
-                         (:catch (lambda (err)
-                                   (warp:log! :error "autoscaler"
-                                              "Eval failed: %S" err)
-                                   (setf (warp-autoscaler-monitor-status
-                                          monitor) :error))))
-                 :immediate t)))
-      (setf (warp-autoscaler-monitor-poll-instance monitor) poll)
-      (loom:poll-start poll)
-      ;; Register the new monitor in the global registry.
-      (warp:registry-add warp-autoscaler--registry monitor-id monitor)
-      (warp:log! :info "autoscaler"
-                 "Started and registered monitor '%s' for pool '%s'."
-                 monitor-id pool-name)
-      monitor-id)))
+  (let* ((monitor-id (warp:uuid-string (warp:uuid4)))
+         (event-system (warp:registry-event-system warp-autoscaler--registry))
+         (monitor (warp-autoscaler--create-monitor-instance
+                   monitor-id allocator pool-name telemetry-pipeline strategy event-system)))
+    (warp:registry-add warp-autoscaler--registry monitor-id monitor)
+    (warp:log! :info "autoscaler"
+               "Started and registered monitor '%s' for pool '%s'."
+               monitor-id pool-name)
+    monitor-id))
 
 (defun warp:autoscaler-stop (monitor-id)
-  "Stops an active auto-scaling monitor.
-This gracefully shuts down the monitor's background polling task and
-removes it from the global registry.
+  "Stops an active auto-scaling monitor and removes it from service.
+This gracefully shuts down the monitor's background evaluation task and
+deregisters it, disabling autoscaling for its target pool.
 
 Arguments:
 - `MONITOR-ID` (string): The unique ID of the monitor to stop.
 
 Returns:
-- `t` if the monitor was found and stopped, `nil` otherwise.
+- `t` if the monitor was found and stopped successfully, `nil` otherwise.
 
 Side Effects:
-- Shuts down the monitor's `loom-poll` instance.
-- Removes the monitor from the `warp-autoscaler--registry`.
-- Emits an `:item-removed` event from the registry.
-
-Signals:
-- `warp-autoscaler-not-initialized`: If the subsystem is not initialized."
+- Shuts down the monitor's background `loom-poll` instance.
+- Removes the monitor from the global `warp-autoscaler--registry`.
+- Emits an `:item-removed` event from the registry."
   (warp-autoscaler--ensure-initialized)
   (when-let ((monitor (warp:registry-get warp-autoscaler--registry monitor-id)))
     (warp:log! :info "autoscaler" "Stopping monitor '%s' for pool '%s'."
@@ -881,16 +743,12 @@ Signals:
     (warp:registry-remove warp-autoscaler--registry monitor-id)
     t))
 
-;;;###autoload
 (defun warp:autoscaler-list ()
-  "Returns a list of all active auto-scaling monitors.
-Provides a summary view of all currently managed scaling operations.
-
-Arguments: None.
+  "Returns a summary list of all active auto-scaling monitors.
 
 Returns:
-- (list): A list of plists, each describing an active monitor.
-  Each plist contains `:id`, `:pool-name`, `:strategy-type`, and `:status`.
+- (list): A list of plists, where each provides a high-level summary of an
+active monitor (`:id`, `:pool-name`, `:strategy-type`, `:status`).
 
 Signals:
 - `warp-autoscaler-not-initialized`: If the subsystem is not initialized."
@@ -905,19 +763,16 @@ Signals:
          :status ,(warp-autoscaler-monitor-status monitor))))
    (warp:registry-list-keys warp-autoscaler--registry)))
 
-;;;###autoload
 (defun warp:autoscaler-status (monitor-id)
-  "Gets detailed status information for a specific auto-scaling monitor.
-This function provides a comprehensive snapshot of a monitor's state,
-including its strategy, current metrics, and scaling history.
+  "Retrieves detailed status and info for a specific monitor.
+This is the primary function for inspecting the runtime state of an autoscaler.
 
 Arguments:
 - `MONITOR-ID` (string): The unique ID of the monitor to inspect.
 
 Returns:
-- (plist): A plist containing detailed status information about the
-  monitor (e.g., `:id`, `:pool-name`, `:status`, `:total-scale-ups`,
-  `:circuit-breaker-state`), or `nil` if the `MONITOR-ID` is not found.
+- (plist): A detailed plist of the monitor's state, including configuration,
+counters, timers, and circuit breaker status, or `nil` if not found.
 
 Signals:
 - `warp-autoscaler-not-initialized`: If the subsystem is not initialized."
@@ -934,37 +789,30 @@ Signals:
         :min-resources ,(warp-autoscaler-strategy-min-resources strategy)
         :max-resources ,(warp-autoscaler-strategy-max-resources strategy)
         :total-scale-ups ,(warp-autoscaler-monitor-total-scale-ups monitor)
-        :total-scale-downs
-        ,(warp-autoscaler-monitor-total-scale-downs monitor)
-        :last-scale-up-time
-        ,(warp-autoscaler-monitor-last-scale-up-time monitor)
-        :last-scale-down-time
-        ,(warp-autoscaler-monitor-last-scale-down-time
-          monitor)
+        :total-scale-downs ,(warp-autoscaler-monitor-total-scale-downs monitor)
+        :last-scale-up-time ,(warp-autoscaler-monitor-last-scale-up-time monitor)
+        :last-scale-down-time ,(warp-autoscaler-monitor-last-scale-down-time monitor)
         :circuit-breaker-state ,(plist-get cb-status :state)
-        :metrics-history-size ,(length
-                                (warp-autoscaler-metrics-history-data-points
-                                 (warp-autoscaler-monitor-metrics-history
-                                  monitor)))))))
+        :metrics-history-size
+        ,(length (warp-autoscaler-metrics-history-data-points
+                  (warp-autoscaler-monitor-metrics-history monitor)))))))
 
 ;;;###autoload
 (defmacro warp:defautoscaler-strategy (name docstring &rest plist)
-  "Defines a named, reusable `warp-autoscaler-strategy` object.
-This macro simplifies the creation and reuse of common auto-scaling
-configurations within applications.
+  "Defines a named, reusable `warp-autoscaler-strategy` object as a constant.
+This macro provides a convenient, declarative way to define common scaling
+configurations that can be easily referenced throughout an application.
 
 Arguments:
-- `NAME` (symbol): The variable name for the new strategy (e.g.,
-  `my-cpu-strategy`).
+- `NAME` (symbol): The variable name for the new strategy constant.
 - `DOCSTRING` (string): Documentation for the strategy.
-- `PLIST` (plist): A property list of strategy options, matching the
-  keys for `warp-autoscaler-strategy` struct fields (e.g., `:type`,
-  `:min-resources`, `:scale-up-threshold`).
+- `PLIST` (plist): A property list of strategy options matching the slots of the
+`warp-autoscaler-strategy` struct.
 
-Returns: (symbol) The `NAME` of the defined constant.
+Returns: The symbol `NAME`.
 
 Side Effects:
-- Defines a `defconst` variable named `NAME` holding the strategy object."
+- Defines a global constant `NAME` holding the created strategy object."
   `(defconst ,name
      (apply #'%%make-autoscaler-strategy ,plist)
      ,docstring))
@@ -974,8 +822,9 @@ Side Effects:
 ;;----------------------------------------------------------------------
 
 (warp:defautoscaler-strategy warp-autoscaler-cpu-utilization-strategy
-  "Auto-scaling strategy based on average CPU utilization.
-Scales up if CPU goes above 70%, down if below 40%."
+  "A standard strategy based on average CPU utilization.
+Scales up if average CPU across the pool exceeds 70%, and scales down if
+it drops below 40%."
   :type :cpu-utilization
   :min-resources 1
   :max-resources 10
@@ -987,8 +836,8 @@ Scales up if CPU goes above 70%, down if below 40%."
   (lambda (m) (or (plist-get m :avg-cluster-cpu-utilization) 0.0)))
 
 (warp:defautoscaler-strategy warp-autoscaler-request-rate-strategy
-  "Auto-scaling strategy based on total active requests.
-Scales up if active requests exceed 50, down if below 10."
+  "A standard strategy based on the total number of active requests.
+Scales up aggressively if the number of in-flight requests exceeds 50."
   :type :request-rate
   :min-resources 1
   :max-resources 20
@@ -1000,8 +849,9 @@ Scales up if active requests exceed 50, down if below 10."
   (lambda (m) (or (plist-get m :total-active-requests) 0.0)))
 
 (warp:defautoscaler-strategy warp-autoscaler-memory-utilization-strategy
-  "Auto-scaling strategy based on average memory utilization (in MB).
-Scales up if memory exceeds 800MB, down if below 300MB."
+  "A standard strategy based on average memory utilization.
+Useful for memory-intensive workloads. Scales up if average memory per
+worker exceeds 800MB."
   :type :memory-utilization
   :min-resources 1
   :max-resources 5
@@ -1013,8 +863,9 @@ Scales up if memory exceeds 800MB, down if below 300MB."
   (lambda (m) (or (plist-get m :avg-cluster-memory-utilization) 0.0)))
 
 (warp:defautoscaler-strategy warp-autoscaler-predictive-cpu-strategy
-  "Predictive auto-scaling strategy based on historical CPU trend.
-Uses a rolling window of past CPU utilization to predict future needs."
+  "A predictive strategy based on the trend of historical CPU utilization.
+Analyzes a rolling window of past CPU data to anticipate future demand
+and scale proactively."
   :type :predictive
   :min-resources 1
   :max-resources 15
@@ -1026,8 +877,9 @@ Uses a rolling window of past CPU utilization to predict future needs."
   (lambda (m) (or (plist-get m :avg-cluster-cpu-utilization) 0.0)))
 
 (warp:defautoscaler-strategy warp-autoscaler-scheduled-peak-offpeak-strategy
-  "Scheduled auto-scaling strategy for typical peak/off-peak loads.
-Scales to specific sizes at predefined hours of the day."
+  "A scheduled strategy for typical business-day peak and off-peak loads.
+Scales to a high capacity in the morning, reduces in the evening, and runs
+a minimal set overnight."
   :type :scheduled
   :min-resources 1
   :max-resources 5
@@ -1037,23 +889,23 @@ Scales to specific sizes at predefined hours of the day."
               (:hour 23 :target-size 1 :reason "Overnight minimum")))
 
 (warp:defautoscaler-strategy warp-autoscaler-composite-cpu-queue-strategy
-  "Composite auto-scaling strategy combining CPU and request queue depth.
-Scales up if either CPU or active requests are high; scales down if CPU
-is low."
+  "A composite strategy combining CPU utilization and request queue depth.
+This allows nuanced decisions. It scales up if *either* CPU is high
+*or* request count is high, but only scales down if CPU is low."
   :type :composite
   :min-resources 1
   :max-resources 10
   :evaluation-interval 45
   :scale-step-size 2
   :composite-rules
-  `((:metric-extractor-fn
-     ,(lambda (m) (or (plist-get m :avg-cluster-cpu-utilization) 0.0))
+  `((:metric-extractor-fn ,(lambda (m) 
+                            (or (plist-get m :avg-cluster-cpu-utilization) 0.0))
      :operator :gte :threshold 85.0 :action :scale-up)
-    (:metric-extractor-fn
-     ,(lambda (m) (or (plist-get m :total-active-requests) 0.0))
+    (:metric-extractor-fn ,(lambda (m) 
+                            (or (plist-get m :total-active-requests) 0.0))
      :operator :gte :threshold 60.0 :action :scale-up)
-    (:metric-extractor-fn
-     ,(lambda (m) (or (plist-get m :avg-cluster-cpu-utilization) 0.0))
+    (:metric-extractor-fn ,(lambda (m) 
+                            (or (plist-get m :avg-cluster-cpu-utilization) 0.0))
      :operator :lt :threshold 30.0 :action :scale-down)))
 
 ;;----------------------------------------------------------------------
@@ -1061,25 +913,20 @@ is low."
 ;;----------------------------------------------------------------------
 
 (defun warp-autoscaler--shutdown-on-exit ()
-  "A cleanup function to stop all active auto-scaler monitors on exit.
-This hook is added to `kill-emacs-hook` to ensure a clean shutdown
-of all autoscaling background processes.
-
-Arguments: None.
-
-Returns: `nil`.
+  "Cleanup hook to stop all active autoscaler monitors on Emacs exit.
+This ensures all background polling tasks are terminated cleanly,
+preventing orphaned processes and resource leaks.
 
 Side Effects:
-- Iterates through all registered monitors and calls
-  `warp:autoscaler-stop` on each, logging any errors encountered
-  during shutdown."
+- Iterates through the registry, calls `warp:autoscaler-stop` on each monitor,
+and logs any errors encountered during shutdown."
   (when warp-autoscaler--registry
     (let ((ids (warp:registry-list-keys warp-autoscaler--registry)))
       (when ids
-        (warp:log! :info "autoscaler" "Shutdown hook: Stopping %d monitor(s)."
-                   (length ids))
+        (warp:log! :info "autoscaler" "Shutdown: Stopping %d monitor(s)." (length ids))
         (dolist (id ids)
-          (condition-case err (warp:autoscaler-stop id)
+          (condition-case err
+              (warp:autoscaler-stop id)
             (error (warp:log! :error "autoscaler"
                               "Error stopping monitor '%s' on exit: %S"
                               id err))))))))
